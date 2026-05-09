@@ -12,18 +12,25 @@ concurrency:
 
 env:
   COMPOSE_FILE: postgres.green.yml
-  ENV_FILE: postgres.green.env
+  ENV_FILE: /home/kwung/deploy/ieum-infra/postgres.green.env
 
 jobs:
   reset-postgres:
     name: Reset PostgreSQL Container
     runs-on:
       group: ieum_dev_server
-      labels: [self-hosted, linux, x64, dev, deploy]
+      labels: [self-hosted, linux, x64, ieum-infra]
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Ensure env file exists
+        run: |
+          if [ ! -f "$ENV_FILE" ]; then
+            echo "::error::$ENV_FILE 파일이 없습니다."
+            exit 1
+          fi
 
       - name: Ensure Docker network
         run: |
