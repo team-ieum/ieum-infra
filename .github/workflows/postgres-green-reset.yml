@@ -1,0 +1,48 @@
+name: Reset Green PostgreSQL
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reset_green_postgres
+  cancel-in-progress: false
+
+env:
+  COMPOSE_FILE: postgres.green.yml
+  ENV_FILE: postgres.green.env
+
+jobs:
+  reset-postgres:
+    name: Reset PostgreSQL Container
+    runs-on:
+      group: ieum_dev_server
+      labels: [self-hosted, linux, x64, dev, deploy]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure Docker network
+        run: |
+          docker network inspect ieum_net_green >/dev/null 2>&1 \
+            || docker network create --subnet 10.10.10.0/24 ieum_net_green
+
+      - name: Reset PostgreSQL
+        run: |
+          docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" down -v --remove-orphans
+          docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 30); do
+            if docker exec ieum-postgres pg_isready -U ieum -d ieum; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          docker logs --tail 100 ieum-postgres
+          exit 1
