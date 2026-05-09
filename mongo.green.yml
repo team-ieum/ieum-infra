@@ -1,0 +1,36 @@
+name: ieum-green-mongo
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: ieum-mongo
+    restart: unless-stopped
+
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD}
+      MONGO_INITDB_DATABASE: ${MONGO_INITDB_DATABASE}
+
+    volumes:
+      - ieum_mongo_data:/data/db
+
+    networks:
+      ieum_net_green:
+        ipv4_address: 10.10.10.15
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "mongosh --quiet -u ${MONGO_INITDB_ROOT_USERNAME} -p ${MONGO_INITDB_ROOT_PASSWORD} --authenticationDatabase admin --eval 'db.adminCommand({ ping: 1 }).ok' | grep 1"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  ieum_net_green:
+    external: true
+
+volumes:
+  ieum_mongo_data:
