@@ -1,0 +1,29 @@
+name: ieum-green-redis
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: ieum-redis
+    restart: unless-stopped
+
+    command: ["redis-server", "--appendonly", "yes"]
+
+    volumes:
+      - ieum_redis_data:/data
+
+    networks:
+      ieum_net_green:
+        ipv4_address: 10.10.10.12
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  ieum_net_green:
+    external: true
+
+volumes:
+  ieum_redis_data:
