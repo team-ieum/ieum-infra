@@ -1,0 +1,62 @@
+name: Reset Green MongoDB
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reset_green_mongo
+  cancel-in-progress: false
+
+env:
+  COMPOSE_FILE: mongo.green.yml
+  ENV_FILE: /home/kwung/deploy/ieum-infra/mongo.green.env
+
+jobs:
+  reset-mongo:
+    name: Reset MongoDB Container
+    runs-on:
+      group: ieum_dev_server
+      labels: [self-hosted, linux, x64, ieum-infra]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure env file exists
+        run: |
+          if [ ! -f "$ENV_FILE" ]; then
+            echo "::error::$ENV_FILE 파일이 없습니다."
+            exit 1
+          fi
+
+      - name: Ensure Docker network
+        run: |
+          docker network inspect ieum_net_green >/dev/null 2>&1 \
+            || docker network create --subnet 10.10.10.0/24 ieum_net_green
+
+      - name: Reset MongoDB
+        run: |
+          docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" down -v --remove-orphans
+          docker rm -f ieum-mongo >/dev/null 2>&1 || true
+          docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 30); do
+            if docker exec ieum-mongo mongosh \
+              --quiet \
+              -u "$(grep '^MONGO_INITDB_ROOT_USERNAME=' "$ENV_FILE" | cut -d= -f2-)" \
+              -p "$(grep '^MONGO_INITDB_ROOT_PASSWORD=' "$ENV_FILE" | cut -d= -f2-)" \
+              --authenticationDatabase admin \
+              --eval 'db.adminCommand({ ping: 1 }).ok' | grep -q 1; then
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          docker logs --tail 100 ieum-mongo
+          exit 1
