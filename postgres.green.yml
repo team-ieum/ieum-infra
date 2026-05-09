@@ -1,0 +1,32 @@
+name: ieum-green-postgres
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ieum-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+    volumes:
+      - ieum_postgres_data:/var/lib/postgresql/data
+
+    networks:
+      ieum_net_green:
+        ipv4_address: 10.10.10.13
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  ieum_net_green:
+    external: true
+
+volumes:
+  ieum_postgres_data:
