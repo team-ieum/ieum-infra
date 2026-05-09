@@ -1,0 +1,47 @@
+name: Reset Green Redis
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reset_green_redis
+  cancel-in-progress: false
+
+env:
+  COMPOSE_FILE: redis.green.yml
+
+jobs:
+  reset-redis:
+    name: Reset Redis Container
+    runs-on:
+      group: ieum_dev_server
+      labels: [self-hosted, linux, x64, ieum-infra]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure Docker network
+        run: |
+          docker network inspect ieum_net_green >/dev/null 2>&1 \
+            || docker network create --subnet 10.10.10.0/24 ieum_net_green
+
+      - name: Reset Redis
+        run: |
+          docker compose -f "$COMPOSE_FILE" down -v --remove-orphans
+          docker compose -f "$COMPOSE_FILE" up -d
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 30); do
+            if docker exec ieum-redis redis-cli ping | grep -q PONG; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          docker logs --tail 100 ieum-redis
+          exit 1
