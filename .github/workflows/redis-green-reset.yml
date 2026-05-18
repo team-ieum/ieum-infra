@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  COMPOSE_FILE: compose/redis.green.yml
+  COMPOSE_FILE: compose/redis.green.compose.yml
   ENV_FILE: ${{ secrets.REDIS_ENV_FILE }}
 
   REDIS_CONTAINER_NAME: ${{ secrets.REDIS_CONTAINER_NAME }}
