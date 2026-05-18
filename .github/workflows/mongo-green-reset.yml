@@ -1,0 +1,88 @@
+name: Reset Green MongoDB
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reset_green_mongo
+  cancel-in-progress: false
+
+env:
+  COMPOSE_FILE: compose/mongo.green.compose.yml
+  ENV_FILE: ${{ secrets.MONGO_ENV_FILE }}
+
+  MONGO_CONTAINER_NAME: ${{ secrets.MONGO_CONTAINER_NAME }}
+  MONGO_IP: ${{ secrets.MONGO_IP }}
+  MONGO_INITDB_ROOT_USERNAME: ${{ secrets.MONGO_INITDB_ROOT_USERNAME }}
+  MONGO_INITDB_ROOT_PASSWORD: ${{ secrets.MONGO_INITDB_ROOT_PASSWORD }}
+
+  GREEN_NETWORK: ${{ secrets.GREEN_NETWORK }}
+  GREEN_NETWORK_SUBNET: ${{ secrets.GREEN_NETWORK_SUBNET }}
+
+jobs:
+  reset-mongo:
+    name: Reset MongoDB Container
+    runs-on:
+      group: ieum_dev_server
+      labels: [self-hosted, linux, x64, ieum-infra]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure env directory exists
+        run: |
+          mkdir -p "$(dirname "$ENV_FILE")"
+
+      - name: Create env file from GitHub Secrets
+        run: |
+          printf "%s\n" \
+            "MONGO_CONTAINER_NAME=${MONGO_CONTAINER_NAME}" \
+            "MONGO_IP=${MONGO_IP}" \
+            "MONGO_INITDB_ROOT_USERNAME=${MONGO_INITDB_ROOT_USERNAME}" \
+            "MONGO_INITDB_ROOT_PASSWORD=${MONGO_INITDB_ROOT_PASSWORD}" \
+            "GREEN_NETWORK=${GREEN_NETWORK}" \
+            "GREEN_NETWORK_SUBNET=${GREEN_NETWORK_SUBNET}" \
+            > "$ENV_FILE"
+
+      - name: Ensure Docker network
+        run: |
+          docker network inspect "$GREEN_NETWORK" >/dev/null 2>&1 \
+            || docker network create \
+                 --subnet "$GREEN_NETWORK_SUBNET" \
+                 "$GREEN_NETWORK"
+
+      - name: Reset MongoDB
+        run: |
+          docker compose \
+            -f "$COMPOSE_FILE" \
+            --env-file "$ENV_FILE" \
+            down -v --remove-orphans
+
+          docker rm -f "$MONGO_CONTAINER_NAME" >/dev/null 2>&1 || true
+
+          docker compose \
+            -f "$COMPOSE_FILE" \
+            --env-file "$ENV_FILE" \
+            up -d
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 30); do
+            if docker exec "$MONGO_CONTAINER_NAME" mongosh \
+              --quiet \
+              -u "$MONGO_INITDB_ROOT_USERNAME" \
+              -p "$MONGO_INITDB_ROOT_PASSWORD" \
+              --authenticationDatabase admin \
+              --eval 'db.adminCommand({ ping: 1 }).ok' | grep -q 1; then
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          docker logs --tail 100 "$MONGO_CONTAINER_NAME"
+          exit 1
