@@ -1,0 +1,85 @@
+name: Reset Green PostgreSQL
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reset_green_postgres
+  cancel-in-progress: false
+
+env:
+  COMPOSE_FILE: compose/postgres.green.compose.yml
+  ENV_FILE: ${{ secrets.POSTGRES_ENV_FILE }}
+
+  POSTGRES_CONTAINER_NAME: ${{ secrets.POSTGRES_CONTAINER_NAME }}
+  POSTGRES_IP: ${{ secrets.POSTGRES_IP }}
+  POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
+  POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
+  POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
+
+  GREEN_NETWORK: ${{ secrets.GREEN_NETWORK }}
+  GREEN_NETWORK_SUBNET: ${{ secrets.GREEN_NETWORK_SUBNET }}
+
+jobs:
+  reset-postgres:
+    name: Reset PostgreSQL Container
+    runs-on:
+      group: ieum_dev_server
+      labels: [self-hosted, linux, x64, ieum-infra]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure env directory exists
+        run: |
+          mkdir -p "$(dirname "$ENV_FILE")"
+
+      - name: Create env file from GitHub Secrets
+        run: |
+          printf "%s\n" \
+            "POSTGRES_CONTAINER_NAME=${POSTGRES_CONTAINER_NAME}" \
+            "POSTGRES_IP=${POSTGRES_IP}" \
+            "POSTGRES_DB=${POSTGRES_DB}" \
+            "POSTGRES_USER=${POSTGRES_USER}" \
+            "POSTGRES_PASSWORD=${POSTGRES_PASSWORD}" \
+            "GREEN_NETWORK=${GREEN_NETWORK}" \
+            "GREEN_NETWORK_SUBNET=${GREEN_NETWORK_SUBNET}" \
+            > "$ENV_FILE"
+
+      - name: Ensure Docker network
+        run: |
+          docker network inspect "$GREEN_NETWORK" >/dev/null 2>&1 \
+            || docker network create \
+                 --subnet "$GREEN_NETWORK_SUBNET" \
+                 "$GREEN_NETWORK"
+
+      - name: Reset PostgreSQL
+        run: |
+          docker compose \
+            -f "$COMPOSE_FILE" \
+            --env-file "$ENV_FILE" \
+            down -v --remove-orphans
+
+          docker rm -f "$POSTGRES_CONTAINER_NAME" >/dev/null 2>&1 || true
+
+          docker compose \
+            -f "$COMPOSE_FILE" \
+            --env-file "$ENV_FILE" \
+            up -d
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 30); do
+            if docker exec "$POSTGRES_CONTAINER_NAME" \
+              pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB"; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          docker logs --tail 100 "$POSTGRES_CONTAINER_NAME"
+          exit 1
