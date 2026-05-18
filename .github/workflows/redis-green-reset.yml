@@ -37,12 +37,12 @@ jobs:
 
       - name: Create env file from GitHub Secrets
         run: |
-          cat > "$ENV_FILE" <<EOF
-REDIS_CONTAINER_NAME=${REDIS_CONTAINER_NAME}
-REDIS_IP=${REDIS_IP}
-GREEN_NETWORK=${GREEN_NETWORK}
-GREEN_NETWORK_SUBNET=${GREEN_NETWORK_SUBNET}
-EOF
+          printf "%s\n" \
+            "REDIS_CONTAINER_NAME=${REDIS_CONTAINER_NAME}" \
+            "REDIS_IP=${REDIS_IP}" \
+            "GREEN_NETWORK=${GREEN_NETWORK}" \
+            "GREEN_NETWORK_SUBNET=${GREEN_NETWORK_SUBNET}" \
+            > "$ENV_FILE"
 
       - name: Ensure Docker network
         run: |
