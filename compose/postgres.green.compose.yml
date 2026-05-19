@@ -7,7 +7,7 @@ services:
     restart: unless-stopped
 
     ports:
-      - "${HOST_BIND_IP}:${POSTGRES_HOST_PORT}:${POSTGRES_HOST_PORT}"
+      - "${HOST_BIND_IP}:${POSTGRES_HOST_PORT}:${POSTGRES_PORT}"
 
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
