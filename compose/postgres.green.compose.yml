@@ -6,6 +6,9 @@ services:
     container_name: ${POSTGRES_CONTAINER_NAME}
     restart: unless-stopped
 
+    ports:
+      - "${HOST_BIND_IP}:${POSTGRES_HOST_PORT}:${POSTGRES_PORT}"
+
     environment:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}

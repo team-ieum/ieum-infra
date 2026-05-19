@@ -5,7 +5,9 @@ services:
     image: mongo:7
     container_name: ${MONGO_CONTAINER_NAME}
     restart: unless-stopped
-
+    ports:
+      - "${HOST_BIND_IP}:${MONGO_HOST_PORT}:${MONGO_PORT}"
+      
     environment:
       MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME}
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD}
