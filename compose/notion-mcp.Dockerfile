@@ -10,4 +10,4 @@ EXPOSE 3000
 
 # --enable-token-passthrough: 클라이언트가 매 요청 Notion-Token 헤더로 유저별 토큰을 전달한다.
 ENTRYPOINT ["npx", "-y", "@notionhq/notion-mcp-server"]
-CMD ["--transport", "http", "--port", "3000", "--enable-token-passthrough"]
+CMD ["--transport", "http", "--host", "0.0.0.0", "--port", "3000", "--enable-token-passthrough"]
