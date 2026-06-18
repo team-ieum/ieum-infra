@@ -1,0 +1,31 @@
+name: ieum-green-notion-mcp
+
+services:
+  notion-mcp:
+    build:
+      context: .
+      dockerfile: notion-mcp.Dockerfile
+    image: ieum-notion-mcp:green
+    container_name: ${NOTION_MCP_CONTAINER_NAME}
+    restart: unless-stopped
+
+    command:
+      - "--transport"
+      - "http"
+      - "--port"
+      - "${NOTION_MCP_PORT}"
+      - "--enable-token-passthrough"
+
+    # 토큰 passthrough 서버이므로 호스트로 포트를 노출하지 않는다.
+    # 같은 green_network에 있는 ieum-agent만 컨테이너명/IP로 접근한다.
+    expose:
+      - "${NOTION_MCP_PORT}"
+
+    networks:
+      green_network:
+        ipv4_address: ${NOTION_MCP_IP}
+
+networks:
+  green_network:
+    external: true
+    name: ${GREEN_NETWORK}
