@@ -9,6 +9,11 @@ services:
     container_name: ${NOTION_MCP_CONTAINER_NAME}
     restart: unless-stopped
 
+    # 게이트웨이 Bearer 인증 토큰. ieum-agent가 Authorization: Bearer로 동일 값을 보낸다.
+    # (docker inspect Args 노출을 피하려 --auth-token 플래그 대신 env로 주입)
+    environment:
+      AUTH_TOKEN: ${NOTION_MCP_AUTH_TOKEN}
+
     command:
       - "--transport"
       - "http"
