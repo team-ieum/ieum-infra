@@ -21,9 +21,10 @@ services:
     expose:
       - "${NOTION_MCP_PORT}"
 
+    # 고정 IP를 박지 않는다. ieum-agent는 컨테이너명(Docker 내장 DNS)으로 접근하므로
+    # 고정 IP가 불필요하고, 대역 내 주소 충돌(Address already in use)도 피한다.
     networks:
-      green_network:
-        ipv4_address: ${NOTION_MCP_IP}
+      - green_network
 
 networks:
   green_network:

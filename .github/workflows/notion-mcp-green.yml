@@ -15,7 +15,6 @@ env:
   ENV_FILE: ${{ secrets.NOTION_MCP_ENV_FILE }}
 
   NOTION_MCP_CONTAINER_NAME: ${{ secrets.NOTION_MCP_CONTAINER_NAME }}
-  NOTION_MCP_IP: ${{ secrets.NOTION_MCP_IP }}
   NOTION_MCP_PORT: ${{ secrets.NOTION_MCP_PORT }}
 
   GREEN_NETWORK: ${{ secrets.GREEN_NETWORK }}
@@ -40,7 +39,6 @@ jobs:
         run: |
           printf "%s\n" \
             "NOTION_MCP_CONTAINER_NAME=${NOTION_MCP_CONTAINER_NAME}" \
-            "NOTION_MCP_IP=${NOTION_MCP_IP}" \
             "NOTION_MCP_PORT=${NOTION_MCP_PORT}" \
             "GREEN_NETWORK=${GREEN_NETWORK}" \
             "GREEN_NETWORK_SUBNET=${GREEN_NETWORK_SUBNET}" \
