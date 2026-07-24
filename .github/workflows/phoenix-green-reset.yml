@@ -1,0 +1,79 @@
+name: Reset Green Phoenix
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reset_green_phoenix
+  cancel-in-progress: false
+
+env:
+  COMPOSE_FILE: compose/phoenix.green.compose.yml
+  ENV_FILE: ${{ secrets.PHOENIX_ENV_FILE }}
+
+  PHOENIX_CONTAINER_NAME: ${{ secrets.PHOENIX_CONTAINER_NAME }}
+  PHOENIX_UI_PORT: ${{ secrets.PHOENIX_UI_PORT }}
+
+  GREEN_NETWORK: ${{ secrets.GREEN_NETWORK }}
+  GREEN_NETWORK_SUBNET: ${{ secrets.GREEN_NETWORK_SUBNET }}
+
+jobs:
+  reset-phoenix:
+    name: Reset Phoenix Container
+    runs-on:
+      group: ieum_dev_server
+      labels: [self-hosted, linux, x64, ieum-infra]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure env directory exists
+        run: |
+          mkdir -p "$(dirname "$ENV_FILE")"
+
+      - name: Create env file from GitHub Secrets
+        run: |
+          printf "%s\n" \
+            "PHOENIX_CONTAINER_NAME=${PHOENIX_CONTAINER_NAME}" \
+            "PHOENIX_UI_PORT=${PHOENIX_UI_PORT}" \
+            "GREEN_NETWORK=${GREEN_NETWORK}" \
+            "GREEN_NETWORK_SUBNET=${GREEN_NETWORK_SUBNET}" \
+            > "$ENV_FILE"
+
+      - name: Ensure Docker network
+        run: |
+          docker network inspect "$GREEN_NETWORK" >/dev/null 2>&1 \
+            || docker network create \
+                 --subnet "$GREEN_NETWORK_SUBNET" \
+                 "$GREEN_NETWORK"
+
+      - name: Reset Phoenix
+        run: |
+          docker compose \
+            -f "$COMPOSE_FILE" \
+            --env-file "$ENV_FILE" \
+            down -v --remove-orphans
+
+          docker rm -f "$PHOENIX_CONTAINER_NAME" >/dev/null 2>&1 || true
+
+          docker compose \
+            -f "$COMPOSE_FILE" \
+            --env-file "$ENV_FILE" \
+            up -d
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 30); do
+            if docker exec "$PHOENIX_CONTAINER_NAME" \
+                 python -c "import urllib.request; urllib.request.urlopen('http://localhost:6006')" >/dev/null 2>&1; then
+              exit 0
+            fi
+            sleep 2
+          done
+
+          docker logs --tail 100 "$PHOENIX_CONTAINER_NAME"
+          exit 1
