@@ -1,8 +1,6 @@
 name: Deploy Main Phoenix
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
