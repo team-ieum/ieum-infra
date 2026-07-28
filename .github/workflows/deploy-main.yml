@@ -1,0 +1,189 @@
+name: Deploy Main Infra
+
+on:
+  push:
+    branches: [infra/IEUM-SRV-26]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy_main_infra
+  cancel-in-progress: false
+
+env:
+  REDIS_COMPOSE_FILE: compose/redis.green.compose.yml
+  MONGO_COMPOSE_FILE: compose/mongo.green.compose.yml
+
+  REDIS_ENV_FILE: ${{ secrets.REDIS_ENV_FILE }}
+  REDIS_CONTAINER_NAME: ${{ secrets.REDIS_CONTAINER_NAME }}
+  REDIS_IP: ${{ secrets.REDIS_IP }}
+
+  MONGO_ENV_FILE: ${{ secrets.MONGO_ENV_FILE }}
+  MONGO_CONTAINER_NAME: ${{ secrets.MONGO_CONTAINER_NAME }}
+  MONGO_IP: ${{ secrets.MONGO_IP }}
+  MONGO_PORT: ${{ secrets.MONGO_PORT }}
+  MONGO_HOST_PORT: ${{ secrets.MONGO_HOST_PORT }}
+  MONGO_INITDB_DATABASE: ${{ secrets.MONGO_INITDB_DATABASE }}
+  MONGO_INITDB_ROOT_USERNAME: ${{ secrets.MONGO_INITDB_ROOT_USERNAME }}
+  MONGO_INITDB_ROOT_PASSWORD: ${{ secrets.MONGO_INITDB_ROOT_PASSWORD }}
+
+  HOST_BIND_IP: ${{ secrets.HOST_BIND_IP }}
+
+  GREEN_NETWORK: ${{ secrets.GREEN_NETWORK }}
+  GREEN_NETWORK_SUBNET: ${{ secrets.GREEN_NETWORK_SUBNET }}
+
+jobs:
+  deploy-main-infra:
+    name: Deploy Main Redis and MongoDB
+    runs-on:
+      group: ieum_main_server
+      labels: [self-hosted, linux, x64, ieum-infra]
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check runner prerequisites
+        run: |
+          set -euo pipefail
+
+          command -v docker >/dev/null
+          docker compose version >/dev/null
+
+      - name: Apply main defaults
+        run: |
+          set -euo pipefail
+
+          {
+            printf 'REDIS_ENV_FILE=%s\n' "${REDIS_ENV_FILE:-/opt/ieum/deploy/infra/redis.env}"
+            printf 'REDIS_CONTAINER_NAME=%s\n' "${REDIS_CONTAINER_NAME:-ieum-redis}"
+            printf 'REDIS_IP=%s\n' "${REDIS_IP:-10.10.10.12}"
+
+            printf 'MONGO_ENV_FILE=%s\n' "${MONGO_ENV_FILE:-/opt/ieum/deploy/infra/mongo.env}"
+            printf 'MONGO_CONTAINER_NAME=%s\n' "${MONGO_CONTAINER_NAME:-ieum-mongo}"
+            printf 'MONGO_IP=%s\n' "${MONGO_IP:-10.10.10.13}"
+            printf 'MONGO_PORT=%s\n' "${MONGO_PORT:-27017}"
+            printf 'MONGO_HOST_PORT=%s\n' "${MONGO_HOST_PORT:-27017}"
+            printf 'MONGO_INITDB_DATABASE=%s\n' "${MONGO_INITDB_DATABASE:-ieum}"
+
+            printf 'HOST_BIND_IP=%s\n' "${HOST_BIND_IP:-127.0.0.1}"
+            printf 'GREEN_NETWORK=%s\n' "${GREEN_NETWORK:-ieum_net_main}"
+            printf 'GREEN_NETWORK_SUBNET=%s\n' "${GREEN_NETWORK_SUBNET:-10.10.10.0/24}"
+          } >> "$GITHUB_ENV"
+
+      - name: Validate required secrets
+        run: |
+          set -euo pipefail
+
+          missing=0
+          for name in MONGO_INITDB_ROOT_USERNAME MONGO_INITDB_ROOT_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Missing GitHub secret: ${name}"
+              missing=1
+            fi
+          done
+
+          exit "$missing"
+
+      - name: Write env files
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$(dirname "$REDIS_ENV_FILE")" "$(dirname "$MONGO_ENV_FILE")"
+
+          printf "%s\n" \
+            "REDIS_CONTAINER_NAME=${REDIS_CONTAINER_NAME}" \
+            "REDIS_IP=${REDIS_IP}" \
+            "GREEN_NETWORK=${GREEN_NETWORK}" \
+            "GREEN_NETWORK_SUBNET=${GREEN_NETWORK_SUBNET}" \
+            > "$REDIS_ENV_FILE"
+
+          printf "%s\n" \
+            "MONGO_CONTAINER_NAME=${MONGO_CONTAINER_NAME}" \
+            "MONGO_IP=${MONGO_IP}" \
+            "MONGO_PORT=${MONGO_PORT}" \
+            "MONGO_HOST_PORT=${MONGO_HOST_PORT}" \
+            "MONGO_INITDB_DATABASE=${MONGO_INITDB_DATABASE}" \
+            "MONGO_INITDB_ROOT_USERNAME=${MONGO_INITDB_ROOT_USERNAME}" \
+            "MONGO_INITDB_ROOT_PASSWORD=${MONGO_INITDB_ROOT_PASSWORD}" \
+            "HOST_BIND_IP=${HOST_BIND_IP}" \
+            "GREEN_NETWORK=${GREEN_NETWORK}" \
+            "GREEN_NETWORK_SUBNET=${GREEN_NETWORK_SUBNET}" \
+            > "$MONGO_ENV_FILE"
+
+          chmod 600 "$REDIS_ENV_FILE" "$MONGO_ENV_FILE"
+
+      - name: Ensure Docker network
+        run: |
+          set -euo pipefail
+
+          if docker network inspect "$GREEN_NETWORK" >/dev/null 2>&1; then
+            current_subnet="$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' "$GREEN_NETWORK")"
+            if [ "$current_subnet" != "$GREEN_NETWORK_SUBNET" ]; then
+              echo "::error::Docker network ${GREEN_NETWORK} already exists with subnet ${current_subnet}, expected ${GREEN_NETWORK_SUBNET}"
+              exit 1
+            fi
+
+            exit 0
+          fi
+
+          docker network create \
+            --subnet "$GREEN_NETWORK_SUBNET" \
+            "$GREEN_NETWORK"
+
+      - name: Deploy Redis
+        run: |
+          set -euo pipefail
+
+          docker compose \
+            -f "$REDIS_COMPOSE_FILE" \
+            --env-file "$REDIS_ENV_FILE" \
+            up -d --remove-orphans
+
+      - name: Deploy MongoDB
+        run: |
+          set -euo pipefail
+
+          docker compose \
+            -f "$MONGO_COMPOSE_FILE" \
+            --env-file "$MONGO_ENV_FILE" \
+            up -d --remove-orphans
+
+      - name: Health check Redis
+        run: |
+          set -euo pipefail
+
+          for i in $(seq 1 30); do
+            if docker exec "$REDIS_CONTAINER_NAME" redis-cli ping | grep -q PONG; then
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          docker logs --tail 100 "$REDIS_CONTAINER_NAME"
+          exit 1
+
+      - name: Health check MongoDB
+        run: |
+          set -euo pipefail
+
+          for i in $(seq 1 30); do
+            if docker exec "$MONGO_CONTAINER_NAME" mongosh \
+              --quiet \
+              -u "$MONGO_INITDB_ROOT_USERNAME" \
+              -p "$MONGO_INITDB_ROOT_PASSWORD" \
+              --authenticationDatabase admin \
+              --eval 'db.adminCommand({ ping: 1 }).ok' | grep -q 1; then
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          docker logs --tail 100 "$MONGO_CONTAINER_NAME"
+          exit 1
+
