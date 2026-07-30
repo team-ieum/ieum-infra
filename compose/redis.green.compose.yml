@@ -8,6 +8,9 @@ services:
 
     command: ["redis-server", "--appendonly", "yes"]
 
+    ports:
+      - "${HOST_BIND_IP:-127.0.0.1}:${REDIS_HOST_PORT:-6379}:6379"
+
     volumes:
       - ieum_redis_data:/data
 

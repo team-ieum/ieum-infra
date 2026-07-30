@@ -1,0 +1,116 @@
+name: Deploy Main MongoDB
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy_main_mongo
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  COMPOSE_FILE: compose/mongo.green.compose.yml
+  MONGO_CONTAINER_NAME: ${{ secrets.AWS_MONGO_CONTAINER_NAME }}
+  MONGO_IP: ${{ secrets.AWS_MONGO_IP }}
+  MONGO_PORT: ${{ secrets.AWS_MONGO_PORT }}
+  MONGO_HOST_PORT: ${{ secrets.AWS_MONGO_HOST_PORT }}
+  MONGO_INITDB_DATABASE: ${{ secrets.AWS_MONGO_INITDB_DATABASE }}
+  MONGO_INITDB_ROOT_USERNAME: ${{ secrets.AWS_MONGO_INITDB_ROOT_USERNAME }}
+  MONGO_INITDB_ROOT_PASSWORD: ${{ secrets.AWS_MONGO_INITDB_ROOT_PASSWORD }}
+  HOST_BIND_IP: ${{ secrets.AWS_HOST_BIND_IP }}
+  GREEN_NETWORK: ${{ secrets.AWS_DOCKER_NETWORK }}
+  GREEN_NETWORK_SUBNET: ${{ secrets.AWS_DOCKER_NETWORK_SUBNET }}
+
+jobs:
+  deploy-mongo:
+    name: Deploy MongoDB Container
+    runs-on:
+      group: ieum_main_server
+      labels: [self-hosted, linux, x64, ieum-infra, main, deploy]
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check runner prerequisites
+        run: |
+          set -euo pipefail
+
+          command -v docker >/dev/null
+          docker compose version >/dev/null
+
+      - name: Validate secrets
+        run: |
+          set -euo pipefail
+
+          missing_vars=()
+          for name in \
+            MONGO_CONTAINER_NAME \
+            MONGO_IP \
+            MONGO_PORT \
+            MONGO_HOST_PORT \
+            MONGO_INITDB_DATABASE \
+            MONGO_INITDB_ROOT_USERNAME \
+            MONGO_INITDB_ROOT_PASSWORD \
+            HOST_BIND_IP \
+            GREEN_NETWORK \
+            GREEN_NETWORK_SUBNET
+          do
+            [ -n "${!name}" ] || missing_vars+=("$name")
+          done
+
+          if [ ${#missing_vars[@]} -gt 0 ]; then
+            echo "::error::Missing secrets for: ${missing_vars[*]}"
+            exit 1
+          fi
+
+      - name: Ensure Docker network
+        run: |
+          set -euo pipefail
+
+          if docker network inspect "$GREEN_NETWORK" >/dev/null 2>&1; then
+            current_subnet="$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' "$GREEN_NETWORK")"
+            if [ "$current_subnet" != "$GREEN_NETWORK_SUBNET" ]; then
+              echo "::error::Docker network ${GREEN_NETWORK} already exists with subnet ${current_subnet}, expected ${GREEN_NETWORK_SUBNET}"
+              exit 1
+            fi
+
+            exit 0
+          fi
+
+          docker network create --subnet "$GREEN_NETWORK_SUBNET" "$GREEN_NETWORK"
+
+      - name: Deploy MongoDB
+        run: |
+          set -euo pipefail
+
+          docker compose \
+            -f "$COMPOSE_FILE" \
+            up -d
+
+      - name: Health check
+        run: |
+          set -euo pipefail
+
+          for i in $(seq 1 30); do
+            if docker exec "$MONGO_CONTAINER_NAME" mongosh \
+              --quiet \
+              -u "$MONGO_INITDB_ROOT_USERNAME" \
+              -p "$MONGO_INITDB_ROOT_PASSWORD" \
+              --authenticationDatabase admin \
+              --eval 'db.adminCommand({ ping: 1 }).ok' | grep -q 1; then
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          docker logs --tail 100 "$MONGO_CONTAINER_NAME"
+          exit 1

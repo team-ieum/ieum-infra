@@ -25,10 +25,10 @@ services:
       - "${NOTION_MCP_PORT}"
       - "--enable-token-passthrough"
 
-    # 토큰 passthrough 서버이므로 호스트로 포트를 노출하지 않는다.
-    # 같은 green_network에 있는 ieum-agent만 컨테이너명/IP로 접근한다.
-    expose:
-      - "${NOTION_MCP_PORT}"
+    # AWS 배포 서버에서는 agent EC2가 infra EC2의 private IP로 접근하므로 host port를 연다.
+    # 기본 bind를 localhost로 두어 기존 개발 서버 reset workflow의 노출 범위는 유지한다.
+    ports:
+      - "${HOST_BIND_IP:-127.0.0.1}:${NOTION_MCP_HOST_PORT:-3000}:${NOTION_MCP_PORT}"
 
     # 고정 IP를 박지 않는다. ieum-agent는 컨테이너명(Docker 내장 DNS)으로 접근하므로
     # 고정 IP가 불필요하고, 대역 내 주소 충돌(Address already in use)도 피한다.
