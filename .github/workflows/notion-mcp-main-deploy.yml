@@ -1,0 +1,105 @@
+name: Deploy Main Notion MCP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy_main_notion_mcp
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  COMPOSE_FILE: compose/notion-mcp.green.compose.yml
+  NOTION_MCP_CONTAINER_NAME: ${{ secrets.AWS_NOTION_MCP_CONTAINER_NAME }}
+  NOTION_MCP_PORT: ${{ secrets.AWS_NOTION_MCP_PORT }}
+  NOTION_MCP_HOST_PORT: ${{ secrets.AWS_NOTION_MCP_HOST_PORT }}
+  NOTION_MCP_AUTH_TOKEN: ${{ secrets.NOTION_MCP_AUTH_TOKEN }}
+  HOST_BIND_IP: ${{ secrets.AWS_HOST_BIND_IP }}
+  GREEN_NETWORK: ${{ secrets.AWS_DOCKER_NETWORK }}
+  GREEN_NETWORK_SUBNET: ${{ secrets.AWS_DOCKER_NETWORK_SUBNET }}
+
+jobs:
+  deploy-notion-mcp:
+    name: Deploy Notion MCP Container
+    runs-on:
+      group: ieum_main_server
+      labels: [self-hosted, linux, x64, ieum-infra, main, deploy]
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check runner prerequisites
+        run: |
+          set -euo pipefail
+
+          command -v docker >/dev/null
+          docker compose version >/dev/null
+
+      - name: Validate secrets
+        run: |
+          set -euo pipefail
+
+          missing_vars=()
+          for name in \
+            NOTION_MCP_CONTAINER_NAME \
+            NOTION_MCP_PORT \
+            NOTION_MCP_HOST_PORT \
+            NOTION_MCP_AUTH_TOKEN \
+            HOST_BIND_IP \
+            GREEN_NETWORK \
+            GREEN_NETWORK_SUBNET
+          do
+            [ -n "${!name}" ] || missing_vars+=("$name")
+          done
+
+          if [ ${#missing_vars[@]} -gt 0 ]; then
+            echo "::error::Missing secrets for: ${missing_vars[*]}"
+            exit 1
+          fi
+
+      - name: Ensure Docker network
+        run: |
+          set -euo pipefail
+
+          if docker network inspect "$GREEN_NETWORK" >/dev/null 2>&1; then
+            current_subnet="$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' "$GREEN_NETWORK")"
+            if [ "$current_subnet" != "$GREEN_NETWORK_SUBNET" ]; then
+              echo "::error::Docker network ${GREEN_NETWORK} already exists with subnet ${current_subnet}, expected ${GREEN_NETWORK_SUBNET}"
+              exit 1
+            fi
+
+            exit 0
+          fi
+
+          docker network create --subnet "$GREEN_NETWORK_SUBNET" "$GREEN_NETWORK"
+
+      - name: Deploy Notion MCP
+        run: |
+          set -euo pipefail
+
+          docker compose \
+            -f "$COMPOSE_FILE" \
+            up -d --build
+
+      - name: Health check
+        run: |
+          set -euo pipefail
+
+          for i in $(seq 1 30); do
+            if [ "$(docker inspect -f '{{.State.Running}}' "$NOTION_MCP_CONTAINER_NAME" 2>/dev/null)" = "true" ]; then
+              exit 0
+            fi
+
+            sleep 2
+          done
+
+          docker logs --tail 100 "$NOTION_MCP_CONTAINER_NAME"
+          exit 1
