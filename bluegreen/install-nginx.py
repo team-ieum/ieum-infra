@@ -2,13 +2,32 @@
 """Install routing and persistent asset fallback, preserving existing TLS/WAF settings."""
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
+import contextlib
+import fcntl
 import os
 from pathlib import Path
 import pwd
 import re
 import shutil
+import stat
 import subprocess
 import time
+
+DEPLOYMENT_HOME = Path(os.environ.get('IEUM_BLUEGREEN_HOME', '/home/kwung/deploy/bluegreen'))
+
+PREVIOUS_ARCHIVE_ASSET_LOCATIONS = '''    location ^~ /assets/ {
+        proxy_pass http://ieum_frontend;
+        proxy_intercept_errors on;
+        error_page 404 502 503 504 = @ieum_archived_assets;
+    }
+
+    location @ieum_archived_assets {
+        root /var/lib/ieum-bluegreen;
+        try_files $uri =404;
+        add_header Cache-Control "public, max-age=2592000, immutable";
+    }
+
+'''
 
 ASSET_LOCATIONS = '''    location ^~ /assets/ {
         proxy_pass http://ieum_frontend;
@@ -19,7 +38,7 @@ ASSET_LOCATIONS = '''    location ^~ /assets/ {
     location @ieum_archived_assets {
         root /var/lib/ieum-bluegreen;
         try_files $uri =404;
-        add_header Cache-Control "public, max-age=2592000, immutable";
+        expires 30d;
     }
 
 '''
@@ -49,7 +68,9 @@ def render_site(original):
         changed = changed.replace('    location /api/ {',
             '    location /api/ {\n        proxy_buffering off;\n        proxy_read_timeout 600s;')
     # Upgrade either our original fallback or our current configuration idempotently.
-    changed = changed.replace(LEGACY_ASSET_LOCATIONS, '').replace(ASSET_LOCATIONS, '')
+    # expires sets cache freshness without suppressing inherited add_header policy.
+    changed = changed.replace(LEGACY_ASSET_LOCATIONS, '')
+    changed = changed.replace(PREVIOUS_ARCHIVE_ASSET_LOCATIONS, '').replace(ASSET_LOCATIONS, '')
     if re.search(r'location\s+(?:\^~\s+)?/assets/|location\s+@ieum_(?:previous|archived)_assets', changed):
         raise RuntimeError('Unrecognized custom asset locations; preserve and review them before installation')
     root_location = '    location / {\n        proxy_pass http://ieum_frontend;'
@@ -62,9 +83,38 @@ def render_main(original):
         return original
     return 'worker_shutdown_timeout 600s;\n' + original
 
-def main():
-    if os.geteuid() != 0:
-        raise SystemExit('Run with sudo')
+@contextlib.contextmanager
+def deployment_lock(owner):
+    # Do not create a root-owned deployment directory that the controller cannot use.
+    try:
+        directory = DEPLOYMENT_HOME.lstat()
+    except FileNotFoundError:
+        raise RuntimeError('Create the deployment directory as kwung before installing Nginx routing') from None
+    if not stat.S_ISDIR(directory.st_mode) or directory.st_uid != owner.pw_uid:
+        raise RuntimeError('Deployment directory must be a real directory owned by kwung')
+    path = DEPLOYMENT_HOME / 'deploy.lock'
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        descriptor = os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        descriptor = os.open(path, flags)
+        created = False
+    else:
+        created = True
+    try:
+        if created:
+            os.fchown(descriptor, owner.pw_uid, owner.pw_gid)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != owner.pw_uid \
+                or metadata.st_mode & 0o022:
+            raise RuntimeError('Deployment lock must be a regular file owned and writable only by kwung')
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
+
+
+def install_locked(owner):
     source = Path(__file__).resolve().parent
     helper = Path('/usr/local/sbin/ieum-bluegreen-nginx')
     site = Path('/etc/nginx/sites-available/ieum-front.conf')
@@ -82,7 +132,6 @@ def main():
     for path in paths:
         if path.exists():
             shutil.copy2(path, backups / path.name)
-    owner = pwd.getpwnam('kwung')
     for directory, mode in ((backups.parent.parent / 'assets', 0o755),
                             (backups.parent.parent / 'staging', 0o700)):
         directory.mkdir(exist_ok=True, mode=mode)
@@ -125,6 +174,15 @@ def main():
             raise RuntimeError('Installation failed and rollback reload failed; inspect Nginx') from original_error
         raise
     print('Installed routing, independent asset archive and bounded Nginx worker shutdown')
+
+
+def main():
+    if os.geteuid() != 0:
+        raise SystemExit('Run with sudo')
+    owner = pwd.getpwnam('kwung')
+    # Lock before reading live configuration and retain the lock through rollback.
+    with deployment_lock(owner):
+        install_locked(owner)
 
 if __name__ == '__main__':
     main()

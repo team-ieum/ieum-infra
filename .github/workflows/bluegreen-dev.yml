@@ -16,6 +16,19 @@ on:
         description: Exact retained release ID from status (required for rollback)
         type: string
         default: ''
+      force:
+        description: Isolate an unresponsive managed backend before switching (may interrupt work)
+        type: boolean
+        default: false
+      recovery_target:
+        description: Healthy destination for recover; auto follows the journal state
+        type: choice
+        options: [auto, blue, green]
+        default: auto
+      abandon:
+        description: Recover only; isolate both backends and archive the journal for forward-fix (requires force)
+        type: boolean
+        default: false
 permissions:
   contents: read
 concurrency:
@@ -33,20 +46,40 @@ jobs:
           OPERATION: ${{ inputs.operation }}
           COLOR: ${{ inputs.color }}
           RELEASE: ${{ inputs.rollback_release }}
+          FORCE: ${{ inputs.force }}
+          RECOVERY_TARGET: ${{ inputs.recovery_target }}
+          ABANDON: ${{ inputs.abandon }}
           CONTROLLER_SHA256: ${{ vars.BLUEGREEN_CONTROLLER_SHA256 }}
           HELPER_SHA256: ${{ vars.BLUEGREEN_HELPER_SHA256 }}
         run: |
           set -euo pipefail
           controller=/home/kwung/deploy/bluegreen/bluegreen.py
           helper=/usr/local/sbin/ieum-bluegreen-nginx
-          [[ "$CONTROLLER_SHA256" =~ ^[[:xdigit:]]{64}$ && "$HELPER_SHA256" =~ ^[[:xdigit:]]{64}$ ]]
+          if ! [[ "$CONTROLLER_SHA256" =~ ^[[:xdigit:]]{64}$ && "$HELPER_SHA256" =~ ^[[:xdigit:]]{64}$ ]]; then exit 1; fi
           printf '%s  %s\n' "$CONTROLLER_SHA256" "$controller" | sha256sum -c - >/dev/null 2>&1
           printf '%s  %s\n' "$HELPER_SHA256" "$helper" | sha256sum -c - >/dev/null 2>&1
+          if ! [[ "$FORCE" == true || "$FORCE" == false ]]; then exit 1; fi
+          if ! [[ "$ABANDON" == true || "$ABANDON" == false ]]; then exit 1; fi
+          command_args=("$controller" "$OPERATION")
           case "$OPERATION" in
-            status|recover) python3 "$controller" "$OPERATION" ;;
+            status) ;;
+            recover)
+              case "$RECOVERY_TARGET" in
+                auto) ;;
+                blue|green) command_args+=(--target "$RECOVERY_TARGET") ;;
+                *) exit 1 ;;
+              esac
+              if [[ "$ABANDON" == true ]]; then
+                if ! [[ "$FORCE" == true && "$RECOVERY_TARGET" == auto ]]; then exit 1; fi
+                command_args+=(--abandon)
+              fi ;;
             rollback)
-              [[ "$RELEASE" =~ ^[[:xdigit:]]{16}$ ]]
-              python3 "$controller" rollback --release "$RELEASE" ;;
-            check|switch) python3 "$controller" "$OPERATION" "$COLOR" ;;
+              if ! [[ "$RELEASE" =~ ^[[:xdigit:]]{16}$ ]]; then exit 1; fi
+              command_args+=(--release "$RELEASE") ;;
+            switch|check) command_args+=("$COLOR") ;;
             *) exit 1 ;;
           esac
+          if [[ "$FORCE" == true && "$OPERATION" =~ ^(recover|rollback|switch)$ ]]; then
+            command_args+=(--force)
+          fi
+          python3 "${command_args[@]}"

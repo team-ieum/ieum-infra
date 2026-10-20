@@ -33,11 +33,16 @@ class DeploymentSafetyTest(unittest.TestCase):
             for color in ('blue', 'green')}})
         bg.atomic(bg.HOME / 'control/active', 'green\n')
         bg.atomic(bg.HOME / 'control/phase', 'ready\n')
+        bg.atomic(bg.HOME / 'control/pending-recovery-not-before', '2026-10-20T00:00:00Z\n')
         self.set_route('green')
         bg.atomic(bg.HOME / 'snapshots/legacy.json', json.dumps({
             app: {'image': 'legacy-' + app, 'environment': {}} for app in bg.APPS}))
         for attribute, kwargs in [
             ('exists', {'return_value': False}), ('slot_images', {'side_effect': images}),
+            ('backend_identity', {'side_effect': lambda c: {
+                'id': ('b' if c == 'blue' else 'c') * 64,
+                'image': images(c)['backend'], 'name': bg.name(c, 'backend'),
+                'restartPolicy': {'Name': 'unless-stopped', 'MaximumRetryCount': 0}}}),
             ('archive_frontend', {}), ('check', {'return_value': details()}),
             ('verify_ingress', {}), ('control', {'return_value': details()})]:
             p = patch.object(bg, attribute, **kwargs)
@@ -61,9 +66,129 @@ class DeploymentSafetyTest(unittest.TestCase):
         self.assertEqual([c.args[0] for c in route.call_args_list], ['blue', 'green'])
         self.assertEqual([c.args[0] for c in verify.call_args_list], ['blue', 'green'])
         self.assertEqual(bg.state()['active'], 'green')
-        self.assertIsNone(bg.state()['previous'])
-        self.assertEqual(bg.state()['slots']['blue']['status'], 'failed')
+        self.assertEqual(bg.state()['previous'], 'blue')
+        self.assertEqual(bg.state()['slots']['blue']['status'], 'retained')
         self.assertFalse((bg.HOME / 'transaction.json').exists())
+
+    def test_failed_new_candidate_is_not_mistaken_for_retained_release(self):
+        data = bg.state(); data['previous'] = None; data['slots']['blue']['status'] = 'candidate'; bg.save(data)
+        with patch.object(bg, 'route', side_effect=self.set_route), \
+             patch.object(bg, 'verify_ingress', side_effect=[RuntimeError('probe'), None]):
+            with self.assertRaisesRegex(RuntimeError, 'probe'): bg.switch('blue')
+        self.assertEqual(bg.state()['slots']['blue']['status'], 'failed')
+        self.assertIsNone(bg.state()['previous'])
+
+    def test_failed_retained_probe_can_be_retried_with_same_release(self):
+        with patch.object(bg, 'route', side_effect=self.set_route), \
+             patch.object(bg, 'verify_ingress', side_effect=[RuntimeError('temporary probe'), None]):
+            with self.assertRaisesRegex(RuntimeError, 'temporary probe'): bg.rollback(bg.release_id(images('blue')))
+        with patch.object(bg, 'route', side_effect=self.set_route):
+            bg.rollback(bg.release_id(images('blue')))
+        self.assertEqual(bg.state()['active'], 'blue')
+
+    def isolate(self, transaction, color):
+        transaction.setdefault('isolated', {})[color] = transaction['backends'][color]
+        bg.write_transaction(transaction)
+
+    def test_force_switch_isolates_unresponsive_active_before_resuming_healthy_target(self):
+        calls = []
+        def control(color, action=None):
+            calls.append((color, action))
+            if color == 'green': raise OSError('active backend down')
+            return details()
+        def isolate(transaction, color):
+            calls.append((color, 'isolate')); self.isolate(transaction, color)
+        with patch.object(bg, 'control', side_effect=control), \
+             patch.object(bg, 'quarantine_backend', side_effect=isolate), \
+             patch.object(bg, 'route', side_effect=self.set_route):
+            bg.switch('blue', force=True)
+        self.assertEqual(calls[:3], [('green', 'drain'), ('green', 'isolate'), ('blue', 'resume')])
+        self.assertEqual(bg.state()['active'], 'blue')
+        self.assertEqual(bg.state()['slots']['green']['status'], 'isolated')
+        self.assertIsNone(bg.state()['previous'])
+        self.assertFalse((bg.HOME / 'transaction.json').exists())
+        self.assertEqual([c.args[0] for c in bg.verify_ingress.call_args_list], ['blue'])
+
+    def test_unresponsive_source_is_not_silently_ignored_without_force(self):
+        def control(color, action=None):
+            if color == 'green': raise OSError('active backend down')
+            return details()
+        with patch.object(bg, 'control', side_effect=control), \
+             patch.object(bg, 'quarantine_backend') as isolate, \
+             patch.object(bg, 'route', side_effect=self.set_route):
+            with self.assertRaisesRegex(RuntimeError, 'rollback is incomplete'): bg.switch('blue')
+        isolate.assert_not_called()
+        self.assertTrue((bg.HOME / 'transaction.json').exists())
+
+    def test_force_recovery_can_finish_healthy_target_after_failed_source_drain(self):
+        def control(color, action=None):
+            if color == 'green': raise OSError('active backend down')
+            return details()
+        with patch.object(bg, 'control', side_effect=control), patch.object(bg, 'route', side_effect=self.set_route):
+            with self.assertRaises(RuntimeError): bg.switch('blue')
+            with patch.object(bg, 'quarantine_backend', side_effect=self.isolate):
+                bg.recover(force=True, target='blue')
+        self.assertEqual(bg.state()['active'], 'blue')
+        self.assertFalse((bg.HOME / 'transaction.json').exists())
+
+    def test_dead_candidate_cannot_prevent_previous_background_resuming(self):
+        calls = []
+        def control(color, action=None):
+            calls.append((color, action))
+            if (color, action) == ('blue', 'drain'): raise OSError('candidate died')
+            return details()
+        with patch.object(bg, 'control', side_effect=control), \
+             patch.object(bg, 'route', side_effect=self.set_route), \
+             patch.object(bg, 'verify_ingress', side_effect=[RuntimeError('candidate died'), None]), \
+             patch.object(bg, 'quarantine_backend', side_effect=self.isolate) as isolate:
+            with self.assertRaisesRegex(RuntimeError, 'candidate died'): bg.switch('blue')
+        self.assertLess(calls.index(('green', 'resume')), calls.index(('blue', 'drain')))
+        isolate.assert_called_once()
+        self.assertEqual(bg.state()['active'], 'green')
+        self.assertEqual(bg.state()['slots']['blue']['status'], 'isolated')
+        self.assertFalse((bg.HOME / 'transaction.json').exists())
+
+    def test_failed_candidate_isolation_preserves_journal_but_old_background_is_resumed(self):
+        def control(color, action=None):
+            if (color, action) == ('blue', 'drain'): raise OSError('candidate died')
+            return details()
+        with patch.object(bg, 'control', side_effect=control) as controls, \
+             patch.object(bg, 'route', side_effect=self.set_route), \
+             patch.object(bg, 'verify_ingress', side_effect=RuntimeError('candidate died')), \
+             patch.object(bg, 'quarantine_backend', side_effect=RuntimeError('Docker unavailable')):
+            with self.assertRaisesRegex(RuntimeError, 'rollback is incomplete'): bg.switch('blue')
+        self.assertIn(('green', 'resume'), [c.args for c in controls.call_args_list])
+        self.assertTrue((bg.HOME / 'transaction.json').exists())
+
+    def test_abandon_requires_force_and_archives_journal_after_isolating_both_backends(self):
+        original = bg.state()
+        transaction = {'from': 'green', 'to': 'blue', 'snapshot': original, 'targetImages': images('blue'),
+            'backends': {c: bg.backend_identity(c) for c in ('blue', 'green')}}
+        bg.write_transaction(transaction)
+        with patch.object(bg, 'quarantine_backend', side_effect=self.isolate) as isolate:
+            with self.assertRaisesRegex(RuntimeError, '--abandon --force'): bg.recover(abandon=True)
+            isolate.assert_not_called()
+            bg.recover(abandon=True, force=True)
+        self.assertEqual([c.args[1] for c in isolate.call_args_list], ['green', 'blue'])
+        self.assertEqual(bg.state()['active'], 'green')
+        self.assertIsNone(bg.state()['previous'])
+        self.assertFalse((bg.HOME / 'transaction.json').exists())
+        self.assertEqual(len(list((bg.HOME / 'abandoned-transactions').glob('*.json'))), 1)
+
+    def test_environment_replace_removes_omitted_keys_without_changing_other_apps(self):
+        bg.atomic(bg.HOME / 'runtime/green/backend.env', 'KEEP=old\nDELETE=old\n')
+        candidate = bg.HOME / 'candidate.env'; bg.atomic(candidate, 'KEEP=new\n')
+        self.assertEqual(bg.env_values('backend', {}, 'green', candidate), {'KEEP': 'new', 'DELETE': 'old'})
+        self.assertEqual(bg.env_values('backend', {}, 'green', candidate, replace=True), {'KEEP': 'new'})
+        self.assertEqual(bg.env_values('backend', {}, 'green'), {'KEEP': 'old', 'DELETE': 'old'})
+
+    def test_pending_cutoff_requires_explicit_offset_and_is_immutable(self):
+        (bg.HOME / 'control/pending-recovery-not-before').unlink()
+        with self.assertRaisesRegex(RuntimeError, 'Review existing PENDING'): bg.pending_recovery_cutoff()
+        with self.assertRaisesRegex(RuntimeError, 'ISO-8601'): bg.pending_recovery_cutoff('2026-10-20T09:00:00')
+        self.assertEqual(bg.pending_recovery_cutoff('2026-10-20T09:00:00+09:00'), '2026-10-20T00:00:00Z')
+        self.assertEqual(bg.pending_recovery_cutoff(), '2026-10-20T00:00:00Z')
+        with self.assertRaisesRegex(RuntimeError, 'immutable'): bg.pending_recovery_cutoff('2026-10-21T00:00:00Z')
 
     def test_restore_failure_keeps_journal_and_original_cause(self):
         original = RuntimeError('original probe failure')
@@ -99,7 +224,8 @@ class DeploymentSafetyTest(unittest.TestCase):
         data['slots']['blue']['status'] = 'active'; data['slots']['green']['status'] = 'retained'
         bg.save(data); self.set_route('blue'); bg.atomic(bg.HOME / 'control/active', 'blue\n')
         bg.atomic(bg.HOME / 'transaction.json', json.dumps({
-            'from': 'green', 'to': 'blue', 'snapshot': original, 'targetImages': images('blue')}))
+            'from': 'green', 'to': 'blue', 'snapshot': original, 'targetImages': images('blue'),
+            'backends': {c: bg.backend_identity(c) for c in ('blue', 'green')}}))
         with patch.object(bg, 'route') as route: bg.recover()
         route.assert_not_called()
         self.assertEqual(bg.state()['active'], 'blue')
@@ -113,6 +239,107 @@ class DeploymentSafetyTest(unittest.TestCase):
         with patch.object(bg, 'docker') as docker:
             with self.assertRaisesRegex(RuntimeError, 'active environment'): bg.remove_inactive('green')
         docker.assert_not_called()
+
+    def test_force_switch_uses_snapshot_when_isolated_source_disappears(self):
+        vanished = set()
+        def current_images(color):
+            if color in vanished: raise RuntimeError('No such container')
+            return images(color)
+        def isolate(transaction, color):
+            self.isolate(transaction, color); vanished.add(color)
+        def control(color, action=None):
+            if (color, action) == ('green', 'drain'): raise OSError('source disappeared')
+            return details()
+        with patch.object(bg, 'slot_images', side_effect=current_images), \
+             patch.object(bg, 'control', side_effect=control), \
+             patch.object(bg, 'quarantine_backend', side_effect=isolate), \
+             patch.object(bg, 'route', side_effect=self.set_route):
+            bg.switch('blue', force=True)
+        self.assertEqual(bg.state()['active'], 'blue')
+        self.assertEqual(bg.state()['slots']['green']['images'], images('green'))
+        self.assertIsNone(bg.state()['previous'])
+        self.assertFalse((bg.HOME / 'transaction.json').exists())
+
+    def test_force_recover_uses_snapshot_for_absent_isolated_source(self):
+        transaction = {'from': 'green', 'to': 'blue', 'snapshot': bg.state(),
+            'targetImages': images('blue'), 'backends': {c: bg.backend_identity(c) for c in ('blue', 'green')}}
+        self.isolate(transaction, 'green')
+        def current_images(color):
+            if color == 'green': raise RuntimeError('No such container')
+            return images(color)
+        with patch.object(bg, 'slot_images', side_effect=current_images), \
+             patch.object(bg, 'route', side_effect=self.set_route):
+            bg.recover(force=True, target='blue')
+        self.assertEqual(bg.state()['active'], 'blue')
+        self.assertEqual(bg.state()['slots']['green']['status'], 'isolated')
+        self.assertFalse((bg.HOME / 'transaction.json').exists())
+
+    def test_recovery_refuses_same_image_replacement_backend_before_resuming(self):
+        identities = {c: bg.backend_identity(c) for c in ('blue', 'green')}
+        transaction = {'from': 'green', 'to': 'blue', 'snapshot': bg.state(),
+            'targetImages': images('blue'), 'backends': identities}
+        bg.write_transaction(transaction)
+        def replacement(color):
+            return dict(identities[color], id='d' * 64)
+        for target in ('blue', 'green'):
+            with patch.object(bg, 'backend_identity', side_effect=replacement), patch.object(bg, 'route') as route:
+                with self.assertRaisesRegex(RuntimeError, 'identity changed'):
+                    bg.recover(force=True, target=target)
+            route.assert_not_called()
+        bg.control.assert_not_called()
+        self.assertTrue((bg.HOME / 'transaction.json').exists())
+
+    def test_isolated_backend_restart_policy_restored_only_after_healthy_recovery(self):
+        for target in ('blue', 'green'):
+            transaction = {'from': 'green', 'to': 'blue', 'snapshot': bg.state(),
+                'targetImages': images('blue'), 'backends': {c: bg.backend_identity(c) for c in ('blue', 'green')}}
+            self.isolate(transaction, target)
+            def restored(tx, color):
+                bg.verify_ingress.assert_called_with(target)
+                self.assertIn(target, tx['isolated'])
+            with patch.object(bg, 'restore_restart_policy', side_effect=restored) as restore, \
+                 patch.object(bg, 'route', side_effect=self.set_route):
+                bg.recover(force=True, target=target)
+            restore.assert_called_once()
+            self.assertFalse((bg.HOME / 'transaction.json').exists())
+
+    def test_failed_restart_policy_restore_preserves_isolation_and_journal(self):
+        transaction = {'from': 'green', 'to': 'blue', 'snapshot': bg.state(),
+            'targetImages': images('blue'), 'backends': {c: bg.backend_identity(c) for c in ('blue', 'green')}}
+        self.isolate(transaction, 'blue')
+        with patch.object(bg, 'restore_restart_policy', side_effect=RuntimeError('Docker unavailable')), \
+             patch.object(bg, 'route', side_effect=self.set_route):
+            with self.assertRaisesRegex(RuntimeError, 'Docker unavailable'): bg.recover(force=True, target='blue')
+        saved = json.loads((bg.HOME / 'transaction.json').read_text())
+        self.assertIn('blue', saved['isolated'])
+
+    def test_force_inactive_replacement_quarantines_before_removal(self):
+        calls = []
+        def isolate(transaction, color):
+            self.isolate(transaction, color); calls.append('isolated')
+        def docker(*args):
+            self.assertIn('isolated', calls)
+            self.assertTrue((bg.HOME / 'transaction.json').exists())
+            calls.append(args[0])
+        with patch.object(bg, 'exists', side_effect=lambda n: n.startswith('ieum-blue-')), \
+             patch.object(bg, 'inspect', return_value={'Config': {'Labels': {'ieum.bluegreen.managed': 'true'}},
+                 'State': {'Status': 'exited'}}), \
+             patch.object(bg, 'drain', side_effect=OSError('unresponsive inactive')), \
+             patch.object(bg, 'quarantine_backend', side_effect=isolate), \
+             patch.object(bg, 'docker', side_effect=docker):
+            bg.remove_inactive('blue', force=True)
+        self.assertEqual(calls, ['isolated', 'rm', 'rm', 'rm'])
+        self.assertFalse((bg.HOME / 'transaction.json').exists())
+        self.assertEqual(bg.state()['slots']['blue']['status'], 'preparing')
+
+    def test_failed_inactive_isolation_keeps_journal_and_never_removes_containers(self):
+        with patch.object(bg, 'drain', side_effect=OSError('unresponsive inactive')), \
+             patch.object(bg, 'quarantine_backend', side_effect=RuntimeError('isolation failed')), \
+             patch.object(bg, 'docker') as docker:
+            with self.assertRaisesRegex(RuntimeError, 'isolation failed'):
+                bg.remove_inactive('blue', force=True)
+        docker.assert_not_called()
+        self.assertTrue((bg.HOME / 'transaction.json').exists())
 
     def test_manual_nginx_route_drift_blocks_container_removal(self):
         self.set_route('blue')
@@ -202,6 +429,98 @@ class DeploymentSafetyTest(unittest.TestCase):
         candidate.chmod(0o600)
         link = bg.HOME / 'linked.env'; link.symlink_to(candidate)
         with self.assertRaisesRegex(RuntimeError, 'private'): bg.read_env(link)
+
+class BackendIsolationTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(); self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        p = patch.object(bg, 'HOME', self.root); p.start(); self.addCleanup(p.stop)
+        self.expected = {'id': 'b' * 64, 'image': 'sha256:reviewed-backend', 'name': 'ieum-blue-backend'}
+        self.transaction = {'from': 'green', 'to': 'blue', 'backends': {'blue': self.expected}}
+        self.info = {'Id': self.expected['id'], 'Image': self.expected['image'],
+            'Config': {'Labels': {'ieum.bluegreen.managed': 'true', 'ieum.bluegreen.color': 'blue'}},
+            'State': {'Status': 'running', 'Running': True},
+            'HostConfig': {'RestartPolicy': {'Name': 'unless-stopped'}}}
+
+    def docker(self, *args):
+        if args[0] == 'ps': return self.expected['id'] + ' ' + self.expected['name']
+        if args[0] == 'update': self.info['HostConfig']['RestartPolicy']['Name'] = 'no'
+        if args[0] == 'stop': self.info['State'] = {'Status': 'exited', 'Running': False}
+        return ''
+
+    def test_isolation_stops_only_pinned_id_and_verifies_restart_is_disabled(self):
+        with patch.object(bg, 'docker', side_effect=self.docker) as docker, \
+             patch.object(bg, 'inspect', side_effect=lambda n: json.loads(json.dumps(self.info))):
+            bg.quarantine_backend(self.transaction, 'blue')
+        self.assertIn(('update', '--restart=no', self.expected['id']), [c.args for c in docker.call_args_list])
+        self.assertIn(('stop', '--timeout', '30', self.expected['id']), [c.args for c in docker.call_args_list])
+        self.assertEqual(self.transaction['isolated']['blue'], self.expected)
+
+    def test_replacement_container_is_never_stopped(self):
+        self.info['Id'] = 'c' * 64
+        with patch.object(bg, 'docker', side_effect=self.docker) as docker, \
+             patch.object(bg, 'inspect', return_value=self.info):
+            with self.assertRaisesRegex(RuntimeError, 'container changed'):
+                bg.quarantine_backend(self.transaction, 'blue')
+        self.assertEqual([c.args[0] for c in docker.call_args_list], ['ps'])
+        self.assertNotIn('isolated', self.transaction)
+
+    def test_unavailable_docker_is_not_mistaken_for_absent_worker(self):
+        with patch.object(bg, 'docker', side_effect=RuntimeError('Docker daemon unavailable')):
+            with self.assertRaisesRegex(RuntimeError, 'Docker daemon unavailable'):
+                bg.quarantine_backend(self.transaction, 'blue')
+        self.assertNotIn('isolated', self.transaction)
+
+    def test_container_must_really_stop_before_isolation_is_recorded(self):
+        def docker(*args):
+            if args[0] == 'ps': return self.expected['id'] + ' ' + self.expected['name']
+            if args[0] == 'update': self.info['HostConfig']['RestartPolicy']['Name'] = 'no'
+            return ''
+        with patch.object(bg, 'docker', side_effect=docker), patch.object(bg, 'inspect', return_value=self.info):
+            with self.assertRaisesRegex(RuntimeError, 'isolation could not be verified'):
+                bg.quarantine_backend(self.transaction, 'blue')
+        self.assertNotIn('isolated', self.transaction)
+        self.assertTrue((bg.HOME / 'transaction.json').exists())
+
+    def test_authoritatively_absent_original_is_isolated_without_stopping_other_containers(self):
+        with patch.object(bg, 'docker', return_value='') as docker, patch.object(bg, 'inspect') as inspect:
+            bg.quarantine_backend(self.transaction, 'blue')
+        self.assertEqual(docker.call_count, 1)
+        inspect.assert_not_called()
+        self.assertEqual(self.transaction['isolated']['blue'], self.expected)
+
+    def test_renamed_original_requires_manual_inspection(self):
+        with patch.object(bg, 'docker', return_value=self.expected['id'] + ' renamed-backend') as docker:
+            with self.assertRaisesRegex(RuntimeError, 'was renamed'):
+                bg.quarantine_backend(self.transaction, 'blue')
+        self.assertEqual(docker.call_count, 1)
+        self.assertNotIn('isolated', self.transaction)
+
+    def test_original_restart_policy_is_restored_by_exact_id_and_verified(self):
+        self.expected['restartPolicy'] = {'Name': 'on-failure', 'MaximumRetryCount': 5}
+        current = dict(self.expected, restartPolicy={'Name': 'no', 'MaximumRetryCount': 0})
+        def docker(*args):
+            self.assertEqual(args, ('update', '--restart=on-failure:5', self.expected['id']))
+            current['restartPolicy'] = dict(self.expected['restartPolicy'])
+        with patch.object(bg, 'backend_identity', side_effect=lambda c: dict(current)), \
+             patch.object(bg, 'docker', side_effect=docker):
+            bg.restore_restart_policy(self.transaction, 'blue')
+
+    def test_restart_policy_restore_never_updates_replacement_or_unverified_policy(self):
+        self.expected['restartPolicy'] = {'Name': 'unless-stopped', 'MaximumRetryCount': 0}
+        for actual in (dict(self.expected, id='c' * 64), self.expected):
+            with patch.object(bg, 'backend_identity', return_value=actual), patch.object(bg, 'docker') as docker:
+                if actual['id'] != self.expected['id']:
+                    with self.assertRaisesRegex(RuntimeError, 'identity changed'):
+                        bg.restore_restart_policy(self.transaction, 'blue')
+                    docker.assert_not_called()
+                else:
+                    actual['restartPolicy'] = {'Name': 'no', 'MaximumRetryCount': 0}
+                    # The pinned policy must not be overwritten by mutable inspect data.
+                    self.transaction['backends']['blue'] = dict(self.expected,
+                        restartPolicy={'Name': 'unless-stopped', 'MaximumRetryCount': 0})
+                    with self.assertRaisesRegex(RuntimeError, 'could not be verified'):
+                        bg.restore_restart_policy(self.transaction, 'blue')
 
 class AssetArchiveTest(unittest.TestCase):
     def setUp(self):

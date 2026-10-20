@@ -2,6 +2,7 @@
 """IEUM blue/green deployment. Secrets stay in owner-only files on the server."""
 import argparse
 import contextlib
+from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
@@ -30,6 +31,7 @@ ASSETS = Path('/var/lib/ieum-bluegreen/assets')
 JOB_DRAIN_TIMEOUT = 660
 CONNECTION_GRACE = 30
 STOP_TIMEOUT = 1350  # web + workflow executor + relay shutdown phases, with headroom
+ISOLATION_TIMEOUT = 30  # Explicit force may interrupt work; never use this for normal drain.
 PROTOCOL_VERSION = 2
 
 def run(*args):
@@ -120,6 +122,128 @@ def verify_slot(color, allowed):
     if slot_images(color) != slot['images']:
         raise RuntimeError('Container images differ from the recorded release')
     return slot
+
+def backend_identity(color):
+    """Pin the actual managed process before any transition can change its admission state."""
+    if color not in IPS:
+        return None
+    info = inspect(name(color, 'backend'))
+    labels = info['Config'].get('Labels', {}) or {}
+    expected_image = state().get('slots', {}).get(color, {}).get('images', {}).get('backend')
+    if labels.get('ieum.bluegreen.managed') != 'true' or \
+            labels.get('ieum.bluegreen.color') != color or info['Image'] != expected_image:
+        raise RuntimeError('Backend identity does not match its managed release')
+    if not re.fullmatch(r'[a-f0-9]{64}', info.get('Id', '')):
+        raise RuntimeError('Cannot pin the backend container ID')
+    return {'id': info['Id'], 'image': info['Image'], 'name': name(color, 'backend'),
+            'restartPolicy': info['HostConfig']['RestartPolicy']}
+
+def same_backend(actual, expected):
+    return expected is not None and all(actual.get(key) == expected.get(key)
+                                        for key in ('id', 'image', 'name'))
+
+def verify_backend_identity(transaction, color):
+    if color in IPS and not same_backend(backend_identity(color), transaction.get('backends', {}).get(color)):
+        raise RuntimeError('Backend identity changed or was not pinned; manual inspection required')
+
+def restore_restart_policy(transaction, color):
+    expected = transaction.get('backends', {}).get(color)
+    if not same_backend(backend_identity(color), expected):
+        raise RuntimeError('Isolated backend identity changed; manual inspection required')
+    policy = expected.get('restartPolicy', {})
+    policy_name = policy.get('Name')
+    retries = policy.get('MaximumRetryCount', 0)
+    if policy_name not in ('no', 'always', 'unless-stopped', 'on-failure') or \
+            type(retries) is not int or retries < 0:
+        raise RuntimeError('Original backend restart policy is unavailable; inspect journal manually')
+    value = policy_name + (':' + str(retries) if policy_name == 'on-failure' and retries else '')
+    docker('update', '--restart=' + value, expected['id'])
+    actual = backend_identity(color)
+    if not same_backend(actual, expected) or actual['restartPolicy'].get('Name') != policy_name or \
+            actual['restartPolicy'].get('MaximumRetryCount', 0) != retries:
+        raise RuntimeError('Restored backend restart policy could not be verified')
+
+def transaction_images(transaction, color):
+    # An authoritatively absent, isolated backend cannot be inspected again. Its
+    # immutable release inventory was pinned before the transition started.
+    if color in transaction.get('isolated', {}):
+        images = transaction.get('snapshot', {}).get('slots', {}).get(color, {}).get('images', {})
+        if set(images) != set(APPS):
+            raise RuntimeError('Isolated release inventory is unavailable; inspect journal manually')
+        return images
+    return slot_images(color)
+
+def write_transaction(transaction):
+    atomic(HOME / 'transaction.json', json.dumps(transaction))
+
+def quarantine_backend(transaction, color):
+    """A timed-out control request is not evidence that a worker stopped. Fence by Docker ID."""
+    expected = transaction.get('backends', {}).get(color)
+    if color not in IPS or not expected or not re.fullmatch(r'[a-f0-9]{64}', expected.get('id', '')):
+        raise RuntimeError('Recovery requires a pinned managed backend identity; inspect old journal manually')
+    # `exists()` intentionally returns False on any inspect failure. It must not be used
+    # as proof of isolation: an unavailable Docker daemon is not an absent container.
+    inventory = [line.split(maxsplit=1) for line in
+        docker('ps', '--all', '--no-trunc', '--format', '{{.ID}} {{.Names}}').splitlines() if line.strip()]
+    names = {container_name: container_id for container_id, container_name in inventory}
+    if expected['name'] not in names:
+        if expected['id'] in names.values():
+            raise RuntimeError('Pinned backend was renamed; refusing to isolate an unexpected container')
+        transaction.setdefault('isolated', {})[color] = expected
+        write_transaction(transaction)
+        return
+    def pinned():
+        info = inspect(expected['name'])
+        labels = info['Config'].get('Labels', {}) or {}
+        if info.get('Id') != expected['id'] or info['Image'] != expected['image'] or \
+                labels.get('ieum.bluegreen.managed') != 'true' or \
+                labels.get('ieum.bluegreen.color') != color:
+            raise RuntimeError('Backend container changed; refusing to stop a replacement')
+        return info
+    info = pinned()
+    transaction['stage'] = 'isolating_' + color
+    write_transaction(transaction)
+    docker('update', '--restart=no', expected['id'])
+    if info['State']['Status'] in ('running', 'restarting', 'paused'):
+        docker('stop', '--timeout', str(ISOLATION_TIMEOUT), expected['id'])
+    info = pinned()
+    if info['State'].get('Running') or info['State']['Status'] in ('running', 'restarting', 'paused') or \
+            info['HostConfig']['RestartPolicy']['Name'] != 'no':
+        raise RuntimeError('Backend isolation could not be verified; activation refused')
+    transaction.setdefault('isolated', {})[color] = expected
+    write_transaction(transaction)
+    record('backend_isolated', environment=color, containerId=expected['id'])
+
+def drain_or_isolate(transaction, color, force=False):
+    try:
+        control(color, 'drain')
+    except Exception as failure:
+        if not force:
+            raise RuntimeError('Backend drain failed; use explicit --force to isolate it before switching') from failure
+        quarantine_backend(transaction, color)
+
+def normalized_cutoff(value):
+    try:
+        instant = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if instant.tzinfo is None or instant.utcoffset() is None:
+            raise ValueError('missing UTC offset')
+        return instant.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
+    except (ValueError, AttributeError) as failure:
+        raise RuntimeError('Pending recovery cutoff requires an ISO-8601 timestamp with Z or UTC offset') from failure
+
+def pending_recovery_cutoff(explicit=None):
+    path = HOME / 'control/pending-recovery-not-before'
+    saved = normalized_cutoff(path.read_text().strip()) if path.exists() else None
+    supplied = normalized_cutoff(explicit) if explicit else None
+    if saved and supplied and saved != supplied:
+        raise RuntimeError('Pending recovery cutoff is immutable across deployments; review historical work separately')
+    value = saved or supplied
+    if value is None:
+        raise RuntimeError('Review existing PENDING rows and supply --pending-recovery-not-before before protocol-2 deployment')
+    if saved is None:
+        atomic(path, value + '\n', 0o644)
+        record('pending_recovery_cutoff_initialized', notBefore=value)
+    return value
 
 def invalidate_slot(color, status='preparing'):
     data = state()
@@ -259,7 +383,7 @@ def drain(color, timeout=JOB_DRAIN_TIMEOUT, connection_grace=CONNECTION_GRACE):
             raise RuntimeError('Retired environment is not quiescent; preserved without force-stop')
         time.sleep(1)
 
-def remove_inactive(color):
+def remove_inactive(color, force=False):
     data = state()
     assert_consistent(data)
     if data['active'] == color:
@@ -269,7 +393,18 @@ def remove_inactive(color):
         container = name(color, app)
         if exists(container) and inspect(container)['Config'].get('Labels', {}).get('ieum.bluegreen.managed') != 'true':
             raise RuntimeError('Refusing to remove unmanaged container: ' + container)
-    drain(color)
+    replacement_transaction = None
+    try:
+        drain(color)
+    except Exception:
+        if not force:
+            raise
+        replacement_transaction = {'from': data['active'], 'to': color, 'started': time.time(),
+            'stage': 'replacing_unresponsive_inactive', 'snapshot': json.loads(json.dumps(data)),
+            'targetImages': data.get('slots', {}).get(color, {}).get('images'),
+            'backends': {c: backend_identity(c) for c in (data['active'], color) if c in IPS}}
+        write_transaction(replacement_transaction)
+        quarantine_backend(replacement_transaction, color)
     if data.get('slots', {}).get(color, {}).get('status') == 'retained':
         archive_frontend(color)
     # Invalidate rollback before removing the first container, including crash paths.
@@ -280,6 +415,8 @@ def remove_inactive(color):
             info = inspect(container)
             if info['State']['Status'] == 'running': docker('stop', '--time', str(STOP_TIMEOUT), container)
             docker('rm', container)
+    if replacement_transaction is not None:
+        (HOME / 'transaction.json').unlink()
 
 def read_env(path):
     path = Path(path)
@@ -299,7 +436,11 @@ def read_env(path):
         values[key] = value
     return values
 
-def env_values(app, snapshot, active, override=None):
+def env_values(app, snapshot, active, override=None, replace=False):
+    if replace:
+        if override is None:
+            raise RuntimeError('Replacing environment requires an explicit private env file')
+        return read_env(override)
     # Reuse the deployed configuration, not mutable shared .env files of other apps.
     if active == 'legacy':
         values = dict(snapshot['environment'])
@@ -317,13 +458,15 @@ def env_values(app, snapshot, active, override=None):
         values.update(read_env(override))
     return values
 
-def prepare(color, overrides, env_overrides=None):
+def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_not_before=None, force=False):
     data = state()
     assert_consistent(data)
     if color == data['active']: raise RuntimeError('Target environment is already active')
     env_overrides = {} if env_overrides is None else env_overrides
     if set(env_overrides) - set(overrides):
         raise RuntimeError('Environment changes require an explicit image deployment of the same service')
+    if replace_env and not env_overrides:
+        raise RuntimeError('--replace-env requires --env-file')
     snapshots = json.loads((HOME / 'snapshots/legacy.json').read_text())
     if data['active'] != 'legacy':
         for app in APPS:
@@ -334,8 +477,14 @@ def prepare(color, overrides, env_overrides=None):
         raise RuntimeError('Backend image lacks distributed deployment support')
     if images['backend']['Config'].get('Labels', {}).get('ieum.bluegreen.protocol') != str(PROTOCOL_VERSION):
         raise RuntimeError('Deploy the corrected protocol-2 backend before frontend/agent deployments')
-    environments = {app: env_values(app, snapshots[app], data['active'], env_overrides.get(app)) for app in APPS}
-    remove_inactive(color)
+    environments = {app: env_values(app, snapshots[app], data['active'], env_overrides.get(app),
+        replace=replace_env and app in env_overrides) for app in APPS}
+    configured_cutoff = environments['backend'].get('IEUM_WORKFLOW_QUEUE_PENDING_RECOVERY_NOT_BEFORE')
+    if recovery_not_before and configured_cutoff and normalized_cutoff(recovery_not_before) != normalized_cutoff(configured_cutoff):
+        raise RuntimeError('CLI and backend environment specify different pending recovery cutoffs')
+    cutoff = pending_recovery_cutoff(recovery_not_before or configured_cutoff)
+    if force: remove_inactive(color, force=True)
+    else: remove_inactive(color)
     data = state()  # remove_inactive invalidates the former rollback release.
     image_ids = {app: images[app]['Id'] for app in APPS}
     data['slots'][color] = {'status': 'preparing', 'images': image_ids, 'release': release_id(image_ids)}
@@ -353,6 +502,7 @@ def prepare(color, overrides, env_overrides=None):
                 env.update({'AGENT_SERVICE_URL': base(color, 'agent'),
                     'IEUM_DEPLOYMENT_DISTRIBUTED_ENABLED': 'true', 'IEUM_DEPLOYMENT_INSTANCE': color,
                     'IEUM_DEPLOYMENT_START_DRAINED': 'true', 'IEUM_SCHEDULER_JOB_STORE_TYPE': 'jdbc',
+                    'IEUM_WORKFLOW_QUEUE_PENDING_RECOVERY_NOT_BEFORE': cutoff,
                     'IEUM_SCHEDULER_AUTO_STARTUP': 'false', 'SPRING_JPA_HIBERNATE_DDL_AUTO': 'validate',
                     'SERVER_SHUTDOWN': 'graceful', 'SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE': '600s',
                     'MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE': 'health,deployment'})
@@ -408,7 +558,7 @@ def verify_ingress(color, timeout=15):
     raise RuntimeError('TLS ingress verification failed after switching')
 
 
-def switch(color):
+def switch(color, force=False):
     data = state()
     assert_consistent(data)
     old = data['active']
@@ -419,26 +569,30 @@ def switch(color):
     archive_frontend(old)
     archive_frontend(color)  # Reject reused asset URLs before any traffic/worker change.
     transaction = {'from': old, 'to': color, 'started': time.time(), 'stage': 'started',
-                   'snapshot': original_data, 'targetImages': target_slot['images']}
-    atomic(HOME / 'transaction.json', json.dumps(transaction))
+                   'snapshot': original_data, 'targetImages': target_slot['images'],
+                   'backends': {c: backend_identity(c) for c in (old, color) if c in IPS}}
+    write_transaction(transaction)
     try:
         if old in IPS:
-            control(old, 'drain')
+            drain_or_isolate(transaction, old, force)
         control(color, 'resume')
         route(color)
         # Probe the same TLS virtual host, independently of external pfSense NAT.
         verify_ingress(color)
         data['active'], data['previous'] = color, old
         if old in IPS:
-            old_images = slot_images(old)
-            data['slots'][old] = {'status': 'retained', 'images': old_images, 'release': release_id(old_images)}
+            old_images = transaction_images(transaction, old)
+            isolated = old in transaction.get('isolated', {})
+            data['slots'][old] = {'status': 'isolated' if isolated else 'retained',
+                'images': old_images, 'release': release_id(old_images)}
+            if isolated: data['previous'] = None
         else:
             data['previous'] = None
         data['slots'][color]['status'] = 'active'
         atomic(HOME / 'control/active', color + '\n', 0o644)
         save(data)
         transaction['stage'] = 'committed'
-        atomic(HOME / 'transaction.json', json.dumps(transaction))
+        write_transaction(transaction)
         record('switched', previous=old, active=color)
         (HOME / 'transaction.json').unlink(missing_ok=True)
         print(f'Traffic switched: {old} -> {color}; previous environment retained')
@@ -454,29 +608,129 @@ def switch(color):
             raise RuntimeError('Switch failed and rollback is incomplete; transaction retained for recover') from original_error
         raise
 
-def restore_previous(transaction):
+def restore_previous(transaction, allow_isolated=False):
     old, candidate = transaction['from'], transaction['to']
-    original = transaction.get('snapshot')
+    original = json.loads(json.dumps(transaction.get('snapshot')))
     if original is None:
         raise RuntimeError('Old-format transaction requires manual inspection before recovery')
+    if old in IPS and slot_images(old) != original.get('slots', {}).get(old, {}).get('images'):
+        raise RuntimeError('Original release images changed; refusing to resume an unknown release')
+    verify_backend_identity(transaction, old)
+    was_isolated = old in transaction.get('isolated', {})
+    if was_isolated:
+        if not allow_isolated:
+            raise RuntimeError('Original backend was isolated; recover a healthy target or explicitly abandon for forward-fix')
+        check(old)  # Only an explicitly chosen, already restarted healthy release may be resumed.
+        if not same_backend(backend_identity(old), transaction['backends'].get(old)):
+            raise RuntimeError('Isolated backend identity changed; manual inspection required')
     route(old)
-    verify_ingress(old)
-    control(candidate, 'drain')
     atomic(HOME / 'control/active', old + '\n', 0o644)
-    if original.get('previous') == candidate:
-        original['previous'] = None
-    original.get('slots', {}).get(candidate, {})['status'] = 'failed'
-    save(original)
+    # Restore useful work first. An unreachable candidate must never leave the healthy
+    # environment's queue/Quartz stopped while HTTP appears recovered.
     if old in IPS:
         control(old, 'resume')
+    try:
+        verify_backend_identity(transaction, candidate)
+        control(candidate, 'drain')
+    except Exception:
+        quarantine_backend(transaction, candidate)
+    previous_slot = original.get('slots', {}).get(candidate, {})
+    can_retry = (previous_slot.get('status') == 'retained'
+        and candidate not in transaction.get('isolated', {})
+        and slot_images(candidate) == previous_slot.get('images'))
+    if not can_retry:
+        if original.get('previous') == candidate:
+            original['previous'] = None
+        previous_slot['status'] = 'isolated' if candidate in transaction.get('isolated', {}) else 'failed'
+    save(original)
+    verify_ingress(old)
+    if was_isolated:
+        restore_restart_policy(transaction, old)
+        del transaction['isolated'][old]
+        write_transaction(transaction)
     record('switch_failed_rolled_back', active=old, candidate=candidate)
     (HOME / 'transaction.json').unlink(missing_ok=True)
 
-def recover():
+def finish_target(transaction, force=False):
+    target, old = transaction['to'], transaction['from']
+    if slot_images(target) != transaction.get('targetImages'):
+        raise RuntimeError('Target release images changed; manual inspection required')
+    verify_backend_identity(transaction, target)
+    check(target)
+    was_isolated = target in transaction.get('isolated', {})
+    if was_isolated:
+        if not force or not same_backend(backend_identity(target), transaction['backends'].get(target)):
+            raise RuntimeError('Resuming an isolated target requires --force and its original container identity')
+    if old in IPS:
+        drain_or_isolate(transaction, old, force)
+    control(target, 'resume')
+    if route_color() != target:
+        route(target)
+    verify_ingress(target)
+    if was_isolated:
+        restore_restart_policy(transaction, target)
+        del transaction['isolated'][target]
+        write_transaction(transaction)
+    data = json.loads(json.dumps(transaction.get('snapshot')))
+    if data is None:
+        raise RuntimeError('Old-format transaction requires manual inspection before recovery')
+    data['active'], data['previous'] = target, old if old in IPS else None
+    for color in (old, target):
+        if color not in IPS: continue
+        images = transaction_images(transaction, color)
+        status = 'active' if color == target else 'retained'
+        if color in transaction.get('isolated', {}):
+            status = 'isolated'
+            if color == old: data['previous'] = None
+        data['slots'][color] = {'status': status, 'images': images, 'release': release_id(images)}
+    atomic(HOME / 'control/active', target + '\n', 0o644)
+    save(data)
+    record('recovered_committed_switch', active=target)
+    (HOME / 'transaction.json').unlink()
+    print('Finalized healthy target:', target)
+
+def abandon_transaction(transaction, force):
+    if not force:
+        raise RuntimeError('Abandoning an unavailable release requires --abandon --force')
+    for color in (transaction['from'], transaction['to']):
+        if color in IPS:
+            quarantine_backend(transaction, color)
+    actual_route = route_color()
+    if actual_route not in (transaction['from'], transaction['to']):
+        raise RuntimeError('Nginx route is outside this transaction; inspect manually')
+    data = json.loads(json.dumps(transaction.get('snapshot')))
+    if data is None:
+        raise RuntimeError('Old-format transaction requires manual inspection before recovery')
+    for color in transaction.get('isolated', {}):
+        data['slots'][color]['status'] = 'isolated'
+    data['active'], data['previous'] = actual_route, None
+    atomic(HOME / 'control/active', actual_route + '\n', 0o644)
+    save(data)
+    archive = HOME / 'abandoned-transactions' / (str(time.time_ns()) + '.json')
+    atomic(archive, json.dumps(transaction, indent=2) + '\n')
+    record('transaction_abandoned_for_forward_fix', active=actual_route, journal=str(archive))
+    (HOME / 'transaction.json').unlink()
+    print('Backends isolated; transaction archived. Service health is NOT restored; manual forward-fix is now permitted.')
+
+def recover(force=False, target=None, abandon=False):
     transaction_path = HOME / 'transaction.json'
     if not transaction_path.exists():
         print('No unfinished transaction'); return
     transaction = json.loads(transaction_path.read_text())
+    if abandon:
+        if target is not None:
+            raise RuntimeError('--target and --abandon cannot be combined')
+        abandon_transaction(transaction, force)
+        return
+    if target is not None:
+        if target not in (transaction['from'], transaction['to']):
+            raise RuntimeError('Recovery target must belong to the unfinished transaction')
+        if target == transaction['from']:
+            restore_previous(transaction, allow_isolated=force)
+            print('Recovered previous environment:', target)
+        else:
+            finish_target(transaction, force)
+        return
     target = transaction['to']
     data = state()
     # A process may die after state commit but before unlink. Finalize the
@@ -484,21 +738,12 @@ def recover():
     committed = (data['active'] == target and route_color() == target and
                  (HOME / 'control/active').read_text().strip() == target)
     if committed:
-        if slot_images(target) != transaction.get('targetImages'):
-            raise RuntimeError('Committed release images changed; manual inspection required')
-        check(target)
-        verify_ingress(target)
-        if transaction['from'] in IPS:
-            control(transaction['from'], 'drain')
-        control(target, 'resume')
-        record('recovered_committed_switch', active=target)
-        transaction_path.unlink()
-        print('Finalized completed switch:', target)
+        finish_target(transaction, force)
     else:
         restore_previous(transaction)
         print('Recovered previous environment:', transaction['from'])
 
-def rollback(expected_release):
+def rollback(expected_release, force=False):
     data = state()
     assert_consistent(data)
     previous = data.get('previous')
@@ -508,7 +753,8 @@ def rollback(expected_release):
     if not expected_release or expected_release != slot.get('release'):
         raise RuntimeError('Rollback requires the exact retained release ID shown by status')
     print('Rollback release:', slot['release'], json.dumps(slot['images'], sort_keys=True))
-    switch(previous)
+    if force: switch(previous, force=True)
+    else: switch(previous)
 
 def pg(sql):
     return run('docker', 'exec', 'ieum-postgres', 'sh', '-c',
@@ -579,34 +825,44 @@ def main():
         p = sub.add_parser(verb); p.add_argument('color', choices=tuple(IPS))
         if verb == 'prepare':
             for app in APPS: p.add_argument('--' + app + '-image')
+            p.add_argument('--pending-recovery-not-before')
+            p.add_argument('--force', action='store_true')
+        if verb == 'switch': p.add_argument('--force', action='store_true')
     p = sub.add_parser('rollback'); p.add_argument('--release', required=True)
-    sub.add_parser('recover')
+    p.add_argument('--force', action='store_true')
+    p = sub.add_parser('recover'); p.add_argument('--force', action='store_true')
+    p.add_argument('--target', choices=tuple(IPS)); p.add_argument('--abandon', action='store_true')
     p = sub.add_parser('deploy'); p.add_argument('--service', choices=APPS, required=True)
     p.add_argument('--image', required=True)
     p.add_argument('--env-file')
+    p.add_argument('--replace-env', action='store_true')
+    p.add_argument('--pending-recovery-not-before')
+    p.add_argument('--force', action='store_true')
     args = parser.parse_args()
     HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
     if args.command == 'status': status(); return
     with (HOME / 'deploy.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if (HOME / 'transaction.json').exists() and args.command != 'recover':
+        if (HOME / 'transaction.json').exists() and args.command not in ('recover', 'check'):
             raise RuntimeError('Interrupted switch detected; run recover or inspect status first')
         if args.command == 'recover':
-            recover()
+            recover(force=args.force, target=args.target, abandon=args.abandon)
         elif args.command == 'init': init()
         elif args.command == 'prepare':
-            prepare(args.color, {a: getattr(args, a + '_image') for a in APPS if getattr(args, a + '_image')})
-        elif args.command == 'switch': switch(args.color)
+            prepare(args.color, {a: getattr(args, a + '_image') for a in APPS if getattr(args, a + '_image')},
+                recovery_not_before=args.pending_recovery_not_before, force=args.force)
+        elif args.command == 'switch': switch(args.color, force=args.force)
         elif args.command == 'check': print(json.dumps(check(args.color), indent=2))
         elif args.command == 'finish-bootstrap': finish_bootstrap()
         elif args.command == 'rollback':
-            rollback(args.release)
+            rollback(args.release, force=args.force)
         elif args.command == 'deploy':
             active = state()['active']
             if active not in IPS: raise RuntimeError('Finish bootstrap before automatic deployments')
             target = 'green' if active == 'blue' else 'blue'
-            prepare(target, {args.service: args.image}, {args.service: args.env_file} if args.env_file else None)
-            switch(target)
+            prepare(target, {args.service: args.image}, {args.service: args.env_file} if args.env_file else None,
+                replace_env=args.replace_env, recovery_not_before=args.pending_recovery_not_before, force=args.force)
+            switch(target, force=args.force)
 
 if __name__ == '__main__':
     try: main()
