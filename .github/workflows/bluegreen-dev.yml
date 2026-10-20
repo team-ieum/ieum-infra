@@ -1,0 +1,38 @@
+name: Blue Green Dev Operations
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Operation
+        type: choice
+        required: true
+        options: [status, check, switch, rollback]
+      color:
+        description: Environment for check or switch
+        type: choice
+        options: [blue, green]
+        default: blue
+permissions:
+  contents: read
+concurrency:
+  group: bluegreen_dev_operations
+  cancel-in-progress: false
+jobs:
+  operate:
+    runs-on:
+      group: ieum_dev_server
+      labels: [self-hosted, linux, x64, ieum-infra]
+    timeout-minutes: 15
+    steps:
+      - name: Operate installed blue-green controller
+        env:
+          OPERATION: ${{ inputs.operation }}
+          COLOR: ${{ inputs.color }}
+        run: |
+          set -euo pipefail
+          controller=/home/kwung/deploy/bluegreen/bluegreen.py
+          case "$OPERATION" in
+            status|rollback) python3 "$controller" "$OPERATION" ;;
+            check|switch) python3 "$controller" "$OPERATION" "$COLOR" ;;
+            *) exit 1 ;;
+          esac

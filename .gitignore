@@ -1,3 +1,10 @@
 
 # graphify 지식그래프 산출물
 graphify-out/
+
+# 로컬 검토 문서 및 코드 모음
+/.local-docs/
+
+# 로컬 캐시 및 운영체제 파일
+__pycache__/
+.DS_Store
