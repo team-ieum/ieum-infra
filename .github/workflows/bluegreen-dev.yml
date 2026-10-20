@@ -6,12 +6,16 @@ on:
         description: Operation
         type: choice
         required: true
-        options: [status, check, switch, rollback]
+        options: [status, check, switch, rollback, recover]
       color:
         description: Environment for check or switch
         type: choice
         options: [blue, green]
         default: blue
+      rollback_release:
+        description: Exact retained release ID from status (required for rollback)
+        type: string
+        default: ''
 permissions:
   contents: read
 concurrency:
@@ -22,17 +26,27 @@ jobs:
     runs-on:
       group: ieum_dev_server
       labels: [self-hosted, linux, x64, ieum-infra]
-    timeout-minutes: 15
+    timeout-minutes: 45
     steps:
       - name: Operate installed blue-green controller
         env:
           OPERATION: ${{ inputs.operation }}
           COLOR: ${{ inputs.color }}
+          RELEASE: ${{ inputs.rollback_release }}
+          CONTROLLER_SHA256: ${{ vars.BLUEGREEN_CONTROLLER_SHA256 }}
+          HELPER_SHA256: ${{ vars.BLUEGREEN_HELPER_SHA256 }}
         run: |
           set -euo pipefail
           controller=/home/kwung/deploy/bluegreen/bluegreen.py
+          helper=/usr/local/sbin/ieum-bluegreen-nginx
+          [[ "$CONTROLLER_SHA256" =~ ^[[:xdigit:]]{64}$ && "$HELPER_SHA256" =~ ^[[:xdigit:]]{64}$ ]]
+          printf '%s  %s\n' "$CONTROLLER_SHA256" "$controller" | sha256sum -c - >/dev/null 2>&1
+          printf '%s  %s\n' "$HELPER_SHA256" "$helper" | sha256sum -c - >/dev/null 2>&1
           case "$OPERATION" in
-            status|rollback) python3 "$controller" "$OPERATION" ;;
+            status|recover) python3 "$controller" "$OPERATION" ;;
+            rollback)
+              [[ "$RELEASE" =~ ^[[:xdigit:]]{16}$ ]]
+              python3 "$controller" rollback --release "$RELEASE" ;;
             check|switch) python3 "$controller" "$OPERATION" "$COLOR" ;;
             *) exit 1 ;;
           esac

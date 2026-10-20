@@ -17,13 +17,10 @@ def render(color):
     if color not in ROUTES:
         raise ValueError('Expected legacy, blue, or green')
     front, back, agent = ROUTES[color]
-    other = 'green' if color == 'blue' else 'blue'
-    fallback = ROUTES[other][0]
     return f'''# Managed by ieum-bluegreen-nginx. active={color}
 map $host $ieum_environment {{ default {color}; }}
 map $http_upgrade $ieum_connection_upgrade {{ default upgrade; '' close; }}
 upstream ieum_frontend {{ server {front}:80; }}
-upstream ieum_frontend_previous {{ server {fallback}:80; }}
 upstream ieum_backend {{ server {back}:8080; }}
 upstream ieum_agent {{ server {agent}:8000; }}
 '''
@@ -37,6 +34,9 @@ def atomic_write(path, content):
             os.fsync(output.fileno())
         os.chmod(name, 0o644)
         os.replace(name, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try: os.fsync(directory)
+        finally: os.close(directory)
     finally:
         if os.path.exists(name):
             os.unlink(name)
@@ -50,7 +50,9 @@ def apply(color):
     except subprocess.CalledProcessError as error:
         if previous is not None:
             atomic_write(DESTINATION, previous)
-            subprocess.run(['/usr/bin/systemctl', 'reload', 'nginx'], capture_output=True)
+            restored = subprocess.run(['/usr/bin/systemctl', 'reload', 'nginx'], capture_output=True)
+            if restored.returncode:
+                raise RuntimeError('Nginx change failed and restore reload failed; inspect the active route') from error
         else:
             DESTINATION.unlink(missing_ok=True)
         sys.stderr.write(error.stderr.decode(errors='replace') if isinstance(error.stderr, bytes) else str(error))
