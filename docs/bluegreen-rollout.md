@@ -1,6 +1,6 @@
 # Blue/Green 수정 반영 및 장애 복구 절차
 
-이 문서는 2026-10-20 재검토에 따라 보완하는 protocol 2의 운영 계약이다.
+이 문서는 2026-10-21 v3 재검토에 따라 추가 보완하는 protocol 2의 운영 계약이다.
 문서의 명령은 운영자가 승인된 반영·점검 시간에 실행할 예시이며, 문서 수정 과정에서 실행하지 않았다.
 로컬 코드 수정은 기존 서버의 실행 중인 이미지나 GitHub workflow 설정을 변경하지 않는다.
 
@@ -201,6 +201,25 @@ protocol 2 Backend가 없는 조합으로 Frontend/Agent를 먼저 배포하지 
 수행하며, 이전 중복 항목을 정리할 때 새 항목의 메타데이터는 보존한다. 범위 밖·횟수 소진·poison 행은
 자동 FAILED/삭제하지 않는다. Redis 유실·eviction 시 index와 횟수도 유실될 수 있다.
 
+복구 창 밖의 행은 조용히 숨기지 않고 active owner에서 주기적으로 관측한다. `before_cutoff`와
+나이 초과 `age`를 기본 1분마다 각각 최대 101행 조회하고 3초 query timeout hint를 적용한다.
+최대 100개 샘플·100개 초과 여부·가장 오래된 나이와 실행 ID를 로그/계측에
+남긴다. 마지막 batch의 attempts exhausted·deferred와 관측 시각·실패도 확인한다. 샘플 수는 전체
+건수가 아니며 관측 실패 시 이전 값이 남을 수 있으므로 시각과 실패 신호를 함께 읽는다.
+Micrometer의 복구 결과 counter는 결과 관측 횟수이며 실행별 고유 개수로 해석하지 않는다.
+
+이 관측은 **active owner가 실제로 살아 있을 때만** 실행된다. 양쪽 Backend가 내려갔거나 owner가
+없으면 WARN이나 새 gauge를 내보낼 worker도 없으므로 별도의 앱·소유자 생존 감시가 필요하다.
+로그가 조용하거나 gauge가 0이라는 이유만으로 미복구 PENDING이 없다고 판단하지 않는다.
+
+이 보완은 자동 업무 실패 확정·재실행·삭제나 외부 알림 연동이 아니다. SCHEDULE의 기존 중복 실행
+방지 조건은 유지하므로 복구 불가 PENDING이 다음 발화를 막는 영향은 담당자가 업무 이력과 함께
+판단한다. Actuator의 계측을 추가했다고 외부 `/metrics` 노출이나 모니터링 알림 구성이 완료된 것으로
+해석하지 않는다.
+
+상세 지표 이름·소유권 상실 시 초기화·관측 실패 시 마지막 성공 snapshot 보존·Legacy marker 잔존은
+Backend의 `docs/operations/bluegreen-pending-recovery.md`를 함께 확인한다.
+
 명령 형식 예시의 이미지 SHA와 시각은 운영자가 검토한 값으로 바꿔야 한다.
 
 ```bash
@@ -217,6 +236,44 @@ python3 /home/kwung/deploy/bluegreen/bluegreen.py deploy \
 이미지를 지정하는 `prepare ... --pending-recovery-not-before ...`, 검증, `switch`, Legacy 종료 확인,
 `finish-bootstrap` 순서를 해당 기준점에 맞춰 진행한다. 기존 작업과 연결을 확인하지 않고 그대로
 위 명령을 실행하지 않는다.
+
+재bootstrap의 이미지·설정은 최초 `snapshots/legacy.json`을 재사용하지 않고 **현재 실행 중인 Legacy
+세 컨테이너를 매번 inspect한 결과**를 기준으로 한다. 이미지 ID와 image default 대비 runtime env를
+캡처하고, 비활성 환경 제거 전 세 앱의 ID·이미지·env·running 상태가 그대로인지 재확인한다.
+점검 중 Legacy가 재배포돼 달라졌으면 중단한다. init snapshot은 과거 기록으로 보존하며 이를 수동으로
+덮어쓰는 절차가 아니다. 이 가드는 workflow 동결을 대신하지 않는다.
+
+`prepare`에도 앱별 `--frontend-env-file`, `--backend-env-file`, `--agent-env-file`과 `--replace-env`를
+지원한다. 환경을 명시적으로 바꾸는 앱은 그 앱의 이미지도 명시해야 한다. 다른 앱은 현재 Legacy
+이미지·runtime env를 유지한다. 전체 환경 교체의 의미 비교는 6절을 따른다.
+
+```bash
+python3 /home/kwung/deploy/bluegreen/bluegreen.py --lock-timeout 30 prepare blue \
+  --backend-image ieum-backend-dev:REVIEWED_COMMIT_SHA \
+  --backend-env-file /home/kwung/deploy/ieum-backend/.env \
+  --replace-env \
+  --pending-recovery-not-before 'YYYY-MM-DDTHH:MM:SS+09:00'
+```
+
+### cutoff와 DB 기록 시간대 고정
+
+cutoff의 offset/Z가 있어도 `started_at`이 timezone 없는 값이면 기존 기록에 사용한 JVM 시간대와
+일치시켜야 한다. Legacy와 protocol 2의 `TZ`, JVM `-Duser.timezone`, 관련 JVM 환경 옵션을 비교하고
+기존 실행의 DB 시각·업무 발생 시각과 대조해 같은 기준을 고정한다. OS `date`, 작업자 PC의 시간대,
+PostgreSQL 세션 `TimeZone`만으로 실행 중 JVM의 실제 시간대를 단정하지 않는다.
+
+확인한 기준은 반대 색 준비·Backend full env 교체·재배포·rollback에도 유지한다. 기존 값이 UTC였는지
+Asia/Seoul이었는지 확인하지 않고 새 컨테이너만 임의로 UTC/KST로 바꾸거나 저장된 timestamp를 다시
+해석하지 않는다. 표준 시간대를 바꿔야 한다면 과거 데이터와 조회 창의 호환성을 별도로 검토한다.
+
+신규 protocol 2는 `PendingExecutionRequeuer`의 복구 정책 시작 로그에 cutoff·local timestamp zone을
+남긴다. 이 값과 명시한 JVM 설정을 확인하고 Legacy의 기존 기록 기준과 비교한다. 로그의 시간대가
+기존 데이터의 실제 기준과 다르면 cutoff만 바꾸어 우회하지 않는다.
+
+```bash
+# DB 세션 기준 확인 예시이며 JVM 시간대의 증거를 대신하지 않는다.
+docker exec ieum-postgres sh -c 'exec psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SHOW TimeZone"'
+```
 
 protocol 1은 drain 시 직접 실행 fallback과 생존 heartbeat 동작이 protocol 2와 다르다. 단순히 두
 버전을 함께 켜 놓는 방식으로 최초 업그레이드를 무중단이라고 간주하지 않는다. **현재 업무가 끝난
@@ -237,7 +294,8 @@ protocol 1은 `retire`가 없으므로 기존 연결이 남으면 자동 강제 
 1. 공용 잠금 안에서 active·owner·Nginx route와 실제 이미지 ID를 확인한다.
 2. 교체할 비활성 환경의 큐·Quartz·유지보수를 drain하고 진행 중 작업을 기다린다.
 3. 연결에 유예를 주고 protocol 2 `retire`로 SSE·WebSocket을 종료한다.
-4. retire 뒤 API·채팅 수락 거부와 기존 작업·연결 0을 다시 확인한다. 기한 초과 시 보존한다.
+4. retire 뒤 API·채팅 수락 거부와 기존 작업·연결 0을 다시 확인한다. 기본 경로는 기한 초과 시 보존한다.
+   명시적 `--force`의 작업 중단 허용은 7절을 따른다.
 5. 이전 자산을 독립 archive에 저장하고 rollback 포인터를 무효화한 뒤 비활성 슬롯을 교체한다.
 6. 후보의 세 앱·protocol·Quartz·같은 색 Agent 주소와 전환 전 drain 상태를 확인한다.
 7. old·candidate 자산의 같은 URL/다른 내용 충돌을 검사한다.
@@ -264,6 +322,19 @@ deploy --service backend --image ... --env-file PRIVATE_CANDIDATE --replace-env
 키도 다음 배포에 반영**된다. 설정 변경과 키 삭제는 원본 private 파일에서 검토한 뒤 전체 파일을
 준비한다. controller가 관리하는 환경별 주소·분산 제어·복구 cutoff 등은 별도 운영 계약으로 설정된다.
 
+전체 교체를 처음 적용하거나 필수 설정을 바꿀 때는 **현재 컨테이너 runtime env와 완전한 후보 파일을
+비교**한다. `.env`에 없고 옛 workflow의 `docker run -e`로만 주입한 키도 전체 교체에서는 사라진다.
+예를 들어 `SPRING_PROFILES_ACTIVE=dev`, `TZ`, JVM 옵션, 서비스 주소가 후보에 필요한지 각각 결정한다.
+
+- 현재 컨테이너의 `Config.Env`에서 현재 이미지의 기본 `Config.Env`와 같은 값은 구분한다.
+- 별도 주입된 키 중 후보에 없는 키, 값이 달라지는 키, 새 키를 목록으로 검토한다.
+- 비밀값은 화면·CI 로그·검토 문서에 출력하지 않고 private 파일 안에서 비교한다. 키 이름과 검토 결과만 기록한다.
+- 의도적으로 삭제할 키와 유지해야 할 키를 구분하고 필요한 값은 완전한 후보 `.env`에 포함한다.
+- controller가 강제로 관리하는 키와 image default까지 사용자 설정으로 잘못 복제하지 않는다.
+
+`.env` 문법·권한 검사는 이 의미 비교를 대신하지 않는다. 현재 코드에 profile별 설정이 없더라도
+기존 runtime 설정을 확인하지 않고 profile 키 삭제를 항상 안전하다고 가정하지 않는다.
+
 ### Frontend·Agent 환경 overlay
 
 Frontend·Agent는 테스트·빌드 후 private 후보를 만들고 기본 overlay로 전달한다.
@@ -285,18 +356,24 @@ candidate/preparing/failed/isolated 상태면 retained rollback 대상으로 쓰
 대상이 원래 retained였고 이미지가 같으며 격리되지 않았다면 상태를 보존해 재시도할 수 있다.
 슬롯 재사용이 시작되면 rollback 포인터를 지워 실패한 새 후보를 과거 릴리스로 오인하지 않게 한다.
 
-### 활성 Backend가 응답하지 않을 때의 명시적 강제 전환
+### drain 실패 뒤 명시적으로 작업을 중단하는 강제 전환
 
 `switch`, `rollback`, `deploy`의 `--force`는 source Backend drain이 실패했을 때 사용한다.
 컨테이너의 기록된 ID·관리 label·이미지를 대조한 뒤 `restart=no`, `docker stop` 30초 및 정지 상태를
 확인해야 건강한 target을 활성화한다. source 격리를 확인할 수 없거나 target이 불건강하면 중단한다.
 상태 확인·이미지 검증·잠금·일관성 검사를 무조건 건너뛰는 옵션이 아니다.
 
-`prepare`와 `deploy`의 `--force`는 교체할 비활성 Backend의 drain이 응답하지 않는 경우에도 적용된다.
+`prepare`와 `deploy`의 `--force`는 교체할 비활성 Backend의 drain 실패에도 적용된다.
 이 경우 active·비활성 양쪽의 pinned identity와 snapshot을 담은 transaction을 먼저 기록하고,
 정확한 ID의 비활성 Backend가 격리됐음을 확인한 뒤에만 슬롯을 교체한다. 격리·교체 도중 실패하면
 transaction을 남겨 `recover` 또는 명시적인 `abandon`으로 처리한다. 강제 옵션을 누락한 자동 배포는
 이 경로를 임의로 선택하지 않는다.
+
+**drain 실패는 무응답만 뜻하지 않는다.** 정상 응답 중인 retained 환경의 작업 대기 시간 초과,
+연결 종료 후 quiescent 재확인 실패 등 drain 예외도 포함한다. 명시적인 `--force`는 이런 경우의
+작업 중단까지 허용한다. 기본 대기 후에도 장시간 업무가 남으면 30초 stop 제한으로 중단될 수 있으므로
+단순한 재시도 옵션처럼 선택하지 않는다. 이미지를 잘못 pin했거나 격리를 확인할 수 없는 경우의
+안전 검증까지 우회하지는 않는다.
 
 ```bash
 python3 /home/kwung/deploy/bluegreen/bluegreen.py rollback \
@@ -359,6 +436,53 @@ python3 /home/kwung/deploy/bluegreen/bluegreen.py recover --abandon --force
 아니다.** 당시 이미지·이력·journal 사본을 확인한 뒤 검토한 수정 이미지로 새 배포를 수행한다.
 `--target`과 `--abandon`은 함께 사용하지 않는다.
 
+**abandon 이후 첫 forward-fix는 자동 앱 workflow가 아니라 담당자의 수동 `deploy --force`로 수행한다.**
+자동 workflow에는 `--force`가 없으므로 정지된 source의 drain에 실패하고 새 journal을 남길 수 있다.
+검토한 후보·source identity와 원본 journal 사본을 확인한 뒤 다음 형식으로 진행한다.
+
+```bash
+python3 /home/kwung/deploy/bluegreen/bluegreen.py --lock-timeout 30 deploy \
+  --service backend \
+  --image ieum-backend-dev:REVIEWED_FORWARD_FIX_SHA \
+  --env-file /home/kwung/deploy/ieum-backend/.env \
+  --replace-env \
+  --force
+```
+
+실패해서 새 transaction이 생겼다면 원인을 확인하고 `recover --target HEALTHY_COLOR --force` 등
+해당 journal의 복구 경로를 사용한다. 원 journal 사본이나 lock을 지워 자동 배포를 다시 반복하지 않는다.
+건강한 환경이 확인되기 전에는 workflow 재개나 서비스 복구 완료로 기록하지 않는다.
+
+### 긴급 작업이 배포 잠금을 기다릴 때
+
+controller의 전역 `--lock-timeout SECONDS`는 **하위 명령 앞에** 지정한다. 기본은 600초이며,
+비차단 flock 재시도로 기한 안에 잠금을 얻지 못하면 해당 명령만 중단한다. 잠금 holder를 종료하거나
+잠금 파일을 지우지 않는다. 수동 운영 workflow는 30초 잠금 대기와 전체 작업 제한 120분을 사용한다.
+앱 workflow는 강제 격리 없이 기본 잠금 대기 정책을 사용한다.
+
+```bash
+python3 /home/kwung/deploy/bluegreen/bluegreen.py --lock-timeout 30 rollback \
+  --release RETAINED_RELEASE_ID --force
+python3 /home/kwung/deploy/bluegreen/bluegreen.py status
+# PID·명령·획득 시각의 참고 기록만 확인한다. 비밀 env 값은 기록하지 않는다.
+cat /home/kwung/deploy/bluegreen/lock-owner.json
+```
+
+잠금 시간 초과는 앞선 배포가 실패했다거나 holder를 중단해도 된다는 증거가 아니다.
+
+1. 새 자동 배포가 이어지지 않도록 담당자와 조율하고 기존 실행·대기 작업을 확인한다.
+2. `status`와 `lock-owner.json`의 PID·명령·시각을 현재 workflow 로그 및 실제 프로세스와 대조한다.
+   owner 파일은 참고 기록이며 PID 재사용·프로세스 종료 뒤 잔존 가능성을 고려한다.
+3. holder가 정상 drain·Docker 종료 대기·설치 원복을 수행 중이면 완료를 기다린다.
+4. 실제 정지가 필요한 장애라면 배포 담당자가 현재 단계·자식 작업·journal을 확인해 승인된 중단·복구
+   절차를 선택한다. 무조건적인 kill, `kill -9`, lock 삭제·교체, 강제 unlock을 사용하지 않는다.
+5. 프로세스가 끝나면 OS가 실제 flock을 해제하므로 같은 lock inode로 다시 기한을 정해 획득한다.
+   남아 있는 owner 참고 파일만 보고 lock을 지우지 않는다.
+6. 잠금을 얻은 뒤 journal이 있으면 먼저 건강한 방향의 recover 또는 명시적인 abandon을 판단한다.
+
+긴급 route 변경도 진행 중 installer·배포와 경쟁하지 않도록 담당자가 조율한다. 잠금 timeout을
+늘리는 것만으로 장시간 배포 중 활성 Backend 장애를 자동 복구하는 기능이 생기는 것은 아니다.
+
 ## 8. DB 스키마·자산·이벤트 정책
 
 Flyway를 일괄 도입하지 않았으며 후보의 `ddl-auto=validate`를 유지한다. 스키마 변경 릴리스는
@@ -373,11 +497,22 @@ content hash 기반 이름을 사용한다. archive는 30일 캐시 수명을 �
 고려해 보존·삭제 정책을 별도 결정한다.
 
 SSE는 같은 execution ID의 추적 GET만 1/2/4/8/16/30초 간격으로 재구독하며 실행 생성 POST를
-다시 보내지 않는다. 연속 실패 6회, 인증 실패, 명시적 취소를 구분하고 오래된 연결의 callback을
-무시한다. 30초 이상 안정적으로 열린 연결은 재시도 예산을 초기화한다. relay는 bounded FIFO에서
+다시 보내지 않는다. 401은 Axios와 공유하는 single-flight 토큰 refresh를 한 차례 시도하고 같은
+execution ID의 GET으로 재접속한다. refresh는 기존 인증 API의 POST이며 실행 생성 요청 재전송과
+구분한다. 403, 갱신 실패, 갱신 후 재401은 추적을 종료한다.
+
+연속 재연결 실패·명시적 취소·로그아웃·계정 교체를 구분하고 오래된 연결 callback과 과거 refresh
+응답이 새 인증 상태를 덮어쓰지 않도록 epoch를 확인한다. 한 SSE 구독 취소는 그 대기만 중단하며
+다른 Axios/SSE가 공유하는 refresh 요청을 취소하지 않는다. 30초 이상 안정적으로 열린 연결은
+재연결 예산을 초기화한다. relay는 bounded FIFO에서
 과부하 시 새 전달을 비차단 drop하고 집계하며 terminal 상태는 DB 조회로 보정한다. 중간 이벤트의
 영속 보관이나 완전한 전달을 보장하지 않는다. 서버가 연결을 종료했다고 실행 자체가 실패·중단됐다고
 단정하지 않는다. 인증된 장기 연결의 실제 배포 전환 검증은 아직 필요하다.
+
+정상적인 공용 refresh의 토큰 회전과 새 로그인·직접 계정 교체는 구분한다. 계정의 인증 세션 경계가
+바뀌면 이전 계정의 실행 추적 연결·재시도 timer·진행 중 요청·refresh 대기를 폐기해야 한다.
+새 계정의 토큰으로 이전 계정 execution ID의 추적 GET을 다시 보내지 않는다. 이미 서버에 수락된
+이전 실행을 클라이언트 요청 취소만으로 되돌렸다고 간주하지 않는다.
 
 잠금 확인은 노드·후속 실행·상태 기록 경계에서 수행한다. 완전한 DB epoch fencing이나 외부 부수
 효과의 exactly-once 보장은 아니다. 같은 잠금 세션의 짧은 재시도 후 별도 연결에서 PID와
@@ -387,24 +522,32 @@ backend_start를 확인해 상실과 관측 불확실성을 구분한다. 불확
 
 ## 9. 검증 기록과 아직 필요한 운영 검증
 
-아래는 **2026-10-20 재검토 수정 후 로컬 검증 결과**다. 실제 GitHub Actions나 운영 서버의
-검증 결과는 아니다. 전용 Redis/PostgreSQL/Nginx 컨테이너는 검증 후 제거했다.
+아래는 **2026-10-21 v4 추가 수정 후 로컬 검증 결과**다. 실제 GitHub Actions나 운영 서버의
+검증 결과가 아니다. API·core 수치는 현재 JUnit XML, Frontend 및 Infra 수치는 이번 최종 검증 근거를
+기준으로 기록한다. 과거 v3의 API 956개·Frontend 376개와 인증 세션 추가 보완 전 391개 결과를 이번 결과로 재사용하지 않았다.
 
-| 검증 항목 | 수정 후 로컬 결과 |
+| 검증 항목 | v4 로컬 결과 |
 |---|---|
-| API 전체 테스트 | 956개, 실패·오류·건너뜀 0 |
-| workflow-core 전체 테스트 | 544개, 실패·건너뜀 0 |
-| 실제 Redis/PostgreSQL 통합 테스트 | 위 API 결과에 포함된 12개 모두 통과 (Redis 7.4.9, PostgreSQL 16.15) |
+| API 전체 테스트 | 963개, 실패·오류·건너뜀 0 |
+| workflow-core 전체 테스트 | 544개, 실패·오류·건너뜀 0 |
+| API + workflow-core 합계 | 1507개, 실패·오류·건너뜀 0 |
+| 실제 Redis/PostgreSQL 통합 테스트 | 위 API 결과에 포함된 12개 모두 통과 |
+| PENDING 관측 저장소 테스트 | 위 API 결과에 포함된 H2 repository 2개 통과 |
 | API bootJar | 성공 |
-| Frontend 전체 테스트 | 59개 파일, 376개 통과; 타입 검사·프로덕션 빌드·변경 파일 lint/format 통과 |
-| Infra controller·installer 회귀 테스트 | 59개 통과 |
-| 앱·수동 운영 workflow 및 CLI 계약 검사 | 71개 통과 |
+| Frontend 전체 테스트 | 61개 파일, 398개 통과; 타입 검사·Vite 빌드·변경 7개 파일 lint/format·diff 검사 통과 |
+| Infra controller·installer 회귀 테스트 | 70개 통과 (controller 62 + installer 8) |
+| 앱·수동 운영 workflow 및 CLI 계약 검사 | 로컬 계약 71개 통과; 실제 원격 운영 명령 실행과 구분 |
 | Backend private env snapshot | 13개 시나리오 통과 |
-| 앱·Infra workflow shell 구문 | 23개 블록 통과, YAML 중복 키 검사 통과 |
-| 실제 로컬 Nginx HTTP 검사 | Frontend 14개 + archive/proxy 15개 통과 (Nginx 1.29.8) |
+| 앱·Infra workflow shell 구문 | 23개 블록 통과, 4개 YAML 중복 키·파싱 검사 통과 |
+| 이전 실제 로컬 Nginx HTTP 검증 | 2026-10-20 Frontend 14개 + archive/proxy 15개 통과; 관련 소스 변경 없음, v4에서 재실행하지 않음 |
 
-archive 200 응답의 `expires 30d`/`max-age=2592000`, 200·404 응답의 상위 보안 헤더와 미래 추가
-헤더 상속을 확인했다. upstream이 제거된 뒤에도 보관 자산 5개의 정상 응답을 확인했다.
+Frontend의 새 MSW 검증은 refresh HTTP와 Axios/SSE 401의 single-flight 공유·취소·계정 교체 경계를
+검증한다. 실제 JWT 만료·운영 브라우저 SSE·STOMP 물리 연결 또는 배포 중 인증 장기 연결을 검증한
+것은 아니다. 위 테스트 과정에서 운영 서버·원격 workflow를 조작하거나 commit/push하지 않았다.
+
+이전 Nginx 검증은 `expires 30d`/`max-age=2592000`, 200·404의 상위 보안 헤더와 미래 추가 헤더 상속,
+upstream 제거 후 보관 자산 5개의 정상 응답을 확인했다. installer·Nginx 설정 관련 소스가 이전
+검증과 같다는 전제에서 보존한 증거이며 새로운 실행 결과로 합산하지 않는다.
 
 Backend CI는 전용 Redis·PostgreSQL 서비스를 무작위 호스트 포트로 제공하고
 `job.services.*.ports`를 `IEUM_TEST_*`로 전달한다. 일반 Spring 테스트 설정은 덮어쓰지 않는다.

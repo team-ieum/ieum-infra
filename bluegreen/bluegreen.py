@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -33,6 +34,39 @@ CONNECTION_GRACE = 30
 STOP_TIMEOUT = 1350  # web + workflow executor + relay shutdown phases, with headroom
 ISOLATION_TIMEOUT = 30  # Explicit force may interrupt work; never use this for normal drain.
 PROTOCOL_VERSION = 2
+
+def lock_timeout(value):
+    try:
+        seconds = float(value)
+        if not math.isfinite(seconds) or not 0 <= seconds <= 7200:
+            raise ValueError()
+        return seconds
+    except ValueError as failure:
+        raise argparse.ArgumentTypeError('Lock timeout must be between 0 and 7200 seconds') from failure
+
+@contextlib.contextmanager
+def deployment_lock(timeout, command):
+    with (HOME / 'deploy.lock').open('a') as lock:
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('Deployment lock is busy; operation was not started. Inspect status and coordinate with its owner')
+                time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+        owner_path = HOME / 'lock-owner.json'
+        owner = {'pid': os.getpid(), 'command': command,
+                 'startedAt': datetime.now(timezone.utc).isoformat(), 'lease': secrets.token_hex(8)}
+        try:
+            atomic(owner_path, json.dumps(owner))
+            yield
+        finally:
+            # The record is advisory after a killed process; the OS file lock is authoritative.
+            with contextlib.suppress(OSError, ValueError):
+                if json.loads(owner_path.read_text()).get('lease') == owner['lease']:
+                    owner_path.unlink()
 
 def run(*args):
     result = subprocess.run(args, text=True, capture_output=True)
@@ -400,7 +434,7 @@ def remove_inactive(color, force=False):
         if not force:
             raise
         replacement_transaction = {'from': data['active'], 'to': color, 'started': time.time(),
-            'stage': 'replacing_unresponsive_inactive', 'snapshot': json.loads(json.dumps(data)),
+            'stage': 'replacing_after_failed_drain', 'snapshot': json.loads(json.dumps(data)),
             'targetImages': data.get('slots', {}).get(color, {}).get('images'),
             'backends': {c: backend_identity(c) for c in (data['active'], color) if c in IPS}}
         write_transaction(replacement_transaction)
@@ -458,6 +492,28 @@ def env_values(app, snapshot, active, override=None, replace=False):
         values.update(read_env(override))
     return values
 
+def capture_legacy_snapshot():
+    """Read current deployed configuration; init's snapshot is historical rollback evidence only."""
+    snapshots = {}
+    for app in APPS:
+        info = inspect(LEGACY[app])
+        if info['State']['Status'] != 'running' or not re.fullmatch(r'[a-f0-9]{64}', info.get('Id', '')):
+            raise RuntimeError('Legacy source must be running with a pinned container ID before preparation')
+        runtime = dict(e.split('=', 1) for e in info['Config'].get('Env', []))
+        image = json.loads(docker('image', 'inspect', info['Image']))[0]
+        defaults = dict(e.split('=', 1) for e in image['Config'].get('Env', []))
+        snapshots[app] = {'image': info['Image'], 'containerId': info['Id'], 'runtimeEnvironment': runtime,
+            'environment': {key: value for key, value in runtime.items() if defaults.get(key) != value}}
+    return snapshots
+
+def verify_legacy_snapshot(snapshots):
+    for app in APPS:
+        info = inspect(LEGACY[app])
+        runtime = dict(e.split('=', 1) for e in info['Config'].get('Env', []))
+        if info.get('Id') != snapshots[app]['containerId'] or info['Image'] != snapshots[app]['image'] or \
+                info['State']['Status'] != 'running' or runtime != snapshots[app]['runtimeEnvironment']:
+            raise RuntimeError('Legacy source changed during preparation; freeze old workflows and retry')
+
 def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_not_before=None, force=False):
     data = state()
     assert_consistent(data)
@@ -467,10 +523,8 @@ def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_no
         raise RuntimeError('Environment changes require an explicit image deployment of the same service')
     if replace_env and not env_overrides:
         raise RuntimeError('--replace-env requires --env-file')
-    snapshots = json.loads((HOME / 'snapshots/legacy.json').read_text())
-    if data['active'] != 'legacy':
-        for app in APPS:
-            snapshots[app]['image'] = inspect(name(data['active'], app))['Image']
+    snapshots = capture_legacy_snapshot() if data['active'] == 'legacy' else {
+        app: {'image': inspect(name(data['active'], app))['Image']} for app in APPS}
     images = {app: json.loads(docker('image', 'inspect', overrides.get(app, snapshots[app]['image'])))[0]
               for app in APPS}
     if images['backend']['Config'].get('Labels', {}).get('ieum.bluegreen.capable') != 'true':
@@ -479,10 +533,16 @@ def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_no
         raise RuntimeError('Deploy the corrected protocol-2 backend before frontend/agent deployments')
     environments = {app: env_values(app, snapshots[app], data['active'], env_overrides.get(app),
         replace=replace_env and app in env_overrides) for app in APPS}
+    if any('\n' in value or '\r' in value for env in environments.values() for value in env.values()):
+        raise RuntimeError('Multiline environment values require an explicit deployment configuration')
     configured_cutoff = environments['backend'].get('IEUM_WORKFLOW_QUEUE_PENDING_RECOVERY_NOT_BEFORE')
     if recovery_not_before and configured_cutoff and normalized_cutoff(recovery_not_before) != normalized_cutoff(configured_cutoff):
         raise RuntimeError('CLI and backend environment specify different pending recovery cutoffs')
     cutoff = pending_recovery_cutoff(recovery_not_before or configured_cutoff)
+    if data['active'] == 'legacy':
+        verify_legacy_snapshot(snapshots)
+        record('legacy_source_captured', images={a: snapshots[a]['image'] for a in APPS},
+               containerIds={a: snapshots[a]['containerId'] for a in APPS})
     if force: remove_inactive(color, force=True)
     else: remove_inactive(color)
     data = state()  # remove_inactive invalidates the former rollback release.
@@ -522,6 +582,8 @@ def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_no
         details = check(color)
         if not details.get('draining') or not details.get('schedulerStandby'):
             raise RuntimeError('Candidate background workers started before activation')
+        if data['active'] == 'legacy':
+            verify_legacy_snapshot(snapshots)
         data['slots'][color]['status'] = 'candidate'
         save(data)
         record('prepared', target=color, images=data['slots'][color])
@@ -815,16 +877,24 @@ def status():
         output['environments'][color] = services
         with contextlib.suppress(Exception): output['environments'][color]['deployment'] = control(color)
     output['unfinishedTransaction'] = (HOME / 'transaction.json').exists()
+    output['deploymentLockOwnerAdvisory'] = None
+    with contextlib.suppress(OSError, ValueError):
+        output['deploymentLockOwnerAdvisory'] = json.loads((HOME / 'lock-owner.json').read_text())
     print(json.dumps(output, indent=2))
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--lock-timeout', type=lock_timeout, default=600,
+                        help='Maximum seconds to wait for the deployment lock (0..7200, default 600)')
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('init'); sub.add_parser('status'); sub.add_parser('finish-bootstrap')
     for verb in ('prepare', 'switch', 'check'):
         p = sub.add_parser(verb); p.add_argument('color', choices=tuple(IPS))
         if verb == 'prepare':
-            for app in APPS: p.add_argument('--' + app + '-image')
+            for app in APPS:
+                p.add_argument('--' + app + '-image')
+                p.add_argument('--' + app + '-env-file')
+            p.add_argument('--replace-env', action='store_true')
             p.add_argument('--pending-recovery-not-before')
             p.add_argument('--force', action='store_true')
         if verb == 'switch': p.add_argument('--force', action='store_true')
@@ -841,8 +911,7 @@ def main():
     args = parser.parse_args()
     HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
     if args.command == 'status': status(); return
-    with (HOME / 'deploy.lock').open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with deployment_lock(args.lock_timeout, args.command):
         if (HOME / 'transaction.json').exists() and args.command not in ('recover', 'check'):
             raise RuntimeError('Interrupted switch detected; run recover or inspect status first')
         if args.command == 'recover':
@@ -850,7 +919,8 @@ def main():
         elif args.command == 'init': init()
         elif args.command == 'prepare':
             prepare(args.color, {a: getattr(args, a + '_image') for a in APPS if getattr(args, a + '_image')},
-                recovery_not_before=args.pending_recovery_not_before, force=args.force)
+                {a: getattr(args, a + '_env_file') for a in APPS if getattr(args, a + '_env_file')},
+                replace_env=args.replace_env, recovery_not_before=args.pending_recovery_not_before, force=args.force)
         elif args.command == 'switch': switch(args.color, force=args.force)
         elif args.command == 'check': print(json.dumps(check(args.color), indent=2))
         elif args.command == 'finish-bootstrap': finish_bootstrap()

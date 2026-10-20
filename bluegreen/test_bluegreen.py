@@ -430,6 +430,148 @@ class DeploymentSafetyTest(unittest.TestCase):
         link = bg.HOME / 'linked.env'; link.symlink_to(candidate)
         with self.assertRaisesRegex(RuntimeError, 'private'): bg.read_env(link)
 
+    def legacy_fixture(self):
+        data = bg.state(); data['active'] = 'legacy'; data['previous'] = None; bg.save(data)
+        self.set_route('legacy'); bg.atomic(bg.HOME / 'control/active', 'legacy\n')
+        bg.atomic(bg.HOME / 'control/phase', 'legacy\n')
+        infos = {bg.LEGACY[app]: {'Id': format(index + 1, '064x'), 'Image': 'current-' + app,
+            'State': {'Status': 'running'}, 'Config': {'Env': ['BASE=default', 'CURRENT=' + app,
+                'SPRING_PROFILES_ACTIVE=dev']}} for index, app in enumerate(bg.APPS)}
+        created = {}
+        def docker(*args):
+            if args[:2] == ('image', 'inspect'):
+                return json.dumps([{'Id': args[2], 'Config': {'Env': ['BASE=default'],
+                    'Labels': {'ieum.bluegreen.capable': 'true', 'ieum.bluegreen.protocol': '2'}}}])
+            if args[0] == 'create':
+                created[args[args.index('--name') + 1]] = {
+                    'image': args[-1], 'env': bg.read_env(args[args.index('--env-file') + 1])}
+            return ''
+        return infos, created, docker
+
+    def test_legacy_preparation_uses_live_images_and_env_instead_of_init_snapshot(self):
+        infos, created, docker = self.legacy_fixture()
+        original_snapshot = (bg.HOME / 'snapshots/legacy.json').read_bytes()
+        with patch.object(bg, 'inspect', side_effect=lambda n: infos[n]), \
+             patch.object(bg, 'docker', side_effect=docker), \
+             patch.object(bg, 'remove_inactive', side_effect=bg.invalidate_slot):
+            bg.prepare('blue', {'backend': 'new-protocol2-backend'})
+        for app in bg.APPS:
+            candidate = created[bg.name('blue', app)]
+            self.assertEqual(candidate['image'], 'new-protocol2-backend' if app == 'backend' else 'current-' + app)
+            self.assertEqual(candidate['env']['CURRENT'], app)
+            self.assertEqual(candidate['env']['SPRING_PROFILES_ACTIVE'], 'dev')
+            self.assertNotIn('BASE', candidate['env'])
+        self.assertEqual((bg.HOME / 'snapshots/legacy.json').read_bytes(), original_snapshot)
+
+    def test_legacy_preparation_replaces_only_explicit_app_environment(self):
+        infos, created, docker = self.legacy_fixture()
+        candidate = bg.HOME / 'backend-candidate.env'; bg.atomic(candidate, 'REVIEWED=new\n')
+        with patch.object(bg, 'inspect', side_effect=lambda n: infos[n]), \
+             patch.object(bg, 'docker', side_effect=docker), \
+             patch.object(bg, 'remove_inactive', side_effect=bg.invalidate_slot):
+            bg.prepare('blue', {'backend': 'new-backend'}, {'backend': candidate}, replace_env=True)
+        self.assertEqual(created[bg.name('blue', 'backend')]['env']['REVIEWED'], 'new')
+        self.assertNotIn('CURRENT', created[bg.name('blue', 'backend')]['env'])
+        self.assertEqual(created[bg.name('blue', 'agent')]['env']['CURRENT'], 'agent')
+
+    def test_concurrent_legacy_redeployment_aborts_before_inactive_removal(self):
+        infos, created, docker = self.legacy_fixture()
+        count = 0
+        def inspect(container):
+            nonlocal count
+            count += 1
+            result = json.loads(json.dumps(infos[container]))
+            if count > len(bg.APPS): result['Id'] = 'f' * 64
+            return result
+        with patch.object(bg, 'inspect', side_effect=inspect), patch.object(bg, 'docker', side_effect=docker), \
+             patch.object(bg, 'remove_inactive') as remove:
+            with self.assertRaisesRegex(RuntimeError, 'Legacy source changed'):
+                bg.prepare('blue', {'backend': 'new-backend'})
+        remove.assert_not_called(); self.assertFalse(created)
+
+    def test_legacy_changed_during_candidate_creation_is_cleaned_up_and_not_eligible(self):
+        infos, created, docker = self.legacy_fixture()
+        def create_then_change(*args):
+            result = docker(*args)
+            if args[0] == 'create': infos[bg.LEGACY['frontend']]['Id'] = 'f' * 64
+            return result
+        with patch.object(bg, 'inspect', side_effect=lambda n: infos[n]), \
+             patch.object(bg, 'docker', side_effect=create_then_change) as calls, \
+             patch.object(bg, 'remove_inactive', side_effect=bg.invalidate_slot):
+            with self.assertRaisesRegex(RuntimeError, 'Legacy source changed'):
+                bg.prepare('blue', {'backend': 'new-backend'})
+        self.assertEqual(bg.state()['slots']['blue']['status'], 'failed')
+        self.assertEqual(bg.state()['active'], 'legacy')
+        self.assertEqual(len([c for c in calls.call_args_list if c.args[0] == 'rm']), len(bg.APPS))
+
+    def test_legacy_new_env_cutoff_can_be_supplied_through_prepare(self):
+        infos, created, docker = self.legacy_fixture()
+        (bg.HOME / 'control/pending-recovery-not-before').unlink()
+        candidate = bg.HOME / 'backend-candidate.env'
+        bg.atomic(candidate, 'IEUM_WORKFLOW_QUEUE_PENDING_RECOVERY_NOT_BEFORE=2026-10-21T09:00:00+09:00\n')
+        with patch.object(bg, 'inspect', side_effect=lambda n: infos[n]), \
+             patch.object(bg, 'docker', side_effect=docker), \
+             patch.object(bg, 'remove_inactive', side_effect=bg.invalidate_slot):
+            bg.prepare('blue', {'backend': 'new-backend'}, {'backend': candidate})
+        self.assertEqual(created[bg.name('blue', 'backend')]['env'][
+            'IEUM_WORKFLOW_QUEUE_PENDING_RECOVERY_NOT_BEFORE'], '2026-10-21T00:00:00Z')
+
+    def test_stopped_or_unidentifiable_legacy_never_uses_historical_fallback(self):
+        for change in ({'State': {'Status': 'exited'}}, {'Id': ''}):
+            infos, created, docker = self.legacy_fixture()
+            infos[bg.LEGACY['frontend']].update(change)
+            with patch.object(bg, 'inspect', side_effect=lambda n: infos[n]), \
+                 patch.object(bg, 'docker', side_effect=docker), patch.object(bg, 'remove_inactive') as remove:
+                with self.assertRaisesRegex(RuntimeError, 'Legacy source must be running'):
+                    bg.prepare('blue', {'backend': 'new-backend'})
+            remove.assert_not_called(); self.assertFalse(created)
+
+    def test_prepare_cli_accepts_service_env_and_replace_with_bounded_lock(self):
+        with patch.object(bg.sys, 'argv', ['bluegreen', '--lock-timeout', '0', 'prepare', 'blue',
+             '--backend-image', 'reviewed-image', '--backend-env-file', '/private/backend.env', '--replace-env']), \
+             patch.object(bg, 'prepare') as prepare:
+            bg.main()
+        prepare.assert_called_once_with('blue', {'backend': 'reviewed-image'},
+            {'backend': '/private/backend.env'}, replace_env=True, recovery_not_before=None, force=False)
+
+    def test_force_explicitly_allows_interrupting_busy_retained_environment(self):
+        with patch.object(bg, 'drain', side_effect=RuntimeError('Previous environment still has work')), \
+             patch.object(bg, 'quarantine_backend', side_effect=self.isolate) as isolate:
+            with self.assertRaisesRegex(RuntimeError, 'still has work'): bg.remove_inactive('blue')
+            isolate.assert_not_called()
+            bg.remove_inactive('blue', force=True)
+        isolate.assert_called_once()
+
+class DeploymentLockTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(); self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        p = patch.object(bg, 'HOME', self.root); p.start(); self.addCleanup(p.stop)
+
+    def test_busy_lock_times_out_without_entering_or_removing_owners_record(self):
+        with bg.deployment_lock(0, 'deploy'):
+            owner = (bg.HOME / 'lock-owner.json').read_bytes()
+            inode = (bg.HOME / 'deploy.lock').stat().st_ino
+            with self.assertRaisesRegex(RuntimeError, 'operation was not started'):
+                with bg.deployment_lock(0.02, 'rollback'): self.fail('Busy lock entered')
+            self.assertEqual((bg.HOME / 'lock-owner.json').read_bytes(), owner)
+        self.assertFalse((bg.HOME / 'lock-owner.json').exists())
+        with bg.deployment_lock(0, 'recover'):
+            self.assertEqual((bg.HOME / 'deploy.lock').stat().st_ino, inode)
+            self.assertEqual(json.loads((bg.HOME / 'lock-owner.json').read_text())['command'], 'recover')
+
+    def test_exception_releases_lock_and_cleans_advisory_record(self):
+        with self.assertRaisesRegex(RuntimeError, 'operation failed'):
+            with bg.deployment_lock(0, 'prepare'): raise RuntimeError('operation failed')
+        self.assertFalse((bg.HOME / 'lock-owner.json').exists())
+        with bg.deployment_lock(0, 'recover'): pass
+
+    def test_timeout_rejects_negative_nonfinite_and_unbounded_values(self):
+        for value in ('-1', 'NaN', 'inf', '7201', 'invalid'):
+            with self.assertRaises(bg.argparse.ArgumentTypeError): bg.lock_timeout(value)
+        self.assertEqual(bg.lock_timeout('0'), 0)
+        self.assertEqual(bg.lock_timeout('30'), 30)
+
 class BackendIsolationTest(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory(); self.addCleanup(directory.cleanup)

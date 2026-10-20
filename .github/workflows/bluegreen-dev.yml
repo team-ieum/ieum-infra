@@ -17,7 +17,7 @@ on:
         type: string
         default: ''
       force:
-        description: Isolate an unresponsive managed backend before switching (may interrupt work)
+        description: Isolate a managed backend when drain fails (may interrupt running work)
         type: boolean
         default: false
       recovery_target:
@@ -39,7 +39,7 @@ jobs:
     runs-on:
       group: ieum_dev_server
       labels: [self-hosted, linux, x64, ieum-infra]
-    timeout-minutes: 45
+    timeout-minutes: 120
     steps:
       - name: Operate installed blue-green controller
         env:
@@ -60,7 +60,7 @@ jobs:
           printf '%s  %s\n' "$HELPER_SHA256" "$helper" | sha256sum -c - >/dev/null 2>&1
           if ! [[ "$FORCE" == true || "$FORCE" == false ]]; then exit 1; fi
           if ! [[ "$ABANDON" == true || "$ABANDON" == false ]]; then exit 1; fi
-          command_args=("$controller" "$OPERATION")
+          command_args=("$controller" --lock-timeout 30 "$OPERATION")
           case "$OPERATION" in
             status) ;;
             recover)
