@@ -3,6 +3,7 @@
 import argparse
 import contextlib
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 import fcntl
 import hashlib
 import json
@@ -34,15 +35,22 @@ CONNECTION_GRACE = 30
 STOP_TIMEOUT = 1350  # web + workflow executor + relay shutdown phases, with headroom
 ISOLATION_TIMEOUT = 30  # Explicit force may interrupt work; never use this for normal drain.
 PROTOCOL_VERSION = 2
+DEFAULT_OPERATION_LOCK_TIMEOUT = 600
+DEFAULT_DEPLOY_LOCK_TIMEOUT = 14400
+MAX_LOCK_TIMEOUT = 14400
+BACKEND_TIME_ZONES = frozenset(available_timezones()) - {'localtime'}
+
+def default_lock_timeout(command):
+    return DEFAULT_DEPLOY_LOCK_TIMEOUT if command == 'deploy' else DEFAULT_OPERATION_LOCK_TIMEOUT
 
 def lock_timeout(value):
     try:
         seconds = float(value)
-        if not math.isfinite(seconds) or not 0 <= seconds <= 7200:
+        if not math.isfinite(seconds) or not 0 <= seconds <= MAX_LOCK_TIMEOUT:
             raise ValueError()
         return seconds
     except ValueError as failure:
-        raise argparse.ArgumentTypeError('Lock timeout must be between 0 and 7200 seconds') from failure
+        raise argparse.ArgumentTypeError(f'Lock timeout must be between 0 and {MAX_LOCK_TIMEOUT} seconds') from failure
 
 @contextlib.contextmanager
 def deployment_lock(timeout, command):
@@ -277,6 +285,30 @@ def pending_recovery_cutoff(explicit=None):
     if saved is None:
         atomic(path, value + '\n', 0o644)
         record('pending_recovery_cutoff_initialized', notBefore=value)
+    return value
+
+def normalized_backend_zone(value):
+    try:
+        if not isinstance(value, str) or value != value.strip() or not value or len(value) > 128 or \
+                value not in BACKEND_TIME_ZONES:
+            raise ValueError()
+        ZoneInfo(value)
+        return value
+    except (ZoneInfoNotFoundError, ValueError, TypeError) as failure:
+        raise RuntimeError('Backend time zone requires a reviewed IANA zone identifier, for example UTC or Asia/Seoul') from failure
+
+def backend_time_zone(explicit=None):
+    path = HOME / 'control/backend-time-zone'
+    saved = normalized_backend_zone(path.read_text().strip()) if path.exists() else None
+    supplied = normalized_backend_zone(explicit) if explicit else None
+    if saved and supplied and saved != supplied:
+        raise RuntimeError('Backend time zone is immutable across deployments; review existing timestamp semantics separately')
+    value = saved or supplied
+    if value is None:
+        raise RuntimeError('Confirm the Legacy JVM timestamp zone and supply --backend-time-zone or the expected-zone backend setting')
+    if saved is None:
+        atomic(path, value + '\n', 0o644)
+        record('backend_time_zone_initialized', zone=value)
     return value
 
 def invalidate_slot(color, status='preparing'):
@@ -514,7 +546,8 @@ def verify_legacy_snapshot(snapshots):
                 info['State']['Status'] != 'running' or runtime != snapshots[app]['runtimeEnvironment']:
             raise RuntimeError('Legacy source changed during preparation; freeze old workflows and retry')
 
-def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_not_before=None, force=False):
+def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_not_before=None, force=False,
+            backend_zone=None):
     data = state()
     assert_consistent(data)
     if color == data['active']: raise RuntimeError('Target environment is already active')
@@ -539,6 +572,10 @@ def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_no
     if recovery_not_before and configured_cutoff and normalized_cutoff(recovery_not_before) != normalized_cutoff(configured_cutoff):
         raise RuntimeError('CLI and backend environment specify different pending recovery cutoffs')
     cutoff = pending_recovery_cutoff(recovery_not_before or configured_cutoff)
+    configured_zone = environments['backend'].get('IEUM_WORKFLOW_QUEUE_PENDING_RECOVERY_EXPECTED_ZONE')
+    if backend_zone and configured_zone and normalized_backend_zone(backend_zone) != normalized_backend_zone(configured_zone):
+        raise RuntimeError('CLI and backend environment specify different expected time zones')
+    expected_zone = backend_time_zone(backend_zone or configured_zone)
     if data['active'] == 'legacy':
         verify_legacy_snapshot(snapshots)
         record('legacy_source_captured', images={a: snapshots[a]['image'] for a in APPS},
@@ -563,6 +600,7 @@ def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_no
                     'IEUM_DEPLOYMENT_DISTRIBUTED_ENABLED': 'true', 'IEUM_DEPLOYMENT_INSTANCE': color,
                     'IEUM_DEPLOYMENT_START_DRAINED': 'true', 'IEUM_SCHEDULER_JOB_STORE_TYPE': 'jdbc',
                     'IEUM_WORKFLOW_QUEUE_PENDING_RECOVERY_NOT_BEFORE': cutoff,
+                    'TZ': expected_zone, 'IEUM_WORKFLOW_QUEUE_PENDING_RECOVERY_EXPECTED_ZONE': expected_zone,
                     'IEUM_SCHEDULER_AUTO_STARTUP': 'false', 'SPRING_JPA_HIBERNATE_DDL_AUTO': 'validate',
                     'SERVER_SHUTDOWN': 'graceful', 'SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE': '600s',
                     'MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE': 'health,deployment'})
@@ -884,8 +922,8 @@ def status():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--lock-timeout', type=lock_timeout, default=600,
-                        help='Maximum seconds to wait for the deployment lock (0..7200, default 600)')
+    parser.add_argument('--lock-timeout', type=lock_timeout,
+                        help='Maximum seconds to wait for the deployment lock (0..14400; deploy default 14400, other commands 600)')
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('init'); sub.add_parser('status'); sub.add_parser('finish-bootstrap')
     for verb in ('prepare', 'switch', 'check'):
@@ -896,6 +934,7 @@ def main():
                 p.add_argument('--' + app + '-env-file')
             p.add_argument('--replace-env', action='store_true')
             p.add_argument('--pending-recovery-not-before')
+            p.add_argument('--backend-time-zone')
             p.add_argument('--force', action='store_true')
         if verb == 'switch': p.add_argument('--force', action='store_true')
     p = sub.add_parser('rollback'); p.add_argument('--release', required=True)
@@ -907,11 +946,13 @@ def main():
     p.add_argument('--env-file')
     p.add_argument('--replace-env', action='store_true')
     p.add_argument('--pending-recovery-not-before')
+    p.add_argument('--backend-time-zone')
     p.add_argument('--force', action='store_true')
     args = parser.parse_args()
     HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
     if args.command == 'status': status(); return
-    with deployment_lock(args.lock_timeout, args.command):
+    wait_seconds = default_lock_timeout(args.command) if args.lock_timeout is None else args.lock_timeout
+    with deployment_lock(wait_seconds, args.command):
         if (HOME / 'transaction.json').exists() and args.command not in ('recover', 'check'):
             raise RuntimeError('Interrupted switch detected; run recover or inspect status first')
         if args.command == 'recover':
@@ -920,7 +961,8 @@ def main():
         elif args.command == 'prepare':
             prepare(args.color, {a: getattr(args, a + '_image') for a in APPS if getattr(args, a + '_image')},
                 {a: getattr(args, a + '_env_file') for a in APPS if getattr(args, a + '_env_file')},
-                replace_env=args.replace_env, recovery_not_before=args.pending_recovery_not_before, force=args.force)
+                replace_env=args.replace_env, recovery_not_before=args.pending_recovery_not_before, force=args.force,
+                backend_zone=args.backend_time_zone)
         elif args.command == 'switch': switch(args.color, force=args.force)
         elif args.command == 'check': print(json.dumps(check(args.color), indent=2))
         elif args.command == 'finish-bootstrap': finish_bootstrap()
@@ -931,7 +973,8 @@ def main():
             if active not in IPS: raise RuntimeError('Finish bootstrap before automatic deployments')
             target = 'green' if active == 'blue' else 'blue'
             prepare(target, {args.service: args.image}, {args.service: args.env_file} if args.env_file else None,
-                replace_env=args.replace_env, recovery_not_before=args.pending_recovery_not_before, force=args.force)
+                replace_env=args.replace_env, recovery_not_before=args.pending_recovery_not_before, force=args.force,
+                backend_zone=args.backend_time_zone)
             switch(target, force=args.force)
 
 if __name__ == '__main__':

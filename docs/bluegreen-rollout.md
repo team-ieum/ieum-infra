@@ -1,6 +1,6 @@
 # Blue/Green 수정 반영 및 장애 복구 절차
 
-이 문서는 2026-10-21 v3 재검토에 따라 추가 보완하는 protocol 2의 운영 계약이다.
+이 문서는 2026-10-21 v4 재검토에 따라 추가 보완하는 protocol 2의 운영 계약이다.
 문서의 명령은 운영자가 승인된 반영·점검 시간에 실행할 예시이며, 문서 수정 과정에서 실행하지 않았다.
 로컬 코드 수정은 기존 서버의 실행 중인 이미지나 GitHub workflow 설정을 변경하지 않는다.
 
@@ -19,6 +19,21 @@ Blue/Green 상태 파일을 정상 운영 상태라고 가정하거나 수동으
 
 다음 실제 적용을 시작할 때만 팀에 점검 구간을 공유하고 기존 workflow 동결·실행 취소·배포 담당자
 조율을 수행한다. 현재 운영을 멈추는 작업과 로컬 변경 검토를 혼동하지 않는다.
+
+### 로컬 코드와 원격 브랜치의 구분
+
+아래 push 여부는 기존 작업 기록 기준이며 이번 수정 과정에서 원격을 조회하지 않았다.
+
+| 저장소 | 마지막 push된 커밋 | 현재 로컬 HEAD | 현재 HEAD 이후 |
+|---|---|---|---|
+| Infra | `42e06cb` | `1f3dc1c` | 이번 재검토 보완은 미커밋 |
+| Backend | `61d1be3` | `d7394b2` | 이번 재검토 보완은 미커밋 |
+| Frontend | `6812f4c` | `f5c3724` | 이번 재검토 보완은 미커밋 |
+| Agent | `b64e0e6` | `b64e0e6` | 앱 workflow 잠금 예산 수정 1개가 미커밋 |
+
+Infra·Backend·Frontend의 현재 HEAD는 로컬에만 있는 v4 보완 커밋이다. 마지막 push→로컬 HEAD의
+미push 커밋과 로컬 HEAD→working tree의 미커밋 수정을 구분한다. 이 둘 모두 운영에 반영됐다는
+뜻이 아니다. 이번 v5 보완 과정에서는 commit·push·서버 변경을 수행하지 않는다.
 
 ## 2. 다음 재적용 시 기존 배포 경로를 동결한다
 
@@ -208,6 +223,11 @@ protocol 2 Backend가 없는 조합으로 Frontend/Agent를 먼저 배포하지 
 건수가 아니며 관측 실패 시 이전 값이 남을 수 있으므로 시각과 실패 신호를 함께 읽는다.
 Micrometer의 복구 결과 counter는 결과 관측 횟수이며 실행별 고유 개수로 해석하지 않는다.
 
+운영자가 cutoff 이전으로 분류한 과거 PENDING의 `before_cutoff` 경고는 프로세스별 최초의 비어 있지 않은 관측 요약으로
+제한한다. 1분마다 같은 과거 행의 WARN을 반복하는 방식으로 운영 경보를 대신하지 않는다.
+주기적인 bounded 조회와 gauge는 계속되며 프로세스 재시작 뒤에는 요약이 다시 기록될 수 있다.
+나이 초과 `age`, 복구 예산 소진과 관측 실패는 각 로그·지표의 의미에 따라 별도로 판단한다.
+
 이 관측은 **active owner가 실제로 살아 있을 때만** 실행된다. 양쪽 Backend가 내려갔거나 owner가
 없으면 WARN이나 새 gauge를 내보낼 worker도 없으므로 별도의 앱·소유자 생존 감시가 필요하다.
 로그가 조용하거나 gauge가 0이라는 이유만으로 미복구 PENDING이 없다고 판단하지 않는다.
@@ -228,6 +248,7 @@ python3 /home/kwung/deploy/bluegreen/bluegreen.py deploy \
   --image ieum-backend-dev:REVIEWED_COMMIT_SHA \
   --env-file /home/kwung/deploy/ieum-backend/.env \
   --replace-env \
+  --backend-time-zone OPERATOR_CONFIRMED_IANA_ZONE \
   --pending-recovery-not-before 'YYYY-MM-DDTHH:MM:SS+09:00'
 ```
 
@@ -252,6 +273,7 @@ python3 /home/kwung/deploy/bluegreen/bluegreen.py --lock-timeout 30 prepare blue
   --backend-image ieum-backend-dev:REVIEWED_COMMIT_SHA \
   --backend-env-file /home/kwung/deploy/ieum-backend/.env \
   --replace-env \
+  --backend-time-zone OPERATOR_CONFIRMED_IANA_ZONE \
   --pending-recovery-not-before 'YYYY-MM-DDTHH:MM:SS+09:00'
 ```
 
@@ -262,13 +284,28 @@ cutoff의 offset/Z가 있어도 `started_at`이 timezone 없는 값이면 기존
 기존 실행의 DB 시각·업무 발생 시각과 대조해 같은 기준을 고정한다. OS `date`, 작업자 PC의 시간대,
 PostgreSQL 세션 `TimeZone`만으로 실행 중 JVM의 실제 시간대를 단정하지 않는다.
 
-확인한 기준은 반대 색 준비·Backend full env 교체·재배포·rollback에도 유지한다. 기존 값이 UTC였는지
-Asia/Seoul이었는지 확인하지 않고 새 컨테이너만 임의로 UTC/KST로 바꾸거나 저장된 timestamp를 다시
-해석하지 않는다. 표준 시간대를 바꿔야 한다면 과거 데이터와 조회 창의 호환성을 별도로 검토한다.
+첫 protocol 2 준비에는 운영자가 확인한 시간대를 다음 중 하나로 **명시적으로 확정**한다.
 
-신규 protocol 2는 `PendingExecutionRequeuer`의 복구 정책 시작 로그에 cutoff·local timestamp zone을
-남긴다. 이 값과 명시한 JVM 설정을 확인하고 Legacy의 기존 기록 기준과 비교한다. 로그의 시간대가
-기존 데이터의 실제 기준과 다르면 cutoff만 바꾸어 우회하지 않는다.
+- `--backend-time-zone`에 IANA zone ID 또는 `UTC`를 지정한다.
+- Backend 후보 환경의 `IEUM_WORKFLOW_QUEUE_PENDING_RECOVERY_EXPECTED_ZONE`으로 공급한다.
+
+controller는 대소문자를 구분한 IANA 목록에 속한 값만 허용하며 `localtime` 같은 호스트 로컬 별칭은
+거부한다. 호스트 파일시스템이 잘못된 대소문자를 받아 주더라도 운영 기준으로 승인하지 않는다.
+`TZ` 키만 있는 것은 운영자의 확인으로 취급하지 않는다. 서버가 UTC였는지 Asia/Seoul이었는지
+이 문서가 추측하지 않으며 예시의 `OPERATOR_CONFIRMED_IANA_ZONE`을 검증한 실제 값으로 바꾼다.
+확정 값은 `control/backend-time-zone`에 영구 저장하고 **같은 문자열로 불변 재사용**한다.
+후속 prepare·deploy 및 Backend full env 교체에도 controller가 저장한 `TZ`와 expected-zone 환경을
+주입하므로 후보 `.env`에서 이 키를 삭제해도 관리 기준이 사라지지 않는다. 서로 다른 값을 지정하면
+거부한다. 파일 삭제나 강제 옵션으로 기준을 다시 정하지 않는다.
+
+Backend distributed 모드는 expected zone을 필수로 검증하고 실제 JVM zone의 전체 `ZoneRules`와
+비교한다. `UTC`와 `Etc/UTC` 같은 동등한 규칙은 허용하지만 Asia/Seoul을 단순한 고정 `+09:00`으로
+대체하지 않는다. 기존 JVM 옵션은 보존하므로 `-Duser.timezone` 등과 충돌하면 기동이 실패한다.
+cutoff·기대 zone·실제 JVM zone의 기동 로그를 확인하고 Legacy 기록 기준과 대조한다.
+
+이 기준은 반대 색 준비·재배포·rollback에도 유지한다. 실제 기준을 확인하지 않고 새 컨테이너만
+UTC/KST로 바꾸거나 저장된 naive timestamp를 일괄 다시 해석하지 않는다. 시간대를 바꿔야 한다면
+과거 데이터와 조회 창의 호환성을 별도로 검토한다. 기동 실패를 cutoff 변경으로 우회하지 않는다.
 
 ```bash
 # DB 세션 기준 확인 예시이며 JVM 시간대의 증거를 대신하지 않는다.
@@ -320,7 +357,8 @@ deploy --service backend --image ... --env-file PRIVATE_CANDIDATE --replace-env
 
 `--replace-env`는 지정 서비스의 사용자 환경을 완전한 후보 파일로 교체하므로 **원본에서 삭제한
 키도 다음 배포에 반영**된다. 설정 변경과 키 삭제는 원본 private 파일에서 검토한 뒤 전체 파일을
-준비한다. controller가 관리하는 환경별 주소·분산 제어·복구 cutoff 등은 별도 운영 계약으로 설정된다.
+준비한다. controller가 관리하는 환경별 주소·분산 제어·복구 cutoff·불변 Backend 시간대 등은
+별도 운영 계약으로 설정된다.
 
 전체 교체를 처음 적용하거나 필수 설정을 바꿀 때는 **현재 컨테이너 runtime env와 완전한 후보 파일을
 비교**한다. `.env`에 없고 옛 workflow의 `docker run -e`로만 주입한 키도 전체 교체에서는 사라진다.
@@ -455,10 +493,16 @@ python3 /home/kwung/deploy/bluegreen/bluegreen.py --lock-timeout 30 deploy \
 
 ### 긴급 작업이 배포 잠금을 기다릴 때
 
-controller의 전역 `--lock-timeout SECONDS`는 **하위 명령 앞에** 지정한다. 기본은 600초이며,
-비차단 flock 재시도로 기한 안에 잠금을 얻지 못하면 해당 명령만 중단한다. 잠금 holder를 종료하거나
-잠금 파일을 지우지 않는다. 수동 운영 workflow는 30초 잠금 대기와 전체 작업 제한 120분을 사용한다.
-앱 workflow는 강제 격리 없이 기본 잠금 대기 정책을 사용한다.
+controller의 전역 `--lock-timeout SECONDS`는 **하위 명령 앞에** 지정한다. 생략 시 `deploy`는
+14,400초(4시간), 나머지 명령은 600초다. 허용 상한도 14,400초다. 비차단 flock 재시도로 기한 안에
+잠금을 얻지 못하면 해당 명령만 중단하며 holder를 종료하거나 잠금 파일을 지우지 않는다.
+수동 운영 workflow는 긴급 판단을 위한 30초 잠금 대기와 전체 작업 제한 120분을 유지한다.
+
+앱 workflow 세 개는 `--lock-timeout 14400`을 명시하고 job 전체 제한 360분(6시간)을 사용한다.
+4시간 대기는 세 저장소가 함께 배포할 때 앞선 두 배포의 제어된 단계 예산(각 5,865초·약 98분)에 여유를 둔
+정책이다. 빌드·잠금 대기·자기 배포가 같은 6시간 job 예산을 나눠 쓴다. FIFO나 내구성 있는 대기열이
+아니며, 제한 없는 외부 I/O·계속 유입되는 push·job 전체 기한 때문에 여전히 실패할 수 있다.
+자동 배포에 `--force`를 추가하거나 잠금 실패를 무조건 자동 재시도하지 않는다.
 
 ```bash
 python3 /home/kwung/deploy/bluegreen/bluegreen.py --lock-timeout 30 rollback \
@@ -479,6 +523,11 @@ cat /home/kwung/deploy/bluegreen/lock-owner.json
 5. 프로세스가 끝나면 OS가 실제 flock을 해제하므로 같은 lock inode로 다시 기한을 정해 획득한다.
    남아 있는 owner 참고 파일만 보고 lock을 지우지 않는다.
 6. 잠금을 얻은 뒤 journal이 있으면 먼저 건강한 방향의 recover 또는 명시적인 abandon을 판단한다.
+
+앱 배포가 잠금 대기 시간 초과로 실패하면 앞선 배포의 종료 여부와 실제 active 이미지·status·journal을
+확인한다. 이미 최신 이미지가 적용됐는지, 복구가 먼저 필요한지 판단한 뒤 실패한 job을 수동 재실행한다.
+잠금 획득 전에 종료된 명령은 배포를 시작하지 않았지만 workflow 전체 기한 초과나 취소는 다른 단계에서
+발생할 수 있으므로 같은 것으로 단정하지 않는다. holder job 취소·강제 종료로 자리를 비우지 않는다.
 
 긴급 route 변경도 진행 중 installer·배포와 경쟁하지 않도록 담당자가 조율한다. 잠금 timeout을
 늘리는 것만으로 장시간 배포 중 활성 Backend 장애를 자동 복구하는 기능이 생기는 것은 아니다.
@@ -511,6 +560,10 @@ execution ID의 GET으로 재접속한다. refresh는 기존 인증 API의 POST�
 
 정상적인 공용 refresh의 토큰 회전과 새 로그인·직접 계정 교체는 구분한다. 계정의 인증 세션 경계가
 바뀌면 이전 계정의 실행 추적 연결·재시도 timer·진행 중 요청·refresh 대기를 폐기해야 한다.
+같은 세션의 연쇄 회전 `T1→T2→T3`은 이전 요청이 `T1`을 사용했다는 이유만으로 계정 교체로
+오인하지 않는다. Axios 요청과 각 SSE GET이 전송 시점의 세션 identity·token context를 고정해
+동일 세션임을 확인하며 전역 토큰 이력 map을 계속 키우지 않는다. 이전 토큰은 이 요청 context가
+있을 때만 같은 세션의 현재 토큰으로 이어 간다. 다른 세션의 요청은 토큰 문자열이 같아도 재사용하지 않는다.
 새 계정의 토큰으로 이전 계정 execution ID의 추적 GET을 다시 보내지 않는다. 이미 서버에 수락된
 이전 실행을 클라이언트 요청 취소만으로 되돌렸다고 간주하지 않는다.
 
@@ -522,28 +575,33 @@ backend_start를 확인해 상실과 관측 불확실성을 구분한다. 불확
 
 ## 9. 검증 기록과 아직 필요한 운영 검증
 
-아래는 **2026-10-21 v4 추가 수정 후 로컬 검증 결과**다. 실제 GitHub Actions나 운영 서버의
-검증 결과가 아니다. API·core 수치는 현재 JUnit XML, Frontend 및 Infra 수치는 이번 최종 검증 근거를
-기준으로 기록한다. 과거 v3의 API 956개·Frontend 376개와 인증 세션 추가 보완 전 391개 결과를 이번 결과로 재사용하지 않았다.
+아래 표는 **2026-10-21 v5 추가 수정 후 로컬 검증 결과**다. API·core는 이번 전체 JUnit XML,
+Frontend는 신규 v5 근거, Infra·workflow는 이번 독립 검증 결과를 사용한다.
+과거 v4의 API 963개·Frontend 398개·Infra 70개를 현재 결과로 재사용하지 않았다.
+실제 GitHub Actions나 운영 서버의 검증 결과가 아니다.
 
-| 검증 항목 | v4 로컬 결과 |
+| 검증 항목 | v5 로컬 결과 |
 |---|---|
-| API 전체 테스트 | 963개, 실패·오류·건너뜀 0 |
+| API 전체 테스트 | 969개, 실패·오류·건너뜀 0 |
 | workflow-core 전체 테스트 | 544개, 실패·오류·건너뜀 0 |
-| API + workflow-core 합계 | 1507개, 실패·오류·건너뜀 0 |
+| API + workflow-core 합계 | 1513개, 실패·오류·건너뜀 0 |
 | 실제 Redis/PostgreSQL 통합 테스트 | 위 API 결과에 포함된 12개 모두 통과 |
 | PENDING 관측 저장소 테스트 | 위 API 결과에 포함된 H2 repository 2개 통과 |
 | API bootJar | 성공 |
-| Frontend 전체 테스트 | 61개 파일, 398개 통과; 타입 검사·Vite 빌드·변경 7개 파일 lint/format·diff 검사 통과 |
-| Infra controller·installer 회귀 테스트 | 70개 통과 (controller 62 + installer 8) |
-| 앱·수동 운영 workflow 및 CLI 계약 검사 | 로컬 계약 71개 통과; 실제 원격 운영 명령 실행과 구분 |
+| Frontend 전체 테스트 | 61개 파일, 407개 통과; 타입 검사·Vite 빌드·변경 TypeScript 5개 파일 lint/format·diff 검사 통과 |
+| Infra controller·installer 회귀 테스트 | 76개 통과 (controller 68 + installer 8) |
+| 앱·수동 운영 workflow 및 CLI 계약 검사 | 74개 통과; 실제 원격 명령 실행과 구분 |
 | Backend private env snapshot | 13개 시나리오 통과 |
 | 앱·Infra workflow shell 구문 | 23개 블록 통과, 4개 YAML 중복 키·파싱 검사 통과 |
-| 이전 실제 로컬 Nginx HTTP 검증 | 2026-10-20 Frontend 14개 + archive/proxy 15개 통과; 관련 소스 변경 없음, v4에서 재실행하지 않음 |
+| 이전 실제 로컬 Nginx HTTP 검증 | 2026-10-20 Frontend 14개 + archive/proxy 15개 통과; 관련 소스 변경 없음, v5에서 재실행하지 않음 |
 
 Frontend의 새 MSW 검증은 refresh HTTP와 Axios/SSE 401의 single-flight 공유·취소·계정 교체 경계를
 검증한다. 실제 JWT 만료·운영 브라우저 SSE·STOMP 물리 연결 또는 배포 중 인증 장기 연결을 검증한
 것은 아니다. 위 테스트 과정에서 운영 서버·원격 workflow를 조작하거나 commit/push하지 않았다.
+
+Infra의 잠금 장기 대기 회귀는 700초 경과를 모의 시계로 진행한다. 실제로 700초 동안 실행하거나
+운영 배포 두 건을 경합시킨 결과가 아니다. deploy 기본 14,400초·나머지 기본 600초·상한 14,400초,
+명시적 앱 대기 예산과 strict IANA 시간대 검증을 로컬 코드 수준에서 확인했다.
 
 이전 Nginx 검증은 `expires 30d`/`max-age=2592000`, 200·404의 상위 보안 헤더와 미래 추가 헤더 상속,
 upstream 제거 후 보관 자산 5개의 정상 응답을 확인했다. installer·Nginx 설정 관련 소스가 이전

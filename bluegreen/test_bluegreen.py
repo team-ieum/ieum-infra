@@ -34,6 +34,7 @@ class DeploymentSafetyTest(unittest.TestCase):
         bg.atomic(bg.HOME / 'control/active', 'green\n')
         bg.atomic(bg.HOME / 'control/phase', 'ready\n')
         bg.atomic(bg.HOME / 'control/pending-recovery-not-before', '2026-10-20T00:00:00Z\n')
+        bg.atomic(bg.HOME / 'control/backend-time-zone', 'UTC\n')
         self.set_route('green')
         bg.atomic(bg.HOME / 'snapshots/legacy.json', json.dumps({
             app: {'image': 'legacy-' + app, 'environment': {}} for app in bg.APPS}))
@@ -189,6 +190,17 @@ class DeploymentSafetyTest(unittest.TestCase):
         self.assertEqual(bg.pending_recovery_cutoff('2026-10-20T09:00:00+09:00'), '2026-10-20T00:00:00Z')
         self.assertEqual(bg.pending_recovery_cutoff(), '2026-10-20T00:00:00Z')
         with self.assertRaisesRegex(RuntimeError, 'immutable'): bg.pending_recovery_cutoff('2026-10-21T00:00:00Z')
+
+    def test_backend_zone_requires_operator_review_and_is_immutable(self):
+        path = bg.HOME / 'control/backend-time-zone'; path.unlink()
+        with self.assertRaisesRegex(RuntimeError, 'Confirm the Legacy JVM'): bg.backend_time_zone()
+        for invalid in ('Asia/seoul', '+09:00', '../UTC', ' UTC', ''):
+            with self.assertRaisesRegex(RuntimeError, 'IANA zone'): bg.normalized_backend_zone(invalid)
+        self.assertEqual(bg.backend_time_zone('Asia/Seoul'), 'Asia/Seoul')
+        self.assertEqual(path.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(bg.backend_time_zone(), 'Asia/Seoul')
+        with self.assertRaisesRegex(RuntimeError, 'immutable'): bg.backend_time_zone('UTC')
+        self.assertEqual(path.read_text(), 'Asia/Seoul\n')
 
     def test_restore_failure_keeps_journal_and_original_cause(self):
         original = RuntimeError('original probe failure')
@@ -472,6 +484,9 @@ class DeploymentSafetyTest(unittest.TestCase):
             bg.prepare('blue', {'backend': 'new-backend'}, {'backend': candidate}, replace_env=True)
         self.assertEqual(created[bg.name('blue', 'backend')]['env']['REVIEWED'], 'new')
         self.assertNotIn('CURRENT', created[bg.name('blue', 'backend')]['env'])
+        self.assertEqual(created[bg.name('blue', 'backend')]['env']['TZ'], 'UTC')
+        self.assertEqual(created[bg.name('blue', 'backend')]['env'][
+            'IEUM_WORKFLOW_QUEUE_PENDING_RECOVERY_EXPECTED_ZONE'], 'UTC')
         self.assertEqual(created[bg.name('blue', 'agent')]['env']['CURRENT'], 'agent')
 
     def test_concurrent_legacy_redeployment_aborts_before_inactive_removal(self):
@@ -528,11 +543,50 @@ class DeploymentSafetyTest(unittest.TestCase):
 
     def test_prepare_cli_accepts_service_env_and_replace_with_bounded_lock(self):
         with patch.object(bg.sys, 'argv', ['bluegreen', '--lock-timeout', '0', 'prepare', 'blue',
-             '--backend-image', 'reviewed-image', '--backend-env-file', '/private/backend.env', '--replace-env']), \
+             '--backend-image', 'reviewed-image', '--backend-env-file', '/private/backend.env', '--replace-env',
+             '--backend-time-zone', 'UTC']), \
              patch.object(bg, 'prepare') as prepare:
             bg.main()
         prepare.assert_called_once_with('blue', {'backend': 'reviewed-image'},
-            {'backend': '/private/backend.env'}, replace_env=True, recovery_not_before=None, force=False)
+            {'backend': '/private/backend.env'}, replace_env=True, recovery_not_before=None, force=False,
+            backend_zone='UTC')
+
+    def test_legacy_runtime_tz_alone_does_not_count_as_operator_confirmation(self):
+        infos, created, docker = self.legacy_fixture()
+        (bg.HOME / 'control/backend-time-zone').unlink()
+        infos[bg.LEGACY['backend']]['Config']['Env'].append('TZ=UTC')
+        with patch.object(bg, 'inspect', side_effect=lambda n: infos[n]), \
+             patch.object(bg, 'docker', side_effect=docker), patch.object(bg, 'remove_inactive') as remove:
+            with self.assertRaisesRegex(RuntimeError, 'Confirm the Legacy JVM'):
+                bg.prepare('blue', {'backend': 'reviewed-image'})
+        remove.assert_not_called(); self.assertFalse(created)
+
+    def test_reviewed_zone_from_backend_file_is_pinned_and_preserves_jvm_options(self):
+        infos, created, docker = self.legacy_fixture()
+        (bg.HOME / 'control/backend-time-zone').unlink()
+        candidate = bg.HOME / 'backend-candidate.env'
+        bg.atomic(candidate, 'IEUM_WORKFLOW_QUEUE_PENDING_RECOVERY_EXPECTED_ZONE=Asia/Seoul\n'
+            'JAVA_TOOL_OPTIONS=-Xmx768m -Duser.timezone=Asia/Seoul\n')
+        with patch.object(bg, 'inspect', side_effect=lambda n: infos[n]), \
+             patch.object(bg, 'docker', side_effect=docker), \
+             patch.object(bg, 'remove_inactive', side_effect=bg.invalidate_slot):
+            bg.prepare('blue', {'backend': 'reviewed-image'}, {'backend': candidate}, replace_env=True)
+        env = created[bg.name('blue', 'backend')]['env']
+        self.assertEqual(env['TZ'], 'Asia/Seoul')
+        self.assertEqual(env['IEUM_WORKFLOW_QUEUE_PENDING_RECOVERY_EXPECTED_ZONE'], 'Asia/Seoul')
+        self.assertEqual(env['JAVA_TOOL_OPTIONS'], '-Xmx768m -Duser.timezone=Asia/Seoul')
+        self.assertEqual(bg.backend_time_zone(), 'Asia/Seoul')
+
+    def test_conflicting_zone_policies_fail_before_replacing_candidate(self):
+        for cli, configured in (('Asia/Seoul', 'UTC'), (None, 'Asia/Seoul')):
+            infos, created, docker = self.legacy_fixture()
+            candidate = bg.HOME / 'backend-candidate.env'
+            bg.atomic(candidate, 'IEUM_WORKFLOW_QUEUE_PENDING_RECOVERY_EXPECTED_ZONE=' + configured + '\n')
+            with patch.object(bg, 'inspect', side_effect=lambda n: infos[n]), \
+                 patch.object(bg, 'docker', side_effect=docker), patch.object(bg, 'remove_inactive') as remove:
+                with self.assertRaisesRegex(RuntimeError, 'different expected time zones|immutable'):
+                    bg.prepare('blue', {'backend': 'reviewed-image'}, {'backend': candidate}, backend_zone=cli)
+            remove.assert_not_called(); self.assertFalse(created)
 
     def test_force_explicitly_allows_interrupting_busy_retained_environment(self):
         with patch.object(bg, 'drain', side_effect=RuntimeError('Previous environment still has work')), \
@@ -567,10 +621,33 @@ class DeploymentLockTest(unittest.TestCase):
         with bg.deployment_lock(0, 'recover'): pass
 
     def test_timeout_rejects_negative_nonfinite_and_unbounded_values(self):
-        for value in ('-1', 'NaN', 'inf', '7201', 'invalid'):
+        for value in ('-1', 'NaN', 'inf', str(bg.MAX_LOCK_TIMEOUT + 1), 'invalid'):
             with self.assertRaises(bg.argparse.ArgumentTypeError): bg.lock_timeout(value)
         self.assertEqual(bg.lock_timeout('0'), 0)
         self.assertEqual(bg.lock_timeout('30'), 30)
+
+    def test_default_deploy_wait_survives_a_700_second_lock_holder_while_emergency_is_bounded(self):
+        elapsed = [0.0]
+        def flock(*args):
+            if elapsed[0] < 700: raise BlockingIOError('held by another repository')
+        def sleep(seconds): elapsed[0] += seconds
+        with patch.object(bg.time, 'monotonic', side_effect=lambda: elapsed[0]), \
+             patch.object(bg.time, 'sleep', side_effect=sleep), patch.object(bg.fcntl, 'flock', side_effect=flock):
+            with bg.deployment_lock(bg.default_lock_timeout('deploy'), 'deploy'):
+                self.assertGreaterEqual(elapsed[0], 700)
+            elapsed[0] = 0
+            with self.assertRaisesRegex(RuntimeError, 'operation was not started'):
+                with bg.deployment_lock(30, 'rollback'): self.fail('Emergency operation acquired busy lock')
+        self.assertEqual(elapsed[0], 30)
+
+    def test_deploy_default_is_separate_from_operator_wait_and_covers_prior_normal_deployments(self):
+        # Three repositories can overlap. Account for two prior normal releases' bounded phases;
+        # Docker I/O and arbitrary queue depth remain finite-wait operational limits.
+        normal_phases = 2 * bg.JOB_DRAIN_TIMEOUT + bg.CONNECTION_GRACE + \
+            len(bg.APPS) * bg.STOP_TIMEOUT + 2 * 120 + 2 * 15 + 4 * 30
+        self.assertGreater(bg.default_lock_timeout('deploy'), 2 * normal_phases)
+        self.assertEqual(bg.default_lock_timeout('recover'), 600)
+        self.assertEqual(bg.default_lock_timeout('deploy'), 14400)
 
 class BackendIsolationTest(unittest.TestCase):
     def setUp(self):
