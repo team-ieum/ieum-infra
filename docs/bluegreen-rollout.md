@@ -1,6 +1,6 @@
 # Blue/Green 수정 반영 및 장애 복구 절차
 
-이 문서는 2026-10-21 v4 재검토에 따라 추가 보완하는 protocol 2의 운영 계약이다.
+이 문서는 2026-10-21 v5 재검토에 따라 추가 보완하는 protocol 2의 운영 계약이다.
 문서의 명령은 운영자가 승인된 반영·점검 시간에 실행할 예시이며, 문서 수정 과정에서 실행하지 않았다.
 로컬 코드 수정은 기존 서버의 실행 중인 이미지나 GitHub workflow 설정을 변경하지 않는다.
 
@@ -26,14 +26,15 @@ Blue/Green 상태 파일을 정상 운영 상태라고 가정하거나 수동으
 
 | 저장소 | 마지막 push된 커밋 | 현재 로컬 HEAD | 현재 HEAD 이후 |
 |---|---|---|---|
-| Infra | `42e06cb` | `1f3dc1c` | 이번 재검토 보완은 미커밋 |
-| Backend | `61d1be3` | `d7394b2` | 이번 재검토 보완은 미커밋 |
-| Frontend | `6812f4c` | `f5c3724` | 이번 재검토 보완은 미커밋 |
-| Agent | `b64e0e6` | `b64e0e6` | 앱 workflow 잠금 예산 수정 1개가 미커밋 |
+| Infra | `42e06cb` | `ff33bcf` | 이번 재검토 보완은 미커밋 |
+| Backend | `61d1be3` | `35c45ae` | 이번 재검토 보완은 미커밋 |
+| Frontend | `6812f4c` | `548dfaf` | 앱 workflow 보완은 미커밋, 이번 런타임 소스는 동일 |
+| Agent | `b64e0e6` | `f581ee8` | 앱 workflow 보완은 미커밋 |
 
-Infra·Backend·Frontend의 현재 HEAD는 로컬에만 있는 v4 보완 커밋이다. 마지막 push→로컬 HEAD의
+네 저장소의 현재 HEAD에는 push하지 않은 보완 커밋이 있다. 마지막 push 이후 누적 커밋 수는
+Infra·Backend·Frontend 각각 2개, Agent 1개다. 마지막 push→로컬 HEAD의
 미push 커밋과 로컬 HEAD→working tree의 미커밋 수정을 구분한다. 이 둘 모두 운영에 반영됐다는
-뜻이 아니다. 이번 v5 보완 과정에서는 commit·push·서버 변경을 수행하지 않는다.
+뜻이 아니다. 이번 v6 보완 과정에서는 commit·push·서버 변경을 수행하지 않는다.
 
 ## 2. 다음 재적용 시 기존 배포 경로를 동결한다
 
@@ -150,7 +151,8 @@ sudo cat /etc/nginx/conf.d/ieum-bluegreen.conf
 1. `kwung` 계정으로 `/home/kwung/deploy/bluegreen`을 준비하고 소유권과 private 권한을 확인한다.
 2. 검토한 Infra 소스의 `install-nginx.py`와 같은 디렉터리의 `nginx-helper.py`를 준비한다.
 3. **installer를 먼저 실행**해 공개 자산 경로·소유권, 새 upstream 구성, Nginx 정책을 설치한다.
-4. 검토한 controller 사본을 설치하고 원본과 SHA-256이 일치하는지 확인한다.
+4. 검토한 controller와 `legacy-time-zone.py`를 같은 private 배포 디렉터리에 함께 설치하고
+   원본과 SHA-256이 일치하는지 확인한다.
 5. 네 저장소의 승인된 SHA 변수를 등록한 뒤 수동 Backend 적용과 검증을 진행한다.
 
 ```bash
@@ -159,6 +161,7 @@ install -d -m 700 /home/kwung/deploy/bluegreen
 # 검토한 서버 소스 경로에서 설치 도구를 실행한다.
 # sudo python3 /검토한/ieum-infra/bluegreen/install-nginx.py
 sha256sum /home/kwung/deploy/bluegreen/bluegreen.py /usr/local/sbin/ieum-bluegreen-nginx
+sha256sum /home/kwung/deploy/bluegreen/legacy-time-zone.py
 ```
 
 installer는 controller와 같은 `/home/kwung/deploy/bluegreen/deploy.lock`의 `flock`을 잡고 설정 읽기,
@@ -169,6 +172,8 @@ backup, 적용, 검증, 실패 시 원복이 끝날 때까지 보유한다. 새 
 설치 결과 확인 사항:
 
 - `/home/kwung/deploy/bluegreen/bluegreen.py`: 검토한 controller
+- `/home/kwung/deploy/bluegreen/legacy-time-zone.py`: 같은 승인 bundle의 Legacy JVM 조회 도우미,
+  `kwung` 소유 0644. 상위 배포 디렉터리는 0700으로 유지하고 controller는 기존 실행 권한을 유지
 - `/usr/local/sbin/ieum-bluegreen-nginx`: root 소유 0755, 고정 인자만 허용
 - `/var/lib/ieum-bluegreen`: 공개 자산 경로 통과를 위한 0755
 - `/var/lib/ieum-bluegreen/assets`: 배포 계정 소유 0755, 하위 디렉터리 0755, 파일 0644
@@ -186,6 +191,12 @@ backup, 적용, 검증, 실패 시 원복이 끝날 때까지 보유한다. 새 
 조직 변수는 네 저장소에 제한하거나 각 저장소에 같은 승인 버전을 설정한다. 누락·형식 오류·파일
 불일치 시 workflow는 배포 전에 실패한다. 핀은 서버 파일 검증용이며 설치 기능이 아니다. 서버 사본을
 바꿀 때는 소스 버전과 핀을 함께 검토하고 갱신한다.
+
+승인된 controller에는 companion `legacy-time-zone.py`의 기대 SHA-256이 포함된다. Legacy 증거를
+확인할 때 파일의 검증된 bytes만 compile/exec하며 누락·변조는 최초 control pin과 배포 변경 전에
+거부한다. 기존 controller SHA 핀이 이 의존성을 함께 고정하므로 세 번째 GitHub 변수는 추가하지
+않는다. 기존 `BLUEGREEN_HELPER_SHA256`은 계속 root Nginx helper용이다. Nginx installer는
+controller나 companion을 설치하지 않으므로 운영자가 둘을 함께 전달해야 하며 어느 하나만 바꾸지 않는다.
 
 ## 5. 첫 protocol 2 준비와 복구 cutoff
 
@@ -284,6 +295,45 @@ cutoff의 offset/Z가 있어도 `started_at`이 timezone 없는 값이면 기존
 기존 실행의 DB 시각·업무 발생 시각과 대조해 같은 기준을 고정한다. OS `date`, 작업자 PC의 시간대,
 PostgreSQL 세션 `TimeZone`만으로 실행 중 JVM의 실제 시간대를 단정하지 않는다.
 
+실제 JVM 조회는 **현재 실행 중인 Legacy Backend의 정확한 container ID와 JVM PID**에 묶는다.
+아래는 승인된 점검 시간에 사용할 읽기 전용 조회 예시다. `jcmd`가 있고 JVM과 같은 사용자로
+attach할 수 있을 때 대상 프로세스를 확인한 뒤 `CONFIRMED_JVM_PID`를 바꿔 실행한다.
+
+```bash
+docker inspect --format '{{.Id}} {{.Image}} {{.State.Running}}' ieum-backend
+docker exec ieum-backend sh -c 'command -v jcmd >/dev/null || exit 1; jcmd -l'
+docker exec ieum-backend sh -c 'properties="$(jcmd "$1" VM.system_properties)" || exit; printf "%s\n" "$properties" | sed -n "s/^user.timezone=//p"' sh CONFIRMED_JVM_PID
+docker inspect --format '{{.Id}} {{.Image}} {{.State.Running}}' ieum-backend
+```
+
+조회 전후 container ID·image·running을 대조해 같은 JVM의 결과인지 확인한다. `jcmd` 실패·PID
+불명·빈 `user.timezone` 결과는 시간대 증명이 아니다. 새 `java -version`이나
+`java -XshowSettings:properties`는 **새 JVM**을 실행하므로 기존 JVM의 기준을 입증하지 못한다.
+이미지의 통상 기본값, `TZ` 누락, 팀 위치로 UTC·Asia/Seoul을 추정하지 않는다.
+
+`jcmd`의 `user.timezone`은 실행 중 JVM의 property 관측이다. 앱이 이후 `TimeZone.setDefault`를
+호출해 property와 다른 기본값을 만들거나 독자적인 in-memory clock을 썼다면 이 property만으로
+그 기준까지 증명하지 못한다. 대상 JVM에 새 코드를 주입해 모든 clock을 검사하는 기능은 없으므로
+Legacy의 해당 동작 여부와 실제 업무·DB 기록도 함께 검토한다.
+
+실행 중 JVM 조회가 불가능하면 운영자가 기존 실행·DB 기록·JVM 옵션 등 검토 근거로 확인한
+결과를 **해당 container ID에 묶어 명시적으로 확인**해야 한다. 확인 불가능하면 최초 시간대 pin을
+보류한다. 이 문서 작성 과정에서는 서버 조회·운영자 확인·시간대 확정을 수행하지 않았다.
+
+controller의 Legacy 검증도 현재 캡처한 Backend ID·image·startedAt에 묶인 단일 JVM의 `jcmd` 증거를
+확인한 뒤에만 처음 시간대를 pin한다. 실제 조회가 불가능할 때만 운영자가 확인한 **전체 64자리
+container ID**를 `--confirm-legacy-time-zone CONTAINER_ID`로 지정한다. `TZ`·JVM 옵션은
+충돌 확인 자료이며 그 값만으로 실제 JVM 관측을 대신하지 않는다. 이미 조회한 JVM zone이 요청한
+기준과 다르면 확인 플래그로 우회하지 못한다. Legacy가 재배포돼 ID가 바뀌면 이전 확인도 재사용하지 않는다.
+helper는 컨테이너 시작 시각과 Java PID 시작 ticks도 조회 전후 대조해 재시작을 감지한다.
+세 Legacy 앱의 snapshot을 재검증한 뒤 검증된 `expectedZone`, `verifiedAt`, `origin`, `effectiveZone`,
+`proof`를 private 0600 `control/backend-time-zone-proof.json`에 기록하고, `history.jsonl`에
+`legacy_backend_time_zone_verified` 이력을 남긴 다음 불변 cutoff와 zone을 pin한다. 두 값은 이 검증 전에
+형식·기존 정책 일치만 검사하고 저장하지 않는다. helper 누락·변조·Legacy 불일치로 중단되면 첫 cutoff·zone
+pin도 남기지 않는다. proof에는 ID·image·시작
+시각·필터링된 zone 정보와 확인 방식이 담긴다. 설정·JVM 전체 property·원시 stderr는 기록하지 않는다.
+이 파일도 운영자·실제 JVM 확인의 출처를 남기는 자료이며 모든 in-memory clock의 증명은 아니다.
+
 첫 protocol 2 준비에는 운영자가 확인한 시간대를 다음 중 하나로 **명시적으로 확정**한다.
 
 - `--backend-time-zone`에 IANA zone ID 또는 `UTC`를 지정한다.
@@ -311,6 +361,29 @@ UTC/KST로 바꾸거나 저장된 naive timestamp를 일괄 다시 해석하지 
 # DB 세션 기준 확인 예시이며 JVM 시간대의 증거를 대신하지 않는다.
 docker exec ieum-postgres sh -c 'exec psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SHOW TimeZone"'
 ```
+
+### 실행 중 시간대 drift와 복구 차단 관측
+
+기동 시 expected-zone이 없거나 불일치하면 Backend 기동이 실패한다. 기동 후 JVM 기본 zone이나
+복구용 clock zone이 달라지면 다음 주기 검증에서 DB 조회·큐 재발행 전에 PENDING 복구를 차단한다.
+기존 내부 `/actuator/deployment`의 `pendingRecoveryTimezone` 객체에서 다음을 확인한다.
+
+- `initialized`, `valid`, `blocked`, `reason`: 미검증은 `not_validated`, 불일치는 `zone_mismatch`,
+  기대값 오류는 `invalid_expected_zone`으로 구분한다.
+- `expectedZone`, `jvmZone`, `clockZone`: 정책·현재 JVM·복구 clock의 기준이다.
+- `checkedAtEpochSeconds`, `blockedSinceEpochSeconds`, `lastBlockedAtEpochSeconds`, `blockedChecks`:
+  마지막 검증과 현재 차단 시작·최근 차단·프로세스 누적 실패 확인이다.
+
+registry의 `ieum.workflow.pending.recovery.timezone.validation_failures` counter와 기존
+`ieum.workflow.pending.recovery.failures`는 실패 호출을 누적하고, `.timezone.valid`와
+`.timezone.blocked` gauge는 현재 상태를 나타낸다. 같은 불일치 WARN은 최초와 5분마다 기록하며
+zone 값이 달라지면 바로 다시 알린다. 살아 있는 distributed Backend의 검증이 필요하며 양쪽 프로세스가
+없으면 이 상태·새 지표도 갱신되지 않는다.
+
+검토한 올바른 zone으로 복원하면 다음 주기(기본 20초)의 검증 통과 뒤 `valid=true`, `blocked=false`와
+정상화 INFO를 기록하고, active owner의 복구가 다시 진행된다. 별도 수동 clear는 없으며 누적 실패 수는
+유지한다. 이 처리는 과거 DB 시각을 변환하거나 누락 업무를 자동 완료하지 않는다. endpoint는 기존
+내부 관리 경로이며 외부 metrics 노출·경보 통보를 추가한 것으로 해석하지 않는다.
 
 protocol 1은 drain 시 직접 실행 fallback과 생존 heartbeat 동작이 protocol 2와 다르다. 단순히 두
 버전을 함께 켜 놓는 방식으로 최초 업그레이드를 무중단이라고 간주하지 않는다. **현재 업무가 끝난
@@ -499,10 +572,34 @@ controller의 전역 `--lock-timeout SECONDS`는 **하위 명령 앞에** 지정
 수동 운영 workflow는 긴급 판단을 위한 30초 잠금 대기와 전체 작업 제한 120분을 유지한다.
 
 앱 workflow 세 개는 `--lock-timeout 14400`을 명시하고 job 전체 제한 360분(6시간)을 사용한다.
-4시간 대기는 세 저장소가 함께 배포할 때 앞선 두 배포의 제어된 단계 예산(각 5,865초·약 98분)에 여유를 둔
-정책이다. 빌드·잠금 대기·자기 배포가 같은 6시간 job 예산을 나눠 쓴다. FIFO나 내구성 있는 대기열이
-아니며, 제한 없는 외부 I/O·계속 유입되는 push·job 전체 기한 때문에 여전히 실패할 수 있다.
-자동 배포에 `--force`를 추가하거나 잠금 실패를 무조건 자동 재시도하지 않는다.
+이 4시간은 고정 대기를 보장하는 값이 아니라 동적 job 예산 안의 상한이다. 첫 workflow 단계에서
+GitHub REST의 **현재 run attempt** `run_started_at`을 읽고 다음 절대 시각을 계산한다.
+
+```text
+GET ${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT}
+IEUM_BLUEGREEN_JOB_DEADLINE_EPOCH = run_started_at + 21,600초 - 120초
+```
+
+run 시작은 이 job보다 앞서므로 service 준비·대기열 시간도 보수적으로 예산에서 빠진다. 첫 shell 단계의
+현재 시각을 전체 job 시작으로 간주하지 않는다. API·시각 필드가 없거나 잘못되면 실패하며 추정값으로
+대체하지 않는다. `actions:read` 토큰은 이 조회 단계에만 전달하고 deadline만 `GITHUB_ENV`에 기록한다.
+배포는 `deploy --job-deadline-epoch ...`에 이 값을 전달한다.
+[GitHub의 현재 workflow run attempt 조회 API](https://docs.github.com/en/rest/actions/workflow-runs#get-a-workflow-run-attempt)를 사용한다.
+
+run attempt 시작 뒤 이 job이 오래 대기했으면 실제 job 자체에 시간이 남아도 첫 단계가 예산 부족으로
+실패할 수 있다. 의도한 보수적 정책이며 담당자 조율 뒤 새 job/attempt로 재시도한다. 과거 시작을
+현재 시각으로 바꾸거나 deadline을 늘려 통과시키지 않는다.
+
+controller는 잠금 대기 전과 획득 후 변경 시작 전에 **최소 7,200초(2시간)**가 남았는지 확인한다.
+허용 잠금 대기는 `min(14,400초, 남은 시간 - 7,200초)`로 줄인다. 준비가 끝나 실제 switch를 시작하기
+전에도 최소 1,800초(30분)가 남아야 하며 부족하면 준비한 후보를 비활성으로 남기고 전환을 시작하지 않는다.
+deadline 부족 실패는 작업을 억지로 끝내기 위한 force나 holder 중단을 허용하지 않는다.
+
+빌드·테스트·잠금 대기·자기 배포가 같은 6시간을 나눠 쓴다. 2시간 reserve는 제어된 정상 단계의 추정
+예산(기존 5,865초)과 여유를 둔 admission 조건이며, 멈춘 Docker·Nginx·외부 I/O나 실패 후 정리까지
+완료하는 보장은 아니다. FIFO·내구성 대기열도 아니므로 연속 push·긴 대기·job 기한 초과로 여전히
+실패할 수 있다. 자동 force·무조건 재시도·job 강제 종료를 사용하지 않는다. 수동·긴급 CLI에는 이
+GitHub job deadline 정책을 자동 적용하지 않으며 기존 잠금 정책을 유지한다.
 
 ```bash
 python3 /home/kwung/deploy/bluegreen/bluegreen.py --lock-timeout 30 rollback \
@@ -575,27 +672,28 @@ backend_start를 확인해 상실과 관측 불확실성을 구분한다. 불확
 
 ## 9. 검증 기록과 아직 필요한 운영 검증
 
-아래 표는 **2026-10-21 v5 추가 수정 후 로컬 검증 결과**다. API·core는 이번 전체 JUnit XML,
-Frontend는 신규 v5 근거, Infra·workflow는 이번 독립 검증 결과를 사용한다.
-과거 v4의 API 963개·Frontend 398개·Infra 70개를 현재 결과로 재사용하지 않았다.
-실제 GitHub Actions나 운영 서버의 검증 결과가 아니다.
+아래 표에서 **v6 새 로컬 실행**과 **동일 소스의 과거 실행 재사용**을 구분한다. Backend는 전체
+XML과 새 bootJar, Infra·workflow·deadline은 이번 독립 검증 근거를 사용한다. Frontend의 앱/테스트
+7개 파일은 이전 hash와 같아 과거 407개 결과를 재사용하며 이번에 다시 실행하지 않았다.
+과거 Frontend·Nginx 건수는 새 실행 건수와 합산하지 않는다. 실제 GitHub Actions나 운영 서버의 결과가 아니다.
 
-| 검증 항목 | v5 로컬 결과 |
+| 검증 항목 | v6 새 실행 또는 명시한 과거 결과 |
 |---|---|
-| API 전체 테스트 | 969개, 실패·오류·건너뜀 0 |
+| API 전체 테스트 | v6 새 실행 971개, 실패·오류·건너뜀 0 |
 | workflow-core 전체 테스트 | 544개, 실패·오류·건너뜀 0 |
-| API + workflow-core 합계 | 1513개, 실패·오류·건너뜀 0 |
+| API + workflow-core 합계 | v6 새 실행 1515개, 실패·오류·건너뜀 0 |
 | 실제 Redis/PostgreSQL 통합 테스트 | 위 API 결과에 포함된 12개 모두 통과 |
 | PENDING 관측 저장소 테스트 | 위 API 결과에 포함된 H2 repository 2개 통과 |
 | API bootJar | 성공 |
-| Frontend 전체 테스트 | 61개 파일, 407개 통과; 타입 검사·Vite 빌드·변경 TypeScript 5개 파일 lint/format·diff 검사 통과 |
-| Infra controller·installer 회귀 테스트 | 76개 통과 (controller 68 + installer 8) |
-| 앱·수동 운영 workflow 및 CLI 계약 검사 | 74개 통과; 실제 원격 명령 실행과 구분 |
+| Frontend 기존 검증 재사용 | v5 당시 61개 파일·407개 및 타입/Vite·TypeScript 5개 lint/format 통과; 앱/테스트 7개 hash 동일, v6 재실행 아님. 현재 workflow는 별도 검증 |
+| Infra controller·installer·Legacy helper 회귀 | v6 새 실행 108개 통과 (controller 81 + installer 8 + helper 19) |
+| 앱·수동 운영 workflow 및 CLI 계약 검사 | v6 새 실행 77개 통과; 실제 원격 명령 실행과 구분 |
+| 첫 단계 run attempt REST·deadline 검증 | v6 새 실행 30개 통과 (앱별 mock 10개); 실제 GitHub API를 호출한 로컬 테스트가 아님 |
 | Backend private env snapshot | 13개 시나리오 통과 |
-| 앱·Infra workflow shell 구문 | 23개 블록 통과, 4개 YAML 중복 키·파싱 검사 통과 |
-| 이전 실제 로컬 Nginx HTTP 검증 | 2026-10-20 Frontend 14개 + archive/proxy 15개 통과; 관련 소스 변경 없음, v5에서 재실행하지 않음 |
+| 앱·Infra workflow shell 구문 | v6 새 실행 26개 블록 통과, 4개 YAML 중복 키·파싱 검사 통과 |
+| 이전 실제 로컬 Nginx HTTP 검증 | 2026-10-20 Frontend 14개 + archive/proxy 15개 통과; installer·현재 frontend Nginx heredoc bytes 동일, v6 HTTP 재실행 아님 |
 
-Frontend의 새 MSW 검증은 refresh HTTP와 Axios/SSE 401의 single-flight 공유·취소·계정 교체 경계를
+Frontend의 기존 MSW 검증은 refresh HTTP와 Axios/SSE 401의 single-flight 공유·취소·계정 교체 경계를
 검증한다. 실제 JWT 만료·운영 브라우저 SSE·STOMP 물리 연결 또는 배포 중 인증 장기 연결을 검증한
 것은 아니다. 위 테스트 과정에서 운영 서버·원격 workflow를 조작하거나 commit/push하지 않았다.
 

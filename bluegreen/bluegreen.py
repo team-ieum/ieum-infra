@@ -38,7 +38,10 @@ PROTOCOL_VERSION = 2
 DEFAULT_OPERATION_LOCK_TIMEOUT = 600
 DEFAULT_DEPLOY_LOCK_TIMEOUT = 14400
 MAX_LOCK_TIMEOUT = 14400
+DEPLOYMENT_RESERVE_SECONDS = 7200  # Budget for preparation, normal switch and bounded shutdown phases.
+SWITCH_RESERVE_SECONDS = 1800  # Includes the 660s drain, connection grace, checks and control requests.
 BACKEND_TIME_ZONES = frozenset(available_timezones()) - {'localtime'}
+LEGACY_ZONE_HELPER_SHA256 = 'b9fca0a7d4337f5da2de8e1a684efc239f4116f3a4003efb6f7244d7dbf85ced'
 
 def default_lock_timeout(command):
     return DEFAULT_DEPLOY_LOCK_TIMEOUT if command == 'deploy' else DEFAULT_OPERATION_LOCK_TIMEOUT
@@ -52,8 +55,24 @@ def lock_timeout(value):
     except ValueError as failure:
         raise argparse.ArgumentTypeError(f'Lock timeout must be between 0 and {MAX_LOCK_TIMEOUT} seconds') from failure
 
+def job_deadline(value):
+    try:
+        deadline = float(value)
+        if not math.isfinite(deadline) or deadline <= 0:
+            raise ValueError()
+        return deadline
+    except ValueError as failure:
+        raise argparse.ArgumentTypeError('Job deadline must be a finite positive Unix timestamp') from failure
+
+def require_job_budget(deadline, reserve=DEPLOYMENT_RESERVE_SECONDS):
+    if deadline is not None and deadline - time.time() < reserve:
+        raise RuntimeError('Insufficient job time remains; deployment was not started. Inspect status and retry in a fresh job')
+
 @contextlib.contextmanager
-def deployment_lock(timeout, command):
+def deployment_lock(timeout, command, job_deadline_epoch=None):
+    require_job_budget(job_deadline_epoch)
+    if job_deadline_epoch is not None:
+        timeout = min(timeout, max(0, job_deadline_epoch - time.time() - DEPLOYMENT_RESERVE_SECONDS))
     with (HOME / 'deploy.lock').open('a') as lock:
         deadline = time.monotonic() + timeout
         while True:
@@ -64,6 +83,8 @@ def deployment_lock(timeout, command):
                 if time.monotonic() >= deadline:
                     raise RuntimeError('Deployment lock is busy; operation was not started. Inspect status and coordinate with its owner')
                 time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+        # Recheck after acquisition: waiting and wall-clock changes must not consume the operation reserve.
+        require_job_budget(job_deadline_epoch)
         owner_path = HOME / 'lock-owner.json'
         owner = {'pid': os.getpid(), 'command': command,
                  'startedAt': datetime.now(timezone.utc).isoformat(), 'lease': secrets.token_hex(8)}
@@ -273,7 +294,7 @@ def normalized_cutoff(value):
     except (ValueError, AttributeError) as failure:
         raise RuntimeError('Pending recovery cutoff requires an ISO-8601 timestamp with Z or UTC offset') from failure
 
-def pending_recovery_cutoff(explicit=None):
+def pending_recovery_cutoff(explicit=None, persist=True):
     path = HOME / 'control/pending-recovery-not-before'
     saved = normalized_cutoff(path.read_text().strip()) if path.exists() else None
     supplied = normalized_cutoff(explicit) if explicit else None
@@ -282,7 +303,7 @@ def pending_recovery_cutoff(explicit=None):
     value = saved or supplied
     if value is None:
         raise RuntimeError('Review existing PENDING rows and supply --pending-recovery-not-before before protocol-2 deployment')
-    if saved is None:
+    if saved is None and persist:
         atomic(path, value + '\n', 0o644)
         record('pending_recovery_cutoff_initialized', notBefore=value)
     return value
@@ -297,7 +318,7 @@ def normalized_backend_zone(value):
     except (ZoneInfoNotFoundError, ValueError, TypeError) as failure:
         raise RuntimeError('Backend time zone requires a reviewed IANA zone identifier, for example UTC or Asia/Seoul') from failure
 
-def backend_time_zone(explicit=None):
+def backend_time_zone(explicit=None, persist=True):
     path = HOME / 'control/backend-time-zone'
     saved = normalized_backend_zone(path.read_text().strip()) if path.exists() else None
     supplied = normalized_backend_zone(explicit) if explicit else None
@@ -306,10 +327,31 @@ def backend_time_zone(explicit=None):
     value = saved or supplied
     if value is None:
         raise RuntimeError('Confirm the Legacy JVM timestamp zone and supply --backend-time-zone or the expected-zone backend setting')
-    if saved is None:
+    if saved is None and persist:
         atomic(path, value + '\n', 0o644)
         record('backend_time_zone_initialized', zone=value)
     return value
+
+def validate_legacy_time_zone(snapshot, requested, confirmation_id):
+    # The approved controller digest also binds its companion. Execute the exact verified bytes.
+    path = Path(__file__).with_name('legacy-time-zone.py')
+    try:
+        source = path.read_bytes()
+        if hashlib.sha256(source).hexdigest() != LEGACY_ZONE_HELPER_SHA256:
+            raise ValueError()
+    except (OSError, ValueError):
+        raise RuntimeError('Legacy time-zone companion is missing or differs from the approved controller bundle') from None
+    namespace = {'__name__': 'ieum_legacy_time_zone', '__file__': str(path)}
+    exec(compile(source, str(path), 'exec'), namespace)
+    def probe(*args, timeout):
+        try:
+            result = subprocess.run(['docker', *args], text=True, capture_output=True, timeout=timeout)
+            if result.returncode:
+                raise RuntimeError()
+            return result.stdout.strip()
+        except (OSError, subprocess.SubprocessError, RuntimeError):
+            raise RuntimeError('Legacy JVM evidence probe failed') from None
+    return namespace['validate_legacy_zone'](snapshot, requested, confirmation_id, probe)
 
 def invalidate_slot(color, status='preparing'):
     data = state()
@@ -535,6 +577,7 @@ def capture_legacy_snapshot():
         image = json.loads(docker('image', 'inspect', info['Image']))[0]
         defaults = dict(e.split('=', 1) for e in image['Config'].get('Env', []))
         snapshots[app] = {'image': info['Image'], 'containerId': info['Id'], 'runtimeEnvironment': runtime,
+            'startedAt': info['State']['StartedAt'],
             'environment': {key: value for key, value in runtime.items() if defaults.get(key) != value}}
     return snapshots
 
@@ -543,14 +586,17 @@ def verify_legacy_snapshot(snapshots):
         info = inspect(LEGACY[app])
         runtime = dict(e.split('=', 1) for e in info['Config'].get('Env', []))
         if info.get('Id') != snapshots[app]['containerId'] or info['Image'] != snapshots[app]['image'] or \
-                info['State']['Status'] != 'running' or runtime != snapshots[app]['runtimeEnvironment']:
+                info['State']['Status'] != 'running' or info['State']['StartedAt'] != snapshots[app]['startedAt'] or \
+                runtime != snapshots[app]['runtimeEnvironment']:
             raise RuntimeError('Legacy source changed during preparation; freeze old workflows and retry')
 
 def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_not_before=None, force=False,
-            backend_zone=None):
+            backend_zone=None, legacy_zone_confirmation=None):
     data = state()
     assert_consistent(data)
     if color == data['active']: raise RuntimeError('Target environment is already active')
+    if legacy_zone_confirmation is not None and data['active'] != 'legacy':
+        raise RuntimeError('Legacy time-zone confirmation is only valid during Legacy preparation')
     env_overrides = {} if env_overrides is None else env_overrides
     if set(env_overrides) - set(overrides):
         raise RuntimeError('Environment changes require an explicit image deployment of the same service')
@@ -571,15 +617,21 @@ def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_no
     configured_cutoff = environments['backend'].get('IEUM_WORKFLOW_QUEUE_PENDING_RECOVERY_NOT_BEFORE')
     if recovery_not_before and configured_cutoff and normalized_cutoff(recovery_not_before) != normalized_cutoff(configured_cutoff):
         raise RuntimeError('CLI and backend environment specify different pending recovery cutoffs')
-    cutoff = pending_recovery_cutoff(recovery_not_before or configured_cutoff)
+    cutoff = pending_recovery_cutoff(recovery_not_before or configured_cutoff, persist=False)
     configured_zone = environments['backend'].get('IEUM_WORKFLOW_QUEUE_PENDING_RECOVERY_EXPECTED_ZONE')
     if backend_zone and configured_zone and normalized_backend_zone(backend_zone) != normalized_backend_zone(configured_zone):
         raise RuntimeError('CLI and backend environment specify different expected time zones')
-    expected_zone = backend_time_zone(backend_zone or configured_zone)
+    expected_zone = backend_time_zone(backend_zone or configured_zone, persist=False)
     if data['active'] == 'legacy':
+        proof = validate_legacy_time_zone(snapshots['backend'], expected_zone, legacy_zone_confirmation)
         verify_legacy_snapshot(snapshots)
+        atomic(HOME / 'control/backend-time-zone-proof.json', json.dumps({
+            'expectedZone': expected_zone, 'verifiedAt': datetime.now(timezone.utc).isoformat(), **proof}))
+        record('legacy_backend_time_zone_verified', expectedZone=expected_zone, **proof)
         record('legacy_source_captured', images={a: snapshots[a]['image'] for a in APPS},
                containerIds={a: snapshots[a]['containerId'] for a in APPS})
+    pending_recovery_cutoff(cutoff)
+    backend_time_zone(expected_zone)
     if force: remove_inactive(color, force=True)
     else: remove_inactive(color)
     data = state()  # remove_inactive invalidates the former rollback release.
@@ -935,6 +987,7 @@ def main():
             p.add_argument('--replace-env', action='store_true')
             p.add_argument('--pending-recovery-not-before')
             p.add_argument('--backend-time-zone')
+            p.add_argument('--confirm-legacy-time-zone', metavar='CONTAINER_ID')
             p.add_argument('--force', action='store_true')
         if verb == 'switch': p.add_argument('--force', action='store_true')
     p = sub.add_parser('rollback'); p.add_argument('--release', required=True)
@@ -947,12 +1000,16 @@ def main():
     p.add_argument('--replace-env', action='store_true')
     p.add_argument('--pending-recovery-not-before')
     p.add_argument('--backend-time-zone')
+    p.add_argument('--confirm-legacy-time-zone', metavar='CONTAINER_ID')
+    p.add_argument('--job-deadline-epoch', type=job_deadline,
+                   help='Conservative CI cancellation deadline; keep two hours after lock acquisition')
     p.add_argument('--force', action='store_true')
     args = parser.parse_args()
     HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
     if args.command == 'status': status(); return
     wait_seconds = default_lock_timeout(args.command) if args.lock_timeout is None else args.lock_timeout
-    with deployment_lock(wait_seconds, args.command):
+    deadline = args.job_deadline_epoch if args.command == 'deploy' else None
+    with deployment_lock(wait_seconds, args.command, deadline):
         if (HOME / 'transaction.json').exists() and args.command not in ('recover', 'check'):
             raise RuntimeError('Interrupted switch detected; run recover or inspect status first')
         if args.command == 'recover':
@@ -962,7 +1019,7 @@ def main():
             prepare(args.color, {a: getattr(args, a + '_image') for a in APPS if getattr(args, a + '_image')},
                 {a: getattr(args, a + '_env_file') for a in APPS if getattr(args, a + '_env_file')},
                 replace_env=args.replace_env, recovery_not_before=args.pending_recovery_not_before, force=args.force,
-                backend_zone=args.backend_time_zone)
+                backend_zone=args.backend_time_zone, legacy_zone_confirmation=args.confirm_legacy_time_zone)
         elif args.command == 'switch': switch(args.color, force=args.force)
         elif args.command == 'check': print(json.dumps(check(args.color), indent=2))
         elif args.command == 'finish-bootstrap': finish_bootstrap()
@@ -974,7 +1031,10 @@ def main():
             target = 'green' if active == 'blue' else 'blue'
             prepare(target, {args.service: args.image}, {args.service: args.env_file} if args.env_file else None,
                 replace_env=args.replace_env, recovery_not_before=args.pending_recovery_not_before, force=args.force,
-                backend_zone=args.backend_time_zone)
+                backend_zone=args.backend_time_zone, legacy_zone_confirmation=args.confirm_legacy_time_zone)
+            # Keep the healthy candidate inactive if preparation exceeded its expected time budget.
+            if deadline is not None and deadline - time.time() < SWITCH_RESERVE_SECONDS:
+                raise RuntimeError('Insufficient job time remains to switch; active route is unchanged. Inspect the inactive candidate and retry')
             switch(target, force=args.force)
 
 if __name__ == '__main__':

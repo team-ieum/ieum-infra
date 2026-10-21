@@ -45,6 +45,7 @@ class DeploymentSafetyTest(unittest.TestCase):
                 'image': images(c)['backend'], 'name': bg.name(c, 'backend'),
                 'restartPolicy': {'Name': 'unless-stopped', 'MaximumRetryCount': 0}}}),
             ('archive_frontend', {}), ('check', {'return_value': details()}),
+            ('validate_legacy_time_zone', {'return_value': {'origin': 'running-jvm', 'effectiveZone': 'UTC', 'proof': {}}}),
             ('verify_ingress', {}), ('control', {'return_value': details()})]:
             p = patch.object(bg, attribute, **kwargs)
             p.start(); self.addCleanup(p.stop)
@@ -447,7 +448,7 @@ class DeploymentSafetyTest(unittest.TestCase):
         self.set_route('legacy'); bg.atomic(bg.HOME / 'control/active', 'legacy\n')
         bg.atomic(bg.HOME / 'control/phase', 'legacy\n')
         infos = {bg.LEGACY[app]: {'Id': format(index + 1, '064x'), 'Image': 'current-' + app,
-            'State': {'Status': 'running'}, 'Config': {'Env': ['BASE=default', 'CURRENT=' + app,
+            'State': {'Status': 'running', 'StartedAt': '2026-10-20T00:00:00Z'}, 'Config': {'Env': ['BASE=default', 'CURRENT=' + app,
                 'SPRING_PROFILES_ACTIVE=dev']}} for index, app in enumerate(bg.APPS)}
         created = {}
         def docker(*args):
@@ -549,7 +550,7 @@ class DeploymentSafetyTest(unittest.TestCase):
             bg.main()
         prepare.assert_called_once_with('blue', {'backend': 'reviewed-image'},
             {'backend': '/private/backend.env'}, replace_env=True, recovery_not_before=None, force=False,
-            backend_zone='UTC')
+            backend_zone='UTC', legacy_zone_confirmation=None)
 
     def test_legacy_runtime_tz_alone_does_not_count_as_operator_confirmation(self):
         infos, created, docker = self.legacy_fixture()
@@ -587,6 +588,51 @@ class DeploymentSafetyTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'different expected time zones|immutable'):
                     bg.prepare('blue', {'backend': 'reviewed-image'}, {'backend': candidate}, backend_zone=cli)
             remove.assert_not_called(); self.assertFalse(created)
+
+    def test_legacy_zone_mismatch_never_pins_zone_or_replaces_candidate(self):
+        infos, created, docker = self.legacy_fixture()
+        (bg.HOME / 'control/backend-time-zone').unlink()
+        (bg.HOME / 'control/pending-recovery-not-before').unlink()
+        with patch.object(bg, 'inspect', side_effect=lambda n: infos[n]), \
+             patch.object(bg, 'docker', side_effect=docker), patch.object(bg, 'remove_inactive') as remove, \
+             patch.object(bg, 'validate_legacy_time_zone', side_effect=RuntimeError('Legacy JVM mismatch')):
+            with self.assertRaisesRegex(RuntimeError, 'mismatch'):
+                bg.prepare('blue', {'backend': 'reviewed-image'}, backend_zone='Asia/Seoul',
+                           recovery_not_before='2026-10-20T00:00:00Z')
+        self.assertFalse((bg.HOME / 'control/backend-time-zone').exists())
+        self.assertFalse((bg.HOME / 'control/pending-recovery-not-before').exists())
+        self.assertFalse((bg.HOME / 'control/backend-time-zone-proof.json').exists())
+        remove.assert_not_called(); self.assertFalse(created)
+
+    def test_legacy_proof_is_reverified_before_pin_and_confirmation_is_forwarded(self):
+        infos, created, docker = self.legacy_fixture()
+        (bg.HOME / 'control/backend-time-zone').unlink()
+        confirmation = infos[bg.LEGACY['backend']]['Id']
+        with patch.object(bg, 'inspect', side_effect=lambda n: infos[n]), \
+             patch.object(bg, 'docker', side_effect=docker), patch.object(bg, 'remove_inactive') as remove, \
+             patch.object(bg, 'verify_legacy_snapshot', side_effect=RuntimeError('Legacy source changed')):
+            with self.assertRaisesRegex(RuntimeError, 'Legacy source changed'):
+                bg.prepare('blue', {'backend': 'reviewed-image'}, backend_zone='UTC',
+                           legacy_zone_confirmation=confirmation)
+        bg.validate_legacy_time_zone.assert_called_once()
+        self.assertEqual(bg.validate_legacy_time_zone.call_args.args[1:], ('UTC', confirmation))
+        self.assertFalse((bg.HOME / 'control/backend-time-zone').exists())
+        remove.assert_not_called(); self.assertFalse(created)
+
+    def test_legacy_same_id_restart_during_preparation_is_rejected(self):
+        infos, created, docker = self.legacy_fixture()
+        def changed(*args):
+            result = docker(*args)
+            if args[0] == 'create':
+                infos[bg.LEGACY['backend']]['State']['StartedAt'] = '2026-10-21T00:00:00Z'
+            return result
+        with patch.object(bg, 'inspect', side_effect=lambda n: infos[n]), \
+             patch.object(bg, 'docker', side_effect=changed), \
+             patch.object(bg, 'remove_inactive', side_effect=bg.invalidate_slot):
+            with self.assertRaisesRegex(RuntimeError, 'Legacy source changed'):
+                bg.prepare('blue', {'backend': 'reviewed-image'})
+        self.assertEqual(bg.state()['active'], 'legacy')
+        self.assertEqual(bg.state()['slots']['blue']['status'], 'failed')
 
     def test_force_explicitly_allows_interrupting_busy_retained_environment(self):
         with patch.object(bg, 'drain', side_effect=RuntimeError('Previous environment still has work')), \
@@ -648,6 +694,91 @@ class DeploymentLockTest(unittest.TestCase):
         self.assertGreater(bg.default_lock_timeout('deploy'), 2 * normal_phases)
         self.assertEqual(bg.default_lock_timeout('recover'), 600)
         self.assertEqual(bg.default_lock_timeout('deploy'), 14400)
+        self.assertGreater(bg.DEPLOYMENT_RESERVE_SECONDS, normal_phases)
+
+    def test_insufficient_job_budget_refuses_before_even_opening_lock(self):
+        with patch.object(bg.time, 'time', return_value=1000):
+            with self.assertRaisesRegex(RuntimeError, 'Insufficient job time'):
+                with bg.deployment_lock(14400, 'deploy', 8199): self.fail('entered')
+        self.assertFalse((bg.HOME / 'deploy.lock').exists())
+        self.assertFalse((bg.HOME / 'lock-owner.json').exists())
+
+    def test_wait_is_reduced_by_build_time_and_preserves_operation_reserve(self):
+        elapsed = [0.0]
+        def sleep(seconds): elapsed[0] += seconds
+        with patch.object(bg.time, 'time', side_effect=lambda: 1000 + elapsed[0]), \
+             patch.object(bg.time, 'monotonic', side_effect=lambda: elapsed[0]), \
+             patch.object(bg.time, 'sleep', side_effect=sleep), \
+             patch.object(bg.fcntl, 'flock', side_effect=BlockingIOError('busy')):
+            with self.assertRaisesRegex(RuntimeError, 'operation was not started'):
+                with bg.deployment_lock(14400, 'deploy', 8300): self.fail('entered')
+        self.assertEqual(elapsed[0], 100)
+        self.assertFalse((bg.HOME / 'lock-owner.json').exists())
+
+    def test_reserve_is_rechecked_after_lock_acquisition_before_operation(self):
+        with patch.object(bg.time, 'time', side_effect=[1000, 1000, 1002]):
+            with self.assertRaisesRegex(RuntimeError, 'Insufficient job time'):
+                with bg.deployment_lock(14400, 'deploy', 8201): self.fail('entered')
+        self.assertFalse((bg.HOME / 'lock-owner.json').exists())
+        with bg.deployment_lock(0, 'recover'): pass
+
+    def test_finite_wait_cap_still_applies_with_a_long_job_deadline(self):
+        elapsed = [0.0]
+        def sleep(seconds): elapsed[0] += seconds
+        with patch.object(bg.time, 'time', side_effect=lambda: 1000 + elapsed[0]), \
+             patch.object(bg.time, 'monotonic', side_effect=lambda: elapsed[0]), \
+             patch.object(bg.time, 'sleep', side_effect=sleep), \
+             patch.object(bg.fcntl, 'flock', side_effect=BlockingIOError('busy')):
+            with self.assertRaisesRegex(RuntimeError, 'operation was not started'):
+                with bg.deployment_lock(30, 'deploy', 50000): self.fail('entered')
+        self.assertEqual(elapsed[0], 30)
+
+    def test_deploy_keeps_candidate_inactive_when_preparation_consumes_switch_budget(self):
+        now = [1000.0]
+        def prepare(*args, **kwargs): now[0] = 10000 - bg.SWITCH_RESERVE_SECONDS + 1
+        with patch.object(bg.sys, 'argv', ['bluegreen', '--lock-timeout', '0', 'deploy',
+             '--service', 'backend', '--image', 'candidate', '--job-deadline-epoch', '10000']), \
+             patch.object(bg.time, 'time', side_effect=lambda: now[0]), \
+             patch.object(bg, 'state', return_value={'active': 'blue'}), \
+             patch.object(bg, 'prepare', side_effect=prepare) as prepared, patch.object(bg, 'switch') as switch:
+            with self.assertRaisesRegex(RuntimeError, 'active route is unchanged'): bg.main()
+        prepared.assert_called_once(); switch.assert_not_called()
+        self.assertFalse((bg.HOME / 'transaction.json').exists())
+
+    def test_switch_reserve_covers_normal_bounded_switch_phases(self):
+        self.assertGreater(bg.SWITCH_RESERVE_SECONDS, bg.JOB_DRAIN_TIMEOUT + bg.CONNECTION_GRACE + 120 + 30 + 15)
+
+    def test_job_deadline_rejects_nonfinite_or_nonpositive_values(self):
+        for value in ('-1', '0', 'NaN', 'inf', 'invalid'):
+            with self.assertRaises(bg.argparse.ArgumentTypeError): bg.job_deadline(value)
+        self.assertEqual(bg.job_deadline('10000'), 10000)
+
+class LegacyCompanionBindingTest(unittest.TestCase):
+    def test_missing_or_modified_companion_is_rejected_before_execution(self):
+        for failure in (OSError('missing'), None):
+            with patch.object(bg.Path, 'read_bytes', **({'side_effect': failure} if failure else {'return_value': b'bad code'})), \
+                 patch.object(bg.subprocess, 'run') as run:
+                with self.assertRaisesRegex(RuntimeError, 'companion is missing or differs'):
+                    bg.validate_legacy_time_zone({}, 'UTC', None)
+            run.assert_not_called()
+
+    def test_approved_companion_bytes_match_embedded_digest(self):
+        source = Path(bg.__file__).with_name('legacy-time-zone.py').read_bytes()
+        self.assertEqual(bg.hashlib.sha256(source).hexdigest(), bg.LEGACY_ZONE_HELPER_SHA256)
+
+    def test_verified_companion_uses_pinned_docker_probe_with_timeouts(self):
+        snapshot = {'containerId': 'a' * 64, 'image': 'sha256:reviewed',
+                    'startedAt': '2026-10-20T00:00:00Z', 'runtimeEnvironment': {}}
+        identity = json.dumps({'id': snapshot['containerId'], 'image': snapshot['image'],
+                               'status': 'running', 'startedAt': snapshot['startedAt']})
+        from types import SimpleNamespace
+        results = [identity, 'ieum-zone-v1|actual|1|UTC', identity]
+        with patch.object(bg.subprocess, 'run', side_effect=lambda *a, **kw:
+                          SimpleNamespace(returncode=0, stdout=results.pop(0))) as run:
+            proof = bg.validate_legacy_time_zone(snapshot, 'UTC', None)
+        self.assertEqual(proof['origin'], 'running-jvm')
+        self.assertEqual([call.kwargs['timeout'] for call in run.call_args_list], [5, 10, 5])
+        self.assertTrue(all(snapshot['containerId'] in call.args[0] for call in run.call_args_list))
 
 class BackendIsolationTest(unittest.TestCase):
     def setUp(self):
