@@ -388,12 +388,14 @@ class DeploymentSafetyTest(unittest.TestCase):
         with patch.object(bg, 'inspect', side_effect=lambda n: {'Image': images('green')[n.rsplit('-', 1)[1]]}), \
              patch.object(bg, 'env_values', return_value={}), \
              patch.object(bg, 'remove_inactive', side_effect=lambda c: bg.invalidate_slot(c)), \
+             patch.object(bg.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='')) as cleanup_calls, \
              patch.object(bg, 'docker', side_effect=docker):
-            with self.assertRaisesRegex(RuntimeError, 'cleanup is incomplete') as caught:
+            with self.assertRaisesRegex(RuntimeError, 'creation failed'):
                 bg.prepare('blue', {'backend': 'new-backend'})
-        self.assertIn('creation failed', str(caught.exception.__cause__))
+        self.assertEqual(cleanup_calls.call_count, 1)
         self.assertEqual(bg.state()['slots']['blue']['status'], 'failed')
-        self.assertFalse(bg.state()['slots']['blue']['cleanup']['complete'])
+        self.assertTrue(bg.state()['slots']['blue']['cleanup']['complete'])
+        self.assertEqual(bg.state()['slots']['blue']['cleanup']['containers'][0]['reason'], 'already_absent')
         self.assertIsNone(bg.state()['previous'])
         with self.assertRaisesRegex(RuntimeError, 'No retained'): bg.rollback(bg.release_id(images('blue')))
 
@@ -475,7 +477,7 @@ class DeploymentSafetyTest(unittest.TestCase):
     def candidate_cleanup_runner(self, infos, created):
         def run(args, **kwargs):
             if args[1] == 'ps':
-                output = '\n'.join(item['id'] for item in created.values())
+                output = '\n'.join(item['id'] + ' ' + name for name, item in created.items())
             elif args[1] == 'inspect':
                 output = json.dumps([infos[args[-1]]])
             else:
@@ -574,7 +576,25 @@ class DeploymentSafetyTest(unittest.TestCase):
             bg.main()
         prepare.assert_called_once_with('blue', {'backend': 'reviewed-image'},
             {'backend': '/private/backend.env'}, replace_env=True, recovery_not_before=None, force=False,
-            backend_zone='UTC', legacy_zone_confirmation=None)
+            backend_zone='UTC', legacy_zone_confirmation=None, legacy_probe_timeout=10, legacy_probe_attempts=2)
+
+    def test_prepare_cli_forwards_bounded_legacy_probe_settings(self):
+        with patch.object(bg.sys, 'argv', ['bluegreen', '--lock-timeout', '0', 'prepare', 'blue',
+             '--legacy-probe-timeout', '60', '--legacy-probe-attempts', '3']), patch.object(bg, 'prepare') as prepare:
+            bg.main()
+        self.assertEqual(prepare.call_args.kwargs['legacy_probe_timeout'], 60)
+        self.assertEqual(prepare.call_args.kwargs['legacy_probe_attempts'], 3)
+
+    def test_legacy_probe_cli_and_programmatic_settings_reject_unbounded_or_fractional_values(self):
+        for parser, values in ((bg.parse_legacy_probe_timeout, ('5', '61', '6.5', 'NaN', 'inf', True, '-1')),
+                               (bg.parse_legacy_probe_attempts, ('0', '4', '1.5', 'NaN', True, '-1'))):
+            for value in values:
+                with self.subTest(value=value), self.assertRaises(bg.argparse.ArgumentTypeError): parser(value)
+        self.assertEqual(bg.parse_legacy_probe_timeout('6'), 6)
+        self.assertEqual(bg.parse_legacy_probe_attempts('1'), 1)
+        with patch.object(bg, 'state') as state:
+            with self.assertRaises(bg.argparse.ArgumentTypeError): bg.prepare('blue', {}, legacy_probe_timeout=61)
+        state.assert_not_called()
 
     def test_legacy_runtime_tz_alone_does_not_count_as_operator_confirmation(self):
         infos, created, docker = self.legacy_fixture()
@@ -627,6 +647,49 @@ class DeploymentSafetyTest(unittest.TestCase):
         self.assertFalse((bg.HOME / 'control/pending-recovery-not-before').exists())
         self.assertFalse((bg.HOME / 'control/backend-time-zone-proof.json').exists())
         remove.assert_not_called(); self.assertFalse(created)
+        diagnostic = json.loads((bg.HOME / 'history.jsonl').read_text().splitlines()[-1])
+        self.assertEqual(diagnostic['action'], 'legacy_zone_probe_failed')
+        self.assertEqual(diagnostic['code'], 'legacy_zone_validation_failed')
+        self.assertFalse(diagnostic['attemptsKnown'])
+        self.assertNotIn('attempts', diagnostic)
+
+    def test_structured_probe_failure_is_recorded_without_pinning_or_replacing_anything(self):
+        infos, created, docker = self.legacy_fixture()
+        (bg.HOME / 'control/backend-time-zone').unlink()
+        (bg.HOME / 'control/pending-recovery-not-before').unlink()
+        original_state = (bg.HOME / 'state.json').read_bytes()
+        failure = RuntimeError('private-transport-diagnostic')
+        failure.code, failure.attempts, failure.timeoutSeconds = 'probe_timeout', 2, 30
+        with patch.object(bg, 'inspect', side_effect=lambda n: infos[n]), \
+             patch.object(bg, 'docker', side_effect=docker), patch.object(bg, 'remove_inactive') as remove, \
+             patch.object(bg, 'validate_legacy_time_zone', side_effect=failure) as validate:
+            with self.assertRaises(RuntimeError) as caught:
+                bg.prepare('blue', {'backend': 'reviewed-image'}, backend_zone='UTC',
+                           recovery_not_before='2026-10-20T00:00:00Z',
+                           legacy_probe_timeout=30, legacy_probe_attempts=3)
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(validate.call_args.kwargs, {'probe_timeout': 30, 'probe_attempts': 3})
+        remove.assert_not_called(); self.assertFalse(created)
+        self.assertEqual((bg.HOME / 'state.json').read_bytes(), original_state)
+        for path in ('backend-time-zone', 'pending-recovery-not-before', 'backend-time-zone-proof.json'):
+            self.assertFalse((bg.HOME / 'control' / path).exists())
+        history = (bg.HOME / 'history.jsonl').read_text()
+        self.assertNotIn('private-transport-diagnostic', history)
+        event = json.loads(history.splitlines()[-1])
+        self.assertEqual({key: event[key] for key in ('action', 'code', 'attempts', 'attemptsKnown',
+                                                     'configuredTimeout', 'configuredAttempts')},
+                         {'action': 'legacy_zone_probe_failed', 'code': 'probe_timeout', 'attempts': 2,
+                          'attemptsKnown': True, 'configuredTimeout': 30, 'configuredAttempts': 3})
+
+    def test_malformed_or_private_probe_error_metadata_is_never_copied_to_history(self):
+        for code, attempts in (('private-code', 1), (['private-code'], 1), ('probe_timeout', 99), ('probe_timeout', True)):
+            failure = RuntimeError('private-message')
+            failure.code, failure.attempts = code, attempts
+            bg.record_legacy_probe_failure(failure, 10, 2)
+            event = json.loads((bg.HOME / 'history.jsonl').read_text().splitlines()[-1])
+            self.assertEqual(event['code'], 'legacy_zone_validation_failed')
+            self.assertFalse(event['attemptsKnown']); self.assertNotIn('attempts', event)
+        self.assertNotIn('private-', (bg.HOME / 'history.jsonl').read_text())
 
     def test_legacy_proof_is_reverified_before_pin_and_confirmation_is_forwarded(self):
         infos, created, docker = self.legacy_fixture()
@@ -681,12 +744,13 @@ class DeploymentSafetyTest(unittest.TestCase):
             result = docker(*args)
             return 'not-a-container-id' if args[0] == 'create' else result
         with patch.object(bg, 'inspect', side_effect=lambda n: infos[n]), \
-             patch.object(bg, 'docker', side_effect=invalid_id), patch.object(bg.subprocess, 'run') as cleanup_calls, \
+             patch.object(bg, 'docker', side_effect=invalid_id), \
+             patch.object(bg.subprocess, 'run', side_effect=self.candidate_cleanup_runner(infos, created)) as cleanup_calls, \
              patch.object(bg, 'remove_inactive', side_effect=bg.invalidate_slot):
             with self.assertRaisesRegex(RuntimeError, 'cleanup is incomplete') as caught:
                 bg.prepare('blue', {'backend': 'reviewed-image'})
         self.assertIn('ID could not be pinned', str(caught.exception.__cause__))
-        cleanup_calls.assert_not_called()
+        self.assertEqual(cleanup_calls.call_count, 1)
         cleanup = bg.state()['slots']['blue']['cleanup']
         self.assertFalse(cleanup['complete'])
         self.assertEqual(cleanup['containers'][0]['reason'], 'identity_unavailable')
@@ -745,7 +809,8 @@ class CandidateCleanupTest(unittest.TestCase):
             'State': {'Status': 'running'}} for item in self.created}
 
     def docker_run(self, args, **kwargs):
-        if args[1] == 'ps': output = '\n'.join(self.infos)
+        if args[1] == 'ps': output = '\n'.join(identity + ' ' + info['Name'].removeprefix('/')
+                                              for identity, info in self.infos.items())
         elif args[1] == 'inspect': output = json.dumps([self.infos[args[-1]]])
         else: output = ''
         return SimpleNamespace(returncode=0, stdout=output)
@@ -789,7 +854,7 @@ class CandidateCleanupTest(unittest.TestCase):
         for key, replacement in (('Id', 'e' * 64), ('Image', 'sha256:other'), ('Name', '/renamed'),
                                  ('Config', {'Labels': {'ieum.bluegreen.managed': 'false'}})):
             original = json.loads(json.dumps(self.infos))
-            for info in self.infos.values(): info[key] = replacement
+            for identity, info in self.infos.items(): info[key] = replacement + identity[-1] if key == 'Name' else replacement
             with patch.object(bg.subprocess, 'run', side_effect=self.docker_run) as run:
                 outcome = bg.cleanup_candidate_containers('blue', self.created)
             self.assertFalse(outcome['complete'])
@@ -847,6 +912,45 @@ class CandidateCleanupTest(unittest.TestCase):
                 outcome = bg.cleanup_candidate_containers('blue', self.created)
             self.assertFalse(outcome['complete'])
             self.assertEqual(run.call_count, 1)
+
+    def test_unacknowledged_create_with_exact_name_absent_needs_no_manual_cleanup(self):
+        unidentified = {'name': 'ieum-blue-backend', 'image': 'sha256:backend'}
+        for inventory in ('', 'd' * 64 + ' ieum-blue-backend-old'):
+            with patch.object(bg.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout=inventory)) as run:
+                outcome = bg.cleanup_candidate_containers('blue', [], unidentified)
+            self.assertTrue(outcome['complete'])
+            self.assertEqual(outcome['containers'], [{**unidentified, 'removed': True, 'reason': 'already_absent'}])
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.args[0], ['docker', 'ps', '--all', '--no-trunc', '--format', '{{.ID}} {{.Names}}'])
+
+    def test_unacknowledged_same_name_container_is_never_adopted_even_when_image_and_labels_match(self):
+        unidentified = {key: self.created[0][key] for key in ('name', 'image')}
+        for identity in (self.created[0]['id'], 'f' * 64):
+            inventory = identity + ' ' + unidentified['name']
+            with patch.object(bg.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout=inventory)) as run:
+                outcome = bg.cleanup_candidate_containers('blue', [], unidentified)
+            self.assertFalse(outcome['complete'])
+            self.assertEqual(outcome['containers'][0]['reason'], 'identity_unavailable')
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.args[0][1], 'ps')
+
+    def test_unacknowledged_create_daemon_failure_or_invalid_inventory_never_proves_absence(self):
+        unidentified = {'name': 'ieum-blue-backend', 'image': 'sha256:backend'}
+        rows = ['short ieum-unrelated', 'a' * 64, 'a' * 64 + '  ieum-unrelated',
+                'a' * 64 + ' ieum-first\n' + 'a' * 64 + ' ieum-second',
+                'a' * 64 + ' ieum-same\n' + 'b' * 64 + ' ieum-same',
+                'a' * 64 + ' ieum-first,ieum-second']
+        for result in [SimpleNamespace(returncode=1, stdout='')] + [SimpleNamespace(returncode=0, stdout=row) for row in rows]:
+            with patch.object(bg.subprocess, 'run', return_value=result) as run:
+                outcome = bg.cleanup_candidate_containers('blue', [], unidentified)
+            self.assertFalse(outcome['complete'])
+            self.assertEqual(run.call_count, 1)
+        for failure in (OSError('private daemon error'), subprocess.TimeoutExpired(['docker'], 10)):
+            with patch.object(bg.subprocess, 'run', side_effect=failure) as run:
+                outcome = bg.cleanup_candidate_containers('blue', [], unidentified)
+            self.assertFalse(outcome['complete'])
+            self.assertEqual(run.call_count, 1)
+            self.assertNotIn('private daemon error', json.dumps(outcome))
 
     def test_failed_prepare_known_phases_include_cleanup_inside_job_reserve(self):
         failed_prepare = 2 * bg.JOB_DRAIN_TIMEOUT + bg.CONNECTION_GRACE + \
@@ -969,6 +1073,10 @@ class DeploymentLockTest(unittest.TestCase):
         self.assertEqual(bg.job_deadline('10000'), 10000)
 
 class LegacyCompanionBindingTest(unittest.TestCase):
+    FORWARDING_HELPER = b'''def validate_legacy_zone(snapshot, requested, confirmation, probe, *, probe_timeout, probe_attempts):
+    return {"output": probe("exec", snapshot["containerId"], timeout=probe_timeout), "timeout": probe_timeout, "attempts": probe_attempts}
+'''
+
     def test_missing_or_modified_companion_is_rejected_before_execution(self):
         for failure in (OSError('missing'), None):
             with patch.object(bg.Path, 'read_bytes', **({'side_effect': failure} if failure else {'return_value': b'bad code'})), \
@@ -994,6 +1102,33 @@ class LegacyCompanionBindingTest(unittest.TestCase):
         self.assertEqual(proof['origin'], 'running-jvm')
         self.assertEqual([call.kwargs['timeout'] for call in run.call_args_list], [5, 10, 5])
         self.assertTrue(all(snapshot['containerId'] in call.args[0] for call in run.call_args_list))
+
+    def test_companion_receives_only_bounded_probe_settings_and_subprocess_timeout(self):
+        with patch.object(bg.Path, 'read_bytes', return_value=self.FORWARDING_HELPER), \
+             patch.object(bg, 'LEGACY_ZONE_HELPER_SHA256', bg.hashlib.sha256(self.FORWARDING_HELPER).hexdigest()), \
+             patch.object(bg.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='sanitized')) as run:
+            result = bg.validate_legacy_time_zone({'containerId': 'a' * 64}, 'UTC', None,
+                                                probe_timeout=60, probe_attempts=3)
+        self.assertEqual(result, {'output': 'sanitized', 'timeout': 60, 'attempts': 3})
+        self.assertEqual(run.call_args.kwargs['timeout'], 60)
+
+    def test_probe_callback_preserves_retryable_categories_without_raw_diagnostics(self):
+        failures = [(subprocess.TimeoutExpired(['docker'], 10, output='private-output'), TimeoutError),
+                    (OSError(bg.errno.ECONNRESET, 'private-transport'), ConnectionError),
+                    (OSError(bg.errno.ENOENT, 'private-file'), RuntimeError)]
+        for failure, expected in failures:
+            with patch.object(bg.Path, 'read_bytes', return_value=self.FORWARDING_HELPER), \
+                 patch.object(bg, 'LEGACY_ZONE_HELPER_SHA256', bg.hashlib.sha256(self.FORWARDING_HELPER).hexdigest()), \
+                 patch.object(bg.subprocess, 'run', side_effect=failure):
+                with self.assertRaises(expected) as caught:
+                    bg.validate_legacy_time_zone({'containerId': 'a' * 64}, 'UTC', None)
+            self.assertNotIn('private-', str(caught.exception))
+            self.assertTrue(caught.exception.__suppress_context__)
+        with patch.object(bg.Path, 'read_bytes', return_value=self.FORWARDING_HELPER), \
+             patch.object(bg, 'LEGACY_ZONE_HELPER_SHA256', bg.hashlib.sha256(self.FORWARDING_HELPER).hexdigest()), \
+             patch.object(bg.subprocess, 'run', return_value=SimpleNamespace(returncode=1, stdout='private-error')):
+            with self.assertRaisesRegex(RuntimeError, 'Legacy JVM evidence probe failed'):
+                bg.validate_legacy_time_zone({'containerId': 'a' * 64}, 'UTC', None)
 
 class BackendIsolationTest(unittest.TestCase):
     def setUp(self):

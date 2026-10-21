@@ -10,15 +10,34 @@ import json
 from pathlib import Path
 import re
 import shlex
+import subprocess
 from zoneinfo import TZPATH, available_timezones
 
 
 ZONES = frozenset(available_timezones()) - {'localtime'}
 INSPECT_TIMEOUT = 5
 PROBE_TIMEOUT = 10
+PROBE_ATTEMPTS = 2
+MIN_PROBE_TIMEOUT = 6
+MAX_PROBE_TIMEOUT = 60
+MAX_PROBE_ATTEMPTS = 3
 IDENTITY_FORMAT = ('{"id":{{json .Id}},"image":{{json .Image}},'
                    '"status":{{json .State.Status}},"startedAt":{{json .State.StartedAt}}}')
 OPTION_SOURCES = ('JAVA_TOOL_OPTIONS', 'JDK_JAVA_OPTIONS', '_JAVA_OPTIONS', 'JAVA_OPTS')
+
+
+class LegacyProbeError(RuntimeError):
+    """Fixed diagnostics only: raw Docker errors and output must never escape."""
+
+    CODES = frozenset({'probe_timeout', 'probe_transport_failure', 'probe_command_failed',
+                       'probe_invalid_result', 'probe_incomplete_or_changed_process'})
+
+    def __init__(self, code, attempts, timeout_seconds):
+        self.code = code if code in self.CODES else 'probe_invalid_result'
+        self.attempts = attempts
+        self.timeoutSeconds = timeout_seconds
+        super().__init__('Legacy Java process changed or returned incomplete time-zone evidence '
+                         f'[{self.code}; attempts={attempts}; timeoutSeconds={timeout_seconds}]')
 
 # Only an allowlisted zone, numeric PID and a fixed status may leave the container.
 # jcmd's complete property output and its stderr are never returned to the caller.
@@ -286,15 +305,27 @@ def _observed_valid(zone):
     return bool(match and int(match[2]) <= 23 and int(match[3] or '0') <= 59)
 
 
-def _observed_matches(zone, requested):
+def _observed_rules_zone(zone):
     if zone in ZONES:
-        return _equivalent(zone, requested)
+        return zone
     match = re.fullmatch(r'GMT([+-])([0-9]{1,2})(?::([0-9]{2}))?', zone)
-    if match is None or int(match[3] or '0') != 0:
-        return False
+    if match is None or int(match[2]) > 23 or int(match[3] or '0') != 0:
+        return None
     hours = int(match[2])
     alias = 'Etc/UTC' if hours == 0 else f"Etc/GMT{'-' if match[1] == '+' else '+'}{hours}"
-    return alias in ZONES and _equivalent(alias, requested)
+    return alias if alias in ZONES else None
+
+
+def _observed_matches(zone, requested):
+    observed = _observed_rules_zone(zone)
+    return observed is not None and _equivalent(observed, requested)
+
+
+def _observed_equivalent(left, right):
+    if left == right:
+        return True
+    left, right = _observed_rules_zone(left), _observed_rules_zone(right)
+    return left is not None and right is not None and _equivalent(left, right)
 
 
 def _identity(snapshot, docker_runner):
@@ -318,7 +349,7 @@ def _configuration(environment, requested):
         value = environment['TZ']
         value = value[1:] if value.startswith(':') else value
         sources.append('TZ')
-        if value in ZONES:
+        if _observed_valid(value):
             zones.append(value)
         else:
             uncertain = True
@@ -337,35 +368,63 @@ def _configuration(environment, requested):
         if values or '-Duser.timezone' in arguments:
             sources.append(source)
         for value in values:
-            if value in ZONES:
+            if _observed_valid(value):
                 zones.append(value)
             else:
                 uncertain = True
-    consistent = bool(zones) and all(_equivalent(zones[0], zone) for zone in zones[1:])
+    consistent = bool(zones) and all(_observed_equivalent(zones[0], zone) for zone in zones[1:])
     if uncertain or (zones and not consistent):
         status = 'ambiguous'
     elif not zones:
         status = 'unknown'
-    elif _equivalent(zones[0], requested):
+    elif _observed_matches(zones[0], requested):
         status = 'matches'
     else:
         status = 'mismatch'
     return {'status': status, 'sources': sources, 'zones': sorted(set(zones))}
 
 
-def _probe(snapshot, docker_runner):
-    try:
-        output = docker_runner('exec', snapshot['containerId'], 'sh', '-c', PROBE_SCRIPT,
-                               'ieum-legacy-zone', ' '.join(sorted(ZONES)), timeout=PROBE_TIMEOUT)
-    except Exception:
-        return {'status': 'invalid', 'reason': 'probe_failed'}
-    if not isinstance(output, str):
-        return {'status': 'invalid', 'reason': 'invalid_probe_result'}
-    if len(output) > 32768:
-        return {'status': 'invalid', 'reason': 'invalid_probe_result'}
-    if output.startswith('ieum-zone-v2|'):
-        return _probe_v2(output)
-    return _probe_v1(output)
+def _probe_settings(timeout, attempts):
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or \
+            not MIN_PROBE_TIMEOUT <= timeout <= MAX_PROBE_TIMEOUT:
+        raise RuntimeError('Legacy probe timeout must be an integer from 6 through 60 seconds')
+    if isinstance(attempts, bool) or not isinstance(attempts, int) or not 1 <= attempts <= MAX_PROBE_ATTEMPTS:
+        raise RuntimeError('Legacy probe attempts must be an integer from 1 through 3')
+
+
+def _probe(snapshot, docker_runner, timeout=PROBE_TIMEOUT, attempts=PROBE_ATTEMPTS):
+    """Retry only an explicit timeout or transport exception, never bad evidence.
+
+    A nonzero command result is not proof of a transient transport failure. The
+    injected runner may signal a recognized connection failure with ConnectionError;
+    no stderr text or arbitrary exception message is inspected or returned here.
+    """
+    for attempt in range(1, attempts + 1):
+        retryable = False
+        try:
+            output = docker_runner('exec', snapshot['containerId'], 'sh', '-c', PROBE_SCRIPT,
+                                   'ieum-legacy-zone', ' '.join(sorted(ZONES)), timeout=timeout)
+        except (TimeoutError, subprocess.TimeoutExpired):
+            code, retryable = 'probe_timeout', True
+        except ConnectionError:
+            code, retryable = 'probe_transport_failure', True
+        except Exception:
+            code = 'probe_command_failed'
+        else:
+            if not isinstance(output, str) or len(output) > 32768:
+                observed = {'status': 'invalid', 'reason': 'invalid_probe_result'}
+            elif output.startswith('ieum-zone-v2|'):
+                observed = _probe_v2(output)
+            else:
+                observed = _probe_v1(output)
+            if observed['status'] != 'invalid':
+                observed['probe'] = {'code': 'probe_ok', 'attempts': attempt, 'timeoutSeconds': timeout}
+                return observed
+            code = ('probe_incomplete_or_changed_process'
+                    if observed['reason'] == 'incomplete_or_changed_process' else 'probe_invalid_result')
+        if not retryable or attempt == attempts:
+            return {'status': 'invalid', 'reason': code,
+                    'probe': {'code': code, 'attempts': attempt, 'timeoutSeconds': timeout}}
 
 
 def _probe_v1(output):
@@ -427,9 +486,12 @@ def _startup_inputs(observed, requested):
 
     `user.timezone` overrides platform discovery. JVM environment option ordering
     and launcher argument files are deliberately not guessed: conflicting possible
-    property values reject confirmation. With no recognized property, TZ precedes
-    the platform files. JDK 21 updates differ in whether /etc/timezone is consulted,
-    so contradictory known platform files also reject confirmation.
+    property values reject confirmation when both process inputs were read. With
+    no recognized property, TZ precedes the platform files. Unavailable environment
+    or argv may contain an overriding property, so lower evidence cannot establish
+    a mismatch. Invalid or partially read data never reaches this function. JDK 21
+    updates differ in whether /etc/timezone is consulted, so contradictory known
+    platform files also reject confirmation when process inputs are complete.
     """
     inputs = observed['inputs']
     properties = [item for source in ('JAVA_TOOL_OPTIONS', 'JDK_JAVA_OPTIONS', '_JAVA_OPTIONS', 'cmdline')
@@ -448,28 +510,36 @@ def _startup_inputs(observed, requested):
     digest_match = bool(requested_bytes is not None and observed['localtimeSha256'] != 'unavailable' and
                         hashlib.sha256(requested_bytes).hexdigest() == observed['localtimeSha256'])
     known_mismatch = any(not _observed_matches(value, requested) for value in zones)
+    complete_process_inputs = all(value == 'ok' for value in observed['reads'].values())
     uncertain = (any(item['status'] == 'unsupported' for values in inputs.values() for item in values) or
-                 any(value != 'ok' for value in observed['reads'].values()))
-    if known_mismatch:
+                 not complete_process_inputs)
+    if known_mismatch and complete_process_inputs:
         status = 'mismatch'
+    elif not complete_process_inputs:
+        status = 'ambiguous'
     elif zones or (basis.startswith('platform-files') and digest_match):
         status = 'ambiguous' if uncertain else 'matches'
     else:
         status = 'unknown'
     return {'status': status, 'basis': basis, 'zones': zones,
             'inputs': inputs, 'reads': observed['reads'], 'localtimeSha256': observed['localtimeSha256'],
+            'processInputsComplete': complete_process_inputs,
             'requestedTzifDigestMatches': digest_match,
             'limitation': 'startup inputs do not prove cached JVM state or application TimeZone.setDefault overrides'}
 
 
-def validate_legacy_zone(snapshot, requested_zone, confirmation_id, docker_runner):
+def validate_legacy_zone(snapshot, requested_zone, confirmation_id, docker_runner, *,
+                         probe_timeout=PROBE_TIMEOUT, probe_attempts=PROBE_ATTEMPTS):
     """Return sanitized evidence, or reject before the immutable zone is written.
 
     The running JVM property is preferred. Startup inputs alone can be overridden
     or cached, so a matching full container ID is still required without that probe.
-    A known JVM/startup-input mismatch cannot be confirmed away.
+    A known JVM/startup-input mismatch cannot be confirmed away. When higher
+    process inputs are unavailable, Config.Env supplies a separate conservative
+    check before exact-container operator confirmation may proceed.
     """
     requested = _zone(requested_zone)
+    _probe_settings(probe_timeout, probe_attempts)
     if not isinstance(snapshot, dict) or not isinstance(snapshot.get('containerId'), str) or \
             not re.fullmatch(r'[a-f0-9]{64}', snapshot['containerId']) or \
             not isinstance(snapshot.get('image'), str) or not snapshot['image'] or \
@@ -482,15 +552,16 @@ def validate_legacy_zone(snapshot, requested_zone, confirmation_id, docker_runne
     before = _identity(snapshot, docker_runner)
     if before['startedAt'] != snapshot['startedAt']:
         raise RuntimeError('Legacy backend restarted after the captured source snapshot')
-    observed = _probe(snapshot, docker_runner)
+    observed = _probe(snapshot, docker_runner, probe_timeout, probe_attempts)
     after = _identity(snapshot, docker_runner)
     if after != before:
         raise RuntimeError('Legacy backend restarted or changed during time-zone observation')
     if observed['status'] == 'invalid':
-        raise RuntimeError('Legacy Java process changed or returned incomplete time-zone evidence')
+        raise LegacyProbeError(observed['probe']['code'], observed['probe']['attempts'],
+                               observed['probe']['timeoutSeconds']) from None
     configured = _configuration(snapshot['runtimeEnvironment'], requested)
     proof = {'containerId': snapshot['containerId'], 'image': snapshot['image'],
-             'startedAt': before['startedAt'], 'configured': configured}
+             'startedAt': before['startedAt'], 'configured': configured, 'probe': observed['probe']}
     if observed['status'] == 'actual':
         if not _observed_matches(observed['zone'], requested):
             raise RuntimeError('Legacy running JVM time zone differs from the requested backend time zone')
@@ -503,10 +574,14 @@ def validate_legacy_zone(snapshot, requested_zone, confirmation_id, docker_runne
         startup = _startup_inputs(observed, requested)
         if startup['status'] == 'mismatch':
             raise RuntimeError('Legacy process or platform time-zone startup evidence differs from the requested backend time zone')
+        if not startup['processInputsComplete'] and \
+                any(not _observed_matches(value, requested) for value in configured['zones']):
+            raise RuntimeError('Legacy time-zone configuration differs from the requested backend time zone')
         proof.update(startupInputs=startup, pid=observed['process']['pid'],
                      pidStartTicks=observed['process']['startTicks'])
-        # The process environment and argv supersede Config.Env hints. JAVA_OPTS
-        # is not a JVM-consumed variable and may be ignored by the image launcher.
+        # Fully read process inputs supersede Config.Env hints. When one is not
+        # readable, known Config.Env mismatches have already rejected confirmation.
+        # JAVA_OPTS is not consumed directly by the JVM and may be launcher-specific.
         configured = startup
     if configured['status'] == 'mismatch':
         raise RuntimeError('Legacy time-zone configuration differs from the requested backend time zone')

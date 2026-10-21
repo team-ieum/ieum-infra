@@ -4,6 +4,7 @@ import argparse
 import contextlib
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
+import errno
 import fcntl
 import hashlib
 import json
@@ -43,8 +44,12 @@ DEFAULT_DEPLOY_LOCK_TIMEOUT = 14400
 MAX_LOCK_TIMEOUT = 14400
 DEPLOYMENT_RESERVE_SECONDS = 9000  # Normal phases, or failed preparation plus bounded candidate cleanup, with headroom.
 SWITCH_RESERVE_SECONDS = 1800  # Includes the 660s drain, connection grace, checks and control requests.
+DEFAULT_LEGACY_PROBE_TIMEOUT = 10
+DEFAULT_LEGACY_PROBE_ATTEMPTS = 2
+LEGACY_PROBE_FAILURE_CODES = frozenset({'probe_timeout', 'probe_transport_failure', 'probe_command_failed',
+    'probe_invalid_result', 'probe_incomplete_or_changed_process'})
 BACKEND_TIME_ZONES = frozenset(available_timezones()) - {'localtime'}
-LEGACY_ZONE_HELPER_SHA256 = '9a00876f81f26c28f4cd701a965360c5e7ae6481f2a5284a8b0b6aec9077cd2d'
+LEGACY_ZONE_HELPER_SHA256 = '0ec574da2d78251a280a4af735dc2ef0c513af857a5ef148cec5cac604a5799e'
 
 def default_lock_timeout(command):
     return DEFAULT_DEPLOY_LOCK_TIMEOUT if command == 'deploy' else DEFAULT_OPERATION_LOCK_TIMEOUT
@@ -66,6 +71,23 @@ def job_deadline(value):
         return deadline
     except ValueError as failure:
         raise argparse.ArgumentTypeError('Job deadline must be a finite positive Unix timestamp') from failure
+
+def bounded_legacy_probe_integer(value, minimum, maximum, setting):
+    try:
+        if isinstance(value, bool) or not re.fullmatch(r'[0-9]+', str(value)):
+            raise ValueError()
+        result = int(value)
+        if not minimum <= result <= maximum:
+            raise ValueError()
+        return result
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f'{setting} must be an integer between {minimum} and {maximum}') from None
+
+def parse_legacy_probe_timeout(value):
+    return bounded_legacy_probe_integer(value, 6, 60, 'Legacy probe timeout')
+
+def parse_legacy_probe_attempts(value):
+    return bounded_legacy_probe_integer(value, 1, 3, 'Legacy probe attempts')
 
 def require_job_budget(deadline, reserve=DEPLOYMENT_RESERVE_SECONDS):
     if deadline is not None and deadline - time.time() < reserve:
@@ -335,7 +357,11 @@ def backend_time_zone(explicit=None, persist=True):
         record('backend_time_zone_initialized', zone=value)
     return value
 
-def validate_legacy_time_zone(snapshot, requested, confirmation_id):
+def validate_legacy_time_zone(snapshot, requested, confirmation_id,
+                              probe_timeout=DEFAULT_LEGACY_PROBE_TIMEOUT,
+                              probe_attempts=DEFAULT_LEGACY_PROBE_ATTEMPTS):
+    probe_timeout = parse_legacy_probe_timeout(probe_timeout)
+    probe_attempts = parse_legacy_probe_attempts(probe_attempts)
     # The approved controller digest also binds its companion. Execute the exact verified bytes.
     path = Path(__file__).with_name('legacy-time-zone.py')
     try:
@@ -352,9 +378,25 @@ def validate_legacy_time_zone(snapshot, requested, confirmation_id):
             if result.returncode:
                 raise RuntimeError()
             return result.stdout.strip()
-        except (OSError, subprocess.SubprocessError, RuntimeError):
+        except subprocess.TimeoutExpired:
+            raise TimeoutError('Legacy JVM evidence probe timed out') from None
+        except OSError as failure:
+            if failure.errno in (errno.ENOTCONN, errno.ECONNREFUSED, errno.ECONNRESET,
+                                 errno.ETIMEDOUT, errno.EHOSTUNREACH, errno.ENETUNREACH):
+                raise ConnectionError('Legacy JVM evidence probe transport failed') from None
+            raise RuntimeError('Legacy JVM evidence probe command failed') from None
+        except (subprocess.SubprocessError, RuntimeError):
             raise RuntimeError('Legacy JVM evidence probe failed') from None
-    return namespace['validate_legacy_zone'](snapshot, requested, confirmation_id, probe)
+    return namespace['validate_legacy_zone'](snapshot, requested, confirmation_id, probe,
+                                            probe_timeout=probe_timeout, probe_attempts=probe_attempts)
+
+def record_legacy_probe_failure(failure, timeout, attempt_limit):
+    code, attempts = getattr(failure, 'code', None), getattr(failure, 'attempts', None)
+    details = {'configuredTimeout': timeout, 'configuredAttempts': attempt_limit, 'attemptsKnown': False,
+               'code': 'legacy_zone_validation_failed'}
+    if isinstance(code, str) and code in LEGACY_PROBE_FAILURE_CODES and type(attempts) is int and 1 <= attempts <= attempt_limit:
+        details.update(code=code, attempts=attempts, attemptsKnown=True)
+    record('legacy_zone_probe_failed', **details)
 
 def invalidate_slot(color, status='preparing'):
     data = state()
@@ -627,9 +669,17 @@ def cleanup_candidate_containers(color, created, unidentified=None):
         return result.stdout.strip()
 
     try:
-        inventory = set(command('ps', '--all', '--no-trunc', '--format', '{{.ID}}').splitlines()) if created else set()
-        if any(not re.fullmatch(r'[a-f0-9]{64}', identity) for identity in inventory):
-            raise RuntimeError('inventory_unverified')
+        inventory = {}
+        names = set()
+        rows = command('ps', '--all', '--no-trunc', '--format', '{{.ID}} {{.Names}}') if created or unidentified else ''
+        for row in rows.splitlines():
+            fields = row.split(' ')
+            if len(fields) != 2 or not re.fullmatch(r'[a-f0-9]{64}', fields[0]) or \
+                    not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', fields[1]) or \
+                    fields[0] in inventory or fields[1] in names:
+                raise RuntimeError('inventory_unverified')
+            inventory[fields[0]] = fields[1]
+            names.add(fields[1])
     except RuntimeError as failure:
         return unverified(str(failure))
     for item in reversed(created):
@@ -660,11 +710,19 @@ def cleanup_candidate_containers(color, created, unidentified=None):
         finally:
             results.append(outcome)
     if unidentified is not None:
-        results.append({**unidentified, 'removed': False, 'reason': 'identity_unavailable'})
+        # Only an authoritative exact-name absence proves that an unacknowledged
+        # create left no container. Never adopt or mutate a same-name container.
+        absent = unidentified['name'] not in names
+        results.append({**unidentified, 'removed': absent,
+                        'reason': 'already_absent' if absent else 'identity_unavailable'})
     return {'complete': all(item['removed'] for item in results), 'containers': results}
 
 def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_not_before=None, force=False,
-            backend_zone=None, legacy_zone_confirmation=None):
+            backend_zone=None, legacy_zone_confirmation=None,
+            legacy_probe_timeout=DEFAULT_LEGACY_PROBE_TIMEOUT,
+            legacy_probe_attempts=DEFAULT_LEGACY_PROBE_ATTEMPTS):
+    legacy_probe_timeout = parse_legacy_probe_timeout(legacy_probe_timeout)
+    legacy_probe_attempts = parse_legacy_probe_attempts(legacy_probe_attempts)
     data = state()
     assert_consistent(data)
     if color == data['active']: raise RuntimeError('Target environment is already active')
@@ -696,8 +754,13 @@ def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_no
         raise RuntimeError('CLI and backend environment specify different expected time zones')
     expected_zone = backend_time_zone(backend_zone or configured_zone, persist=False)
     if data['active'] == 'legacy':
-        proof = validate_legacy_time_zone(snapshots['backend'], expected_zone, legacy_zone_confirmation)
-        verify_legacy_snapshot(snapshots)
+        try:
+            proof = validate_legacy_time_zone(snapshots['backend'], expected_zone, legacy_zone_confirmation,
+                probe_timeout=legacy_probe_timeout, probe_attempts=legacy_probe_attempts)
+            verify_legacy_snapshot(snapshots)
+        except Exception as failure:
+            record_legacy_probe_failure(failure, legacy_probe_timeout, legacy_probe_attempts)
+            raise
         atomic(HOME / 'control/backend-time-zone-proof.json', json.dumps({
             'expectedZone': expected_zone, 'verifiedAt': datetime.now(timezone.utc).isoformat(), **proof}))
         record('legacy_backend_time_zone_verified', expectedZone=expected_zone, **proof)
@@ -1070,6 +1133,12 @@ def main():
             p.add_argument('--pending-recovery-not-before')
             p.add_argument('--backend-time-zone')
             p.add_argument('--confirm-legacy-time-zone', metavar='CONTAINER_ID')
+            p.add_argument('--legacy-probe-timeout', type=parse_legacy_probe_timeout,
+                           default=DEFAULT_LEGACY_PROBE_TIMEOUT,
+                           help='Legacy preparation probe timeout in seconds (6..60; default 10)')
+            p.add_argument('--legacy-probe-attempts', type=parse_legacy_probe_attempts,
+                           default=DEFAULT_LEGACY_PROBE_ATTEMPTS,
+                           help='Legacy preparation probe attempts (1..3; default 2)')
             p.add_argument('--force', action='store_true')
         if verb == 'switch': p.add_argument('--force', action='store_true')
     p = sub.add_parser('rollback'); p.add_argument('--release', required=True)
@@ -1101,7 +1170,8 @@ def main():
             prepare(args.color, {a: getattr(args, a + '_image') for a in APPS if getattr(args, a + '_image')},
                 {a: getattr(args, a + '_env_file') for a in APPS if getattr(args, a + '_env_file')},
                 replace_env=args.replace_env, recovery_not_before=args.pending_recovery_not_before, force=args.force,
-                backend_zone=args.backend_time_zone, legacy_zone_confirmation=args.confirm_legacy_time_zone)
+                backend_zone=args.backend_time_zone, legacy_zone_confirmation=args.confirm_legacy_time_zone,
+                legacy_probe_timeout=args.legacy_probe_timeout, legacy_probe_attempts=args.legacy_probe_attempts)
         elif args.command == 'switch': switch(args.color, force=args.force)
         elif args.command == 'check': print(json.dumps(check(args.color), indent=2))
         elif args.command == 'finish-bootstrap': finish_bootstrap()

@@ -1,6 +1,6 @@
 # Blue/Green 수정 반영 및 장애 복구 절차
 
-이 문서는 2026-10-21 v6 재검토에 따라 추가 보완하는 protocol 2의 운영 계약이다.
+이 문서는 2026-10-21 v7 재검토에 따라 추가 보완하는 protocol 2의 운영 계약이다.
 문서의 명령은 운영자가 승인된 반영·점검 시간에 실행할 예시이며, 문서 수정 과정에서 실행하지 않았다.
 로컬 코드 수정은 기존 서버의 실행 중인 이미지나 GitHub workflow 설정을 변경하지 않는다.
 
@@ -26,16 +26,16 @@ Blue/Green 상태 파일을 정상 운영 상태라고 가정하거나 수동으
 
 | 저장소 | 마지막 push된 커밋 | 현재 로컬 HEAD | 현재 HEAD 이후 |
 |---|---|---|---|
-| Infra | `42e06cb` | `6dd04d7` | 이번 v7 재검토 보완은 미커밋 |
-| Backend | `61d1be3` | `3bf72e2` | 배포 workflow 보완은 미커밋; 앱 코드 유지 |
-| Frontend | `6812f4c` | `fb9e6e3` | 배포 workflow 보완은 미커밋; 앱 코드 유지 |
-| Agent | `b64e0e6` | `a4fa7c6` | 배포 workflow 보완은 미커밋 |
+| Infra | `42e06cb` | `1f8cf87` | 이번 v8 Infra 보완은 미커밋 |
+| Backend | `61d1be3` | `d9d5b37` | 이번 v8 수정 없음; 앱·배포 workflow 유지 |
+| Frontend | `6812f4c` | `ebaa2cc` | 이번 v8 수정 없음; 앱·배포 workflow 유지 |
+| Agent | `b64e0e6` | `4487eed` | 이번 v8 수정 없음; 배포 workflow 유지 |
 
 네 저장소의 현재 HEAD에는 push하지 않은 보완 커밋이 있다. 마지막 push 이후 누적 커밋 수는
-Infra·Backend·Frontend 각각 3개, Agent 2개다. v6 보완은 위 로컬 HEAD에 커밋됐으며, 이번 v7
-Infra와 앱 세 저장소의 배포 workflow 보완은 그 이후의 미커밋 수정이다. 마지막 push→로컬 HEAD의 미push 커밋과
+Infra·Backend·Frontend 각각 4개, Agent 3개다. 앞선 v7 수정은 위 로컬 HEAD에 커밋됐으며, 이번 v8
+Infra 보완은 그 이후의 미커밋 수정이다. 마지막 push→로컬 HEAD의 미push 커밋과
 로컬 HEAD→working tree의 미커밋 수정을 구분한다. 이 둘 모두 운영에 반영됐다는 뜻이 아니다.
-이번 v7 보완 과정에서는 commit·push·서버 변경을 수행하지 않는다.
+이번 v8 보완 과정에서는 commit·push·서버 변경을 수행하지 않는다.
 
 ## 2. 다음 재적용 시 기존 배포 경로를 동결한다
 
@@ -304,7 +304,7 @@ attach할 수 있을 때 `/proc/*/comm`에서 단일 Java PID를 확인한 뒤 `
 ```bash
 docker inspect --format '{{.Id}} {{.Image}} {{.State.Running}}' ieum-backend
 docker exec ieum-backend sh -c 'command -v jcmd >/dev/null || exit 1; for path in /proc/[0-9]*/comm; do comm=; if IFS= read -r comm < "$path" 2>/dev/null && [ "$comm" = java ]; then pid=${path#/proc/}; printf "%s\n" "${pid%/comm}"; fi; done'
-docker exec ieum-backend sh -c 'properties="$(jcmd "$1" VM.system_properties)" || exit; printf "%s\n" "$properties" | sed -n "s/^user.timezone=//p"' sh CONFIRMED_JVM_PID
+docker exec ieum-backend sh -c 'properties="$(jcmd "$1" VM.system_properties 2>/dev/null)" || exit; printf "%s\n" "$properties" | sed -n "s/^user.timezone=//p"' sh CONFIRMED_JVM_PID
 docker inspect --format '{{.Id}} {{.Image}} {{.State.Running}}' ieum-backend
 ```
 
@@ -327,12 +327,20 @@ stderr를 밖으로 출력하지 않고 IANA allowlist의 zone·고정 상태·�
 [OpenJDK 21.0.8+9의 플랫폼 시간대 조회](https://raw.githubusercontent.com/openjdk/jdk21u/jdk-21.0.8%2B9/src/java.base/unix/native/libjava/TimeZone_md.c),
 [현재 jdk21u의 플랫폼 시간대 조회](https://raw.githubusercontent.com/openjdk/jdk21u/master/src/java.base/unix/native/libjava/TimeZone_md.c).
 
-현재 process의 명시적인 JVM zone과 `TZ`를 우선 고려하고, 이들이 없으면 플랫폼 파일 증거를
-검토한다. JRE patch가 확인되지 않은 상태의 `/etc/timezone`·`/etc/localtime`에 서로 다른 알려진 zone이
-있거나 가능한 선택값이 요청 zone과 다르면 **확인 플래그로도 거부를 우회하지 못한다.** 예를 들어
-`jcmd`가 없고 process에 zone 지정이 없으며 알려진 플랫폼 입력이 `Etc/UTC`이면 `Asia/Seoul`과
-container ID를 명시해도 pin할 수 없다. 단순히 이미지의 통상 기본값·`TZ` 누락·팀 위치를 근거로
-UTC·Asia/Seoul을 추정하지 않는다.
+process 입력을 완전히 읽었다면 명시적인 JVM zone과 `TZ`를 우선 고려하고, 이들이 없으면
+플랫폼 파일 증거를 검토한다. 이 경우 JRE patch가 확인되지 않은 `/etc/timezone`·`/etc/localtime`에
+서로 다른 알려진 zone이 있거나 가능한 선택값이 요청 zone과 다르면 **확인 플래그로도 거부를 우회하지
+못한다.** 예를 들어 `jcmd`가 없고 읽기 완료된 process에 zone 지정이 없으며 알려진 플랫폼 입력이
+`Etc/UTC`이면 `Asia/Seoul`과 container ID를 명시해도 pin할 수 없다.
+
+단, 필터가 형식에 맞게 `reads.environment=unavailable` 또는 `reads.cmdline=unavailable`을
+보고했다면 `startupInputs.processInputsComplete=false`와 `ambiguous`로 구분한다.
+상위 JVM 옵션·`TZ`가 하위 플랫폼 입력을 덮었을 가능성이 남으므로 하위 파일의
+`Etc/UTC`만으로 요청 `Asia/Seoul`의 확정 불일치를 선언하지 않고 `ambiguous`로 낮춰 전체 container ID
+확인 경로를 허용한다. 이 부분 관측에서도 snapshot `Config.Env`의 알려진 IANA/GMT `TZ`·JVM 옵션이 요청값과
+어긋나면 확인으로 우회할 수 없다. 반대로 완전한 process 관측은 설정 snapshot보다 우선한다.
+`unavailable` 고정 상태와 전송 실패·오류·초과·잘린 출력을 혼동하지 않는다. 단순히 이미지의
+통상 기본값·`TZ` 누락·팀 위치로 UTC·Asia/Seoul을 추정하지 않는다.
 
 이 입력들은 JVM의 **시작 입력 증거**다. 실제 JVM의 cached/default `TimeZone`이나 앱의 custom clock을
 직접 읽은 결과가 아니다. `jcmd`의 `user.timezone` property도 앱이 나중에 `TimeZone.setDefault`로
@@ -342,12 +350,39 @@ property와 다른 기본값을 만들었다면 그 값을 증명하지 못한�
 
 실제 jcmd property 조회가 불가능한 경로는 시작 입력이 요청 zone과 일치해도 운영자가 기존 실행·DB
 기록을 검토한 뒤 **전체 64자리 container ID**를 `--confirm-legacy-time-zone CONTAINER_ID`로 지정해야
-한다. 미지원·불명 입력을 확인할 수 없으면 최초 pin을 보류한다. known mismatch·알려진 플랫폼 모순은
-확인으로 덮을 수 없고, 형식 오류·불완전/중복 process 증거·PID 변경도 중단한다. probe 전송 실패·timeout·
+한다. 미지원·불명 입력을 확인할 수 없으면 최초 pin을 보류한다. 실제 jcmd 불일치, 완전한 process
+관측의 알려진 불일치·플랫폼 모순과 부분 관측의 `Config.Env` 불일치는 확인으로 덮을 수 없다.
+명시한 `unavailable` 레코드 외의 필수 형식 누락·중복 process 증거·PID 변경도
+중단한다. probe 전송 실패·timeout·
 비문자/과대/잘린/알 수 없는 출력 역시 확인 플래그로 우회하지 않는다. 인식한 고정 unavailable 사유나
 완전한 v2 입력 판정일 때만 위 운영자 확인 경로를 사용할 수 있다. Legacy가 재배포돼
 ID가 바뀌면 이전 확인을 재사용하지 않는다. controller가 tool을 자동 설치하거나 새 Java 프로세스를
 기동해 기준을 추정하지 않는다.
+
+#### Legacy probe의 유한 재시도와 진단
+
+`prepare`의 `--legacy-probe-timeout`은 **정수 6~60초, 기본 10초**이고
+`--legacy-probe-attempts`는 **정수 1~3회, 기본 2회**다. 이 두 옵션은 수동 Legacy 준비용이다.
+자동 앱 `deploy`는 완료된 bootstrap을 전제로 하며 이 옵션을 새로 받지 않는다. JVM 내부 `jcmd`는 별도로 5초 제한을 유지한다.
+승인된 점검에서 호스트 부하를 확인한 뒤 범위 안에서 outer probe 기한·횟수를 조정하며, timeout을
+없애거나 `--confirm-legacy-time-zone`으로 실패한 probe를 건너뛰지 않는다.
+
+재시도는 `TimeoutError`/`TimeoutExpired` 또는 `ConnectionError`로 확인된 일시적 전송 실패에만 적용한다.
+Docker 명령의 실패 return code, 비문자/과대/잘린/알 수 없는 출력, PID 불일치 등은 즉시 중단한다.
+재시도 횟수를 모두 소진해도 불명 데이터를 운영자 확인으로 승인하지 않는다. probe 전후의
+container ID·image·시작 시각과 PID ticks 확인은 계속 필요하며, 새 컨테이너나 JVM으로 바뀐 상태에서
+이전 시도의 증거를 재사용하지 않는다.
+
+실패에는 raw stderr·환경·옵션 대신 `probe_timeout`, `probe_transport_failure`, `probe_command_failed`,
+`probe_invalid_result`, `probe_incomplete_or_changed_process` 같은 **고정 코드**를 남긴다. controller는
+불변 cutoff·zone pin 및 비활성 제거 전에 private `history.jsonl`에 `legacy_zone_probe_failed`를 기록하고
+중단한다. `configuredTimeout`·`configuredAttempts`는 설정값이며 실제 시도 횟수로 해석하지 않는다.
+구조화된 helper 오류는 `attemptsKnown=true`와 실제 `attempts`를 기록하고, 일반 검증 실패는
+`code=legacy_zone_validation_failed`, `attemptsKnown=false`로 기록하며 모르는 실제 횟수는 생략한다.
+실패 이력 기록은 의도한 진단 쓰기이고 불변 pin·기존 slot·active/owner를 바꾸는 조치가 아니다.
+
+성공 증거에는 `proof.probe={code: probe_ok, attempts, timeoutSeconds}`를 남겨 몇 번 만에 관측됐는지
+구분한다. 이 진단은 새 공개 endpoint·원시 Docker 출력·비밀 설정 기록을 추가하지 않는다.
 
 세 Legacy 앱의 snapshot을 재검증한 뒤 검증된 `expectedZone`, `verifiedAt`, `origin`, `effectiveZone`,
 `proof`를 private 0600 `control/backend-time-zone-proof.json`에 기록하고, `history.jsonl`에
@@ -482,15 +517,23 @@ HTTP 요청의 오류 없는 전환을 보장한다는 의미가 아니다.
 줄인다. 정상 active·retained 환경의 drain과 기존 1,350초 stop 유예는 줄이지 않는다.
 
 controller는 `docker create`가 반환한 정확한 64자리 ID를 pin하고 해당 ID로 시작한다. 정리 시에도
-Docker 전체 ID 목록과 ID·image·이름·managed/color label, saved state·실제 route·control active를
-대조한다. active가 아니며 이번 prepare가 생성한 ID임을 확인한 후보만 `restart=no`로 바꾸고
+Docker 전체 ID·정확한 canonical name 목록과 ID·image·이름·managed/color label, saved state·실제 route·
+control active를 대조한다. 전체 목록은 `docker ps`가 성공하고 각 행의 64자리 ID·한 개의 canonical name,
+ID와 이름의 유일성까지 검증돼야 부재 판단의 근거가 된다. active가 아니며 이번 prepare가 생성한 ID임을 확인한 후보만 `restart=no`로 바꾸고
 필요 시 stop한 뒤 force 없는 `rm`을 수행한다. 이름이 같다는 이유로 다른 컨테이너를 정지하거나
 create 결과가 불명인 경우 이름으로 추정해 제거하지 않는다. 조회가 실패하면 컨테이너 부재로 간주하지 않는다.
 
 슬롯은 `failed`로 기록하고 `.cleanup.complete`와 컨테이너별 ID·이름·image·`removed`·고정 reason을
 보관한다. 같은 payload를 `history.jsonl`의 `prepare_failed` 이력에 남긴다. 전체 목록에서 ID가 없음을
-확인한 후보는 `already_absent`로 구분한다. ID를 식별하지 못하면 `identity_unavailable`로 남기고,
-Docker 실패·시간 초과·예산 소진 등으로 정리가 덜 끝났으면 `complete=false`와 명시적 오류를 반환한다.
+확인한 후보는 `already_absent`로 구분한다. `docker create`가 실패해 ID를 확인받지 못한 경우에도,
+성공적으로 검증한 전체 목록의 **조회 시점에 예정된 이름이 없으면** `already_absent`, `removed=true`로
+기록한다. 생성 전 실패에 실제 잔존이 없는데 정리 미완료라고 표시하지 않는다.
+
+반대로 예정 이름이 존재하면 image·관리 label이 같아도 이번 create의 컨테이너라고 추정·인수하지 않는다.
+`identity_unavailable`로 남기고 ID가 불명인 이름을 inspect·stop·rm 대상으로 삼지 않는다. 목록 조회 실패·
+malformed/중복 결과·시간 초과는 부재 증거가 아니며 정리 미완료다. Docker 실패·시간 초과·예산 소진
+등으로 정리가 덜 끝났으면 `complete=false`와 명시적 오류를 반환한다. 다른 컨테이너를 이름만으로
+제거하지 않는 기존 경계와 active·retained 보호는 유지한다.
 
 이 경로는 아직 route를 바꾸지 않았으므로 전환 journal을 만들지 않는다. `failed`나 정리 미완료를
 새로운 active 서비스 장애·자동 rollback 성공과 혼동하지 않는다. 다음 시도 전에 `status`·history와
@@ -681,6 +724,14 @@ controller는 잠금 대기 전과 획득 후 변경 시작 전에 **최소 9,00
 전에도 최소 1,800초(30분)가 남아야 하며 부족하면 준비한 후보를 비활성으로 남기고 전환을 시작하지 않는다.
 deadline 부족 실패는 작업을 억지로 끝내기 위한 force나 holder 중단을 허용하지 않는다.
 
+예를 들어 run attempt 시작 뒤 다른 대기 없이 빌드·테스트에 약 20분(1,200초)을 썼다면,
+허용 잠금 대기는 `min(14400, 21600 - 120 - 1200 - 9000) = 11280초`(약 3.1시간)다.
+앞선 두 배포가 알려진 정상 최악 7,140초씩 사용하면 `2 × 7140 = 14280초`이므로 세 번째 배포는
+시작 전에 예산 부족으로 거부될 수 있다. job 360분·reserve 9000초·잠금 최대 14400초를 유지한 안전
+설계이며, FIFO나 내구성 있는 배포 대기열을 제공하는 것은 아니다. 담당자는 상태·journal·이미지를
+확인하고 복구 필요 여부와 다음 실행 순서를 조율한 뒤 새 attempt로 수동 재실행한다. 예산을
+현재 시각으로 다시 쓰거나 무조건 자동 재시도·holder 취소로 통과시키지 않는다.
+
 빌드·테스트·잠금 대기·자기 배포가 같은 6시간을 나눠 쓴다. v6의 정상 단계 추정 5,865초에는
 추가 drain 경로가 빠져 있었다. 현재 제어된 정상 경로의 보수적 합은 **7,140초**다.
 `2 × (660 + 30 + 660)`의 비활성/source drain, `3 × 1350`의 기존 앱 stop, `2 × 120`의 후보/재확인,
@@ -693,7 +744,8 @@ prepare 실패의 알려진 단계 합은 비활성 drain 1,350초 + 기존 앱 
 멈춘 Docker·Nginx·외부 I/O·OS를 포함한 전체 완료 시각의 하드 보장은 아니다. FIFO·내구성 대기열도
 아니므로 연속 push·긴 대기·job 기한 초과로 여전히 실패할 수 있다. 자동 force·무조건 재시도·job
 강제 종료를 사용하지 않는다. 수동·긴급 CLI에는 이 GitHub job deadline 정책을 자동 적용하지 않으며
-기존 잠금 정책을 유지한다.
+기존 잠금 정책을 유지한다. 후보 cleanup과 Legacy probe 외 일반 Docker create/start/자산 처리 호출에
+전체 공통 timeout을 추가한 것은 아니다. daemon·외부 I/O가 멈춘 상황을 reserve가 강제 해제하지 않는다.
 
 ```bash
 python3 /home/kwung/deploy/bluegreen/bluegreen.py --lock-timeout 30 rollback \
@@ -766,28 +818,28 @@ backend_start를 확인해 상실과 관측 불확실성을 구분한다. 불확
 
 ## 9. 검증 기록과 아직 필요한 운영 검증
 
-아래 표에서 **v7 새 로컬 실행**과 **동일 소스의 과거 실행 재사용**을 구분한다. 이번 수정에서는
-Backend·Frontend 앱 소스를 바꾸지 않아 전체 Gradle/Vitest를 다시 실행하지 않았다. Backend 앱·참고
-72개, Frontend 앱·참고 13개의 bytes와 이전 검증 증거를 대조해 과거 결과를 재사용한다.
-변경된 앱 workflow 3개와 Infra controller/helper는 아래의 현재 계약 검사로 따로 검증한다.
+아래 표에서 **v8 새 로컬 실행**과 **동일 소스의 과거 실행 재사용**을 구분한다. 이번 수정에서는
+Infra controller/helper·테스트·runbook만 바꿨다. Backend 앱·참고·workflow 73개, Frontend 앱·참고·workflow
+14개의 bytes와 이전 증거를 대조해 기존 검증을 재사용한다. 앱 workflow 3개와 수동 운영 workflow는
+이번에 바꾸지 않았다. 다만 controller CLI의 새 인자를 포함한 계약·shell·YAML은 현재 소스로 다시 확인했다.
 과거 테스트 건수를 새 실행 건수와 합산하지 않는다. 실제 GitHub Actions나 운영 서버의 결과가 아니다.
 
-| 검증 항목 | v7 새 실행 또는 명시한 과거 결과 |
+| 검증 항목 | v8 새 실행 또는 명시한 과거 결과 |
 |---|---|
-| API 전체 테스트 | v6 과거 실행 971개, 실패·오류·건너뜀 0; v7 재실행 아님 |
-| workflow-core 전체 테스트 | v6 과거 실행 544개, 실패·오류·건너뜀 0; v7 재실행 아님 |
+| API 전체 테스트 | v6 과거 실행 971개, 실패·오류·건너뜀 0; v8 재실행 아님 |
+| workflow-core 전체 테스트 | v6 과거 실행 544개, 실패·오류·건너뜀 0; v8 재실행 아님 |
 | API + workflow-core 합계 | v6 과거 실행 1515개, 동일 앱 소스 검증 후 재사용 |
 | 실제 Redis/PostgreSQL 통합 테스트 | 위 v6 API 결과에 포함된 과거 12개 통과 |
 | PENDING 관측 저장소 테스트 | 위 v6 API 결과에 포함된 과거 H2 repository 2개 통과 |
-| API bootJar | v6 빌드 성공 artifact의 현재 bytes·SHA 일치 확인; v7 재빌드 아님 |
-| Frontend 기존 검증 재사용 | v5 당시 61개 파일·407개 및 타입/Vite·TypeScript 5개 lint/format 통과; 현재 앱·참고 13파일 bytes 동일, v7 재실행 아님. 변경 workflow는 별도 검증 |
-| Infra controller·installer·Legacy helper 회귀 | v7 새 실행 143개 통과 (controller 95 + installer 8 + helper 40) |
-| 앱·수동 운영 workflow 및 CLI 계약 검사 | v7 새 실행 77개 통과; 실제 원격 명령 실행과 구분 |
-| 첫 단계 run attempt REST·deadline 검증 | v7 현재 36개 통과 (앱별 mock 12개: 정확 9000초 허용·8999초 거부 포함); 실제 GitHub API 호출 없음 |
-| Backend private env snapshot | v7 현재 13개 시나리오 통과 |
-| 앱·Infra workflow YAML | v7 현재 4개 중복 키·파싱 검사 통과 |
-| Workflow shell 구문 | v7 새 실행 26개 블록 통과 |
-| 이전 실제 로컬 Nginx HTTP 검증 | 2026-10-20 Frontend 14개 + archive/proxy 15개 통과; installer·현재 frontend Nginx heredoc bytes 동일, v7 HTTP 재실행 아님 |
+| API bootJar | v6 빌드 성공 artifact의 현재 bytes·SHA 일치 확인; v8 재빌드 아님 |
+| Frontend 기존 검증 재사용 | v5 당시 61개 파일·407개 및 타입/Vite·TypeScript 5개 lint/format 통과; 현재 앱·참고·workflow 14파일 bytes 동일, v8 재실행 아님 |
+| Infra controller·installer·Legacy helper 회귀 | v8 새 실행 168개 통과 (controller 104 + installer 8 + helper 56) |
+| 앱·수동 운영 workflow 및 CLI 계약 검사 | v8 새 실행 78개 통과 (앱 45 + 수동 20 + CLI 10 + 정책 3); 새 probe CLI 전달 포함, 실제 원격 명령 실행 아님 |
+| 첫 단계 run attempt REST·deadline 검증 | v7 과거 실행 36개 통과 재사용 (앱별 mock 12개, 9000/8999초 경계); workflow bytes 동일, v8 REST mock 재실행 아님 |
+| Backend private env snapshot | v7 과거 실행 13개 시나리오 통과 재사용; workflow bytes 동일, v8 재실행 아님 |
+| 앱·Infra workflow YAML | v8 현재 4개 중복 키·파싱 및 이전 source 비교 통과 |
+| Workflow shell 구문 | v8 새 실행 26개 블록 통과 |
+| 이전 실제 로컬 Nginx HTTP 검증 | 2026-10-20 Frontend 14개 + archive/proxy 15개 통과; installer·현재 frontend Nginx heredoc bytes 동일, v8 HTTP 재실행 아님 |
 
 Frontend의 기존 MSW 검증은 refresh HTTP와 Axios/SSE 401의 single-flight 공유·취소·계정 교체 경계를
 검증한다. 실제 JWT 만료·운영 브라우저 SSE·STOMP 물리 연결 또는 배포 중 인증 장기 연결을 검증한

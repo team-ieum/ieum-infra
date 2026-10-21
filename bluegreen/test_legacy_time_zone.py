@@ -36,18 +36,21 @@ class DockerProbe:
             return json.dumps(identity())
         if args[0] != 'exec':
             raise AssertionError('Only identity inspection and a pinned read-only probe are allowed')
-        if isinstance(self.probe, Exception):
-            raise self.probe
-        return self.probe
+        value = self.probe.pop(0) if isinstance(self.probe, list) else self.probe
+        if isinstance(value, Exception):
+            raise value
+        return value
 
 
 def identity(**changes):
     return dict(id=CID, image=IMAGE, status='running', startedAt='2026-10-20T00:00:00Z', **changes)
 
 
-def startup_probe(*records, actual='ieum-zone-v1|unavailable|missing_tools', pid=17, ticks=123):
+def startup_probe(*records, actual='ieum-zone-v1|unavailable|missing_tools', pid=17, ticks=123,
+                  environment_read='ok', cmdline_read='ok'):
     return '\n'.join([f'ieum-zone-v2|process|{pid}|{ticks}', actual,
-                      'ieum-zone-v2|read|environment|ok', 'ieum-zone-v2|read|cmdline|ok',
+                      'ieum-zone-v2|read|environment|' + environment_read,
+                      'ieum-zone-v2|read|cmdline|' + cmdline_read,
                       *records,
                       *([] if any('|etc-timezone|' in item for item in records)
                         else ['ieum-zone-v2|input|etc-timezone|missing']),
@@ -208,6 +211,161 @@ class LegacyTimeZoneTest(unittest.TestCase):
         for output in (TimeoutError('simulated probe timeout'), partial, full[:40]):
             with self.subTest(kind=type(output).__name__), self.assertRaisesRegex(RuntimeError, 'process changed or returned incomplete'):
                 zone.validate_legacy_zone(snapshot(), 'Asia/Seoul', CID, DockerProbe(output))
+
+    def test_unread_environment_makes_os_mismatch_ambiguous_but_requires_exact_confirmation(self):
+        output = startup_probe('ieum-zone-v2|input|etc-timezone|zone|Etc/UTC',
+                               environment_read='unavailable')
+        with self.assertRaisesRegex(RuntimeError, 'exact captured container ID'):
+            zone.validate_legacy_zone(snapshot({'TZ': 'Asia/Seoul'}), 'Asia/Seoul', None, DockerProbe(output))
+        result = zone.validate_legacy_zone(snapshot({'TZ': 'Asia/Seoul'}), 'Asia/Seoul', CID, DockerProbe(output))
+        self.assertEqual(result['origin'], 'operator-confirmed')
+        startup = result['proof']['startupInputs']
+        self.assertEqual(startup['status'], 'ambiguous')
+        self.assertFalse(startup['processInputsComplete'])
+        self.assertEqual(startup['zones'], ['Etc/UTC'])
+        self.assertEqual(result['proof']['configured']['status'], 'matches')
+
+    def test_unread_cmdline_can_override_process_tz_and_os_inputs(self):
+        output = startup_probe('ieum-zone-v2|input|TZ|zone|UTC',
+                               'ieum-zone-v2|input|etc-timezone|zone|UTC', cmdline_read='unavailable')
+        result = zone.validate_legacy_zone(snapshot({'JAVA_TOOL_OPTIONS': '-Duser.timezone=Asia/Seoul'}),
+                                           'Asia/Seoul', CID, DockerProbe(output))
+        self.assertEqual(result['proof']['startupInputs']['basis'], 'process-TZ')
+        self.assertEqual(result['proof']['startupInputs']['status'], 'ambiguous')
+
+    def test_unread_environment_may_contain_a_property_overriding_known_cmdline_property(self):
+        output = startup_probe('ieum-zone-v2|input|cmdline|zone|UTC', environment_read='unavailable')
+        result = zone.validate_legacy_zone(snapshot({'_JAVA_OPTIONS': '-Duser.timezone=Asia/Seoul'}),
+                                           'Asia/Seoul', CID, DockerProbe(output))
+        self.assertEqual(result['proof']['startupInputs']['basis'], 'jvm-startup-properties')
+        self.assertEqual(result['proof']['startupInputs']['status'], 'ambiguous')
+
+    def test_partial_reads_cannot_confirm_any_known_config_env_mismatch(self):
+        output = startup_probe('ieum-zone-v2|input|etc-timezone|zone|UTC', environment_read='unavailable')
+        for environment in ({'TZ': 'UTC'}, {'JAVA_TOOL_OPTIONS': '-Duser.timezone=UTC'},
+                            {'TZ': 'Asia/Seoul', 'JAVA_OPTS': '-Duser.timezone=UTC'},
+                            {'TZ': 'UTC', 'JAVA_TOOL_OPTIONS': '-Duser.timezone=' + SECRET}):
+            docker = DockerProbe(output)
+            with self.subTest(source=list(environment)), self.assertRaisesRegex(RuntimeError, 'configuration differs') as failure:
+                zone.validate_legacy_zone(snapshot(environment), 'Asia/Seoul', CID, docker)
+            self.assertNotIn(SECRET, str(failure.exception))
+            self.assertEqual(len([call for call in docker.calls if call[0][0] == 'exec']), 1)
+
+    def test_actual_property_overrides_partial_inputs_and_config_env_hints(self):
+        output = startup_probe('ieum-zone-v2|input|etc-timezone|zone|Asia/Seoul',
+                               environment_read='unavailable', actual='ieum-zone-v1|actual|17|UTC')
+        result = zone.validate_legacy_zone(snapshot({'TZ': 'Asia/Seoul'}), 'UTC', None, DockerProbe(output))
+        self.assertEqual(result['origin'], 'running-jvm')
+
+    def test_partial_reads_treat_known_custom_config_gmt_as_rules_not_unknown_strings(self):
+        output = startup_probe('ieum-zone-v2|input|etc-timezone|zone|UTC', environment_read='unavailable')
+        for environment in ({'TZ': 'GMT+09:00'}, {'JAVA_TOOL_OPTIONS': '-Duser.timezone=GMT+09:00'},
+                            {'TZ': 'UTC', '_JAVA_OPTIONS': '-Duser.timezone=GMT+09:00'},
+                            {'JAVA_OPTS': '-Duser.timezone=GMT+05:30'}):
+            with self.subTest(source=list(environment)), self.assertRaisesRegex(RuntimeError, 'configuration differs'):
+                zone.validate_legacy_zone(snapshot(environment), 'UTC', CID, DockerProbe(output))
+        for environment in ({'TZ': ':GMT+00:00'}, {'JAVA_TOOL_OPTIONS': '-Duser.timezone=GMT-00:00'},
+                            {'TZ': 'UTC', '_JAVA_OPTIONS': '-Duser.timezone=GMT+00:00'}):
+            result = zone.validate_legacy_zone(snapshot(environment), 'UTC', CID, DockerProbe(output))
+            self.assertEqual(result['proof']['configured']['status'], 'matches')
+        result = zone.validate_legacy_zone(snapshot({'JAVA_TOOL_OPTIONS': '-Duser.timezone=GMT+09:00'}),
+                                           'Etc/GMT-9', CID, DockerProbe(output))
+        self.assertEqual(result['proof']['configured']['status'], 'matches')
+        self.assertEqual(result['proof']['startupInputs']['status'], 'ambiguous')
+
+    def test_partial_reads_without_any_zone_are_ambiguous_instead_of_runtime_proof(self):
+        result = zone.validate_legacy_zone(snapshot(), 'UTC', CID,
+                                           DockerProbe(startup_probe(cmdline_read='unavailable')))
+        self.assertEqual(result['proof']['startupInputs']['status'], 'ambiguous')
+        self.assertEqual(result['proof']['startupInputs']['zones'], [])
+
+    def test_invalid_probe_settings_fail_before_docker(self):
+        for timeout in (None, True, 5, 61, 10.0, float('inf'), float('nan'), SECRET):
+            docker = DockerProbe()
+            with self.subTest(timeout=timeout), self.assertRaisesRegex(RuntimeError, 'timeout must be an integer'):
+                zone.validate_legacy_zone(snapshot(), 'UTC', None, docker, probe_timeout=timeout)
+            self.assertEqual(docker.calls, [])
+        for attempts in (None, False, 0, 4, 2.0, SECRET):
+            docker = DockerProbe()
+            with self.subTest(attempts=attempts), self.assertRaisesRegex(RuntimeError, 'attempts must be an integer'):
+                zone.validate_legacy_zone(snapshot(), 'UTC', None, docker, probe_attempts=attempts)
+            self.assertEqual(docker.calls, [])
+
+    def test_probe_timeout_retries_then_records_sanitized_success_with_custom_timeout(self):
+        docker = DockerProbe([subprocess.TimeoutExpired(SECRET, 37, output=SECRET, stderr=SECRET),
+                              'ieum-zone-v1|actual|17|UTC'])
+        result = zone.validate_legacy_zone(snapshot(), 'UTC', None, docker, probe_timeout=37)
+        self.assertEqual(result['proof']['probe'], {'code': 'probe_ok', 'attempts': 2, 'timeoutSeconds': 37})
+        self.assertEqual([call[0][0] for call in docker.calls], ['inspect', 'exec', 'exec', 'inspect'])
+        self.assertEqual([timeout for args, timeout in docker.calls if args[0] == 'exec'], [37, 37])
+        self.assertNotIn(SECRET, json.dumps(result))
+
+    def test_transport_retry_obeys_explicit_max_attempts_and_does_not_relaunch_java(self):
+        docker = DockerProbe([ConnectionError(SECRET), ConnectionResetError(SECRET),
+                              'ieum-zone-v1|actual|17|UTC'])
+        result = zone.validate_legacy_zone(snapshot(), 'UTC', None, docker, probe_attempts=3, probe_timeout=60)
+        self.assertEqual(result['proof']['probe'], {'code': 'probe_ok', 'attempts': 3, 'timeoutSeconds': 60})
+        self.assertEqual(len([call for call in docker.calls if call[0][0] == 'exec']), 3)
+        self.assertTrue(all('java -XshowSettings' not in str(args) for args, _ in docker.calls))
+
+    def test_retry_exhaustion_has_fixed_code_attempts_timeout_and_never_allows_confirmation(self):
+        for exception, code in ((TimeoutError(SECRET), 'probe_timeout'),
+                                (ConnectionError(SECRET), 'probe_transport_failure')):
+            docker = DockerProbe(exception)
+            with self.subTest(code=code), self.assertRaises(zone.LegacyProbeError) as failure:
+                zone.validate_legacy_zone(snapshot(), 'UTC', CID, docker)
+            self.assertEqual(failure.exception.code, code)
+            self.assertEqual(failure.exception.attempts, 2)
+            self.assertEqual(failure.exception.timeoutSeconds, 10)
+            self.assertEqual(len([call for call in docker.calls if call[0][0] == 'exec']), 2)
+            self.assertTrue(failure.exception.__suppress_context__)
+            self.assertNotIn(SECRET, str(failure.exception))
+
+    def test_one_attempt_setting_is_respected_at_timeout_lower_bound(self):
+        docker = DockerProbe(TimeoutError(SECRET))
+        with self.assertRaises(zone.LegacyProbeError) as failure:
+            zone.validate_legacy_zone(snapshot(), 'UTC', CID, docker, probe_timeout=6, probe_attempts=1)
+        self.assertEqual((failure.exception.code, failure.exception.attempts, failure.exception.timeoutSeconds),
+                         ('probe_timeout', 1, 6))
+        self.assertEqual(len([call for call in docker.calls if call[0][0] == 'exec']), 1)
+
+    def test_generic_or_nonzero_command_failure_is_not_retried_and_diagnostics_are_fixed(self):
+        for exception in (RuntimeError(SECRET), OSError(SECRET),
+                          subprocess.CalledProcessError(125, SECRET, output=SECRET, stderr=SECRET)):
+            docker = DockerProbe(exception)
+            with self.subTest(kind=type(exception).__name__), self.assertRaises(zone.LegacyProbeError) as failure:
+                zone.validate_legacy_zone(snapshot(), 'UTC', CID, docker, probe_attempts=3)
+            self.assertEqual(failure.exception.code, 'probe_command_failed')
+            self.assertEqual(failure.exception.attempts, 1)
+            self.assertEqual(len([call for call in docker.calls if call[0][0] == 'exec']), 1)
+            self.assertNotIn(SECRET, str(failure.exception))
+
+    def test_malformed_and_changed_process_results_are_not_retried(self):
+        outputs = [(None, 'probe_invalid_result'), (SECRET, 'probe_invalid_result'),
+                   ('x' * 32769, 'probe_invalid_result'),
+                   (startup_probe().replace('ieum-zone-v2|complete', 'ieum-zone-v2|invalid|pid_changed'),
+                    'probe_incomplete_or_changed_process')]
+        for output, code in outputs:
+            docker = DockerProbe([output, 'ieum-zone-v1|actual|17|UTC'])
+            with self.subTest(code=code, kind=type(output).__name__), self.assertRaises(zone.LegacyProbeError) as failure:
+                zone.validate_legacy_zone(snapshot(), 'UTC', CID, docker, probe_attempts=3)
+            self.assertEqual((failure.exception.code, failure.exception.attempts), (code, 1))
+            self.assertEqual(len([call for call in docker.calls if call[0][0] == 'exec']), 1)
+            self.assertNotIn(SECRET, str(failure.exception))
+
+    def test_malformed_result_after_transient_failure_stops_without_last_retry(self):
+        docker = DockerProbe([TimeoutError(SECRET), 'bad ' + SECRET, 'ieum-zone-v1|actual|17|UTC'])
+        with self.assertRaises(zone.LegacyProbeError) as failure:
+            zone.validate_legacy_zone(snapshot(), 'UTC', CID, docker, probe_attempts=3)
+        self.assertEqual((failure.exception.code, failure.exception.attempts), ('probe_invalid_result', 2))
+        self.assertEqual(len([call for call in docker.calls if call[0][0] == 'exec']), 2)
+
+    def test_restart_during_retry_still_fails_identity_fence(self):
+        changed = identity(); changed['startedAt'] = '2026-10-21T00:00:00Z'
+        docker = DockerProbe([TimeoutError(SECRET), 'ieum-zone-v1|actual|17|UTC'],
+                              identities=[identity(), changed])
+        with self.assertRaisesRegex(RuntimeError, 'restarted or changed'):
+            zone.validate_legacy_zone(snapshot(), 'UTC', CID, docker)
 
     def test_multiple_jvms_and_empty_property_need_attestation_not_arbitrary_pid_selection(self):
         for reason in ('ambiguous_jvm', 'missing_or_unknown_property', 'attach_failed'):
