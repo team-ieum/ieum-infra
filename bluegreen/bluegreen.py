@@ -33,15 +33,18 @@ ASSETS = Path('/var/lib/ieum-bluegreen/assets')
 JOB_DRAIN_TIMEOUT = 660
 CONNECTION_GRACE = 30
 STOP_TIMEOUT = 1350  # web + workflow executor + relay shutdown phases, with headroom
+CANDIDATE_STOP_TIMEOUT = 30  # New, never-admitted candidates do not need the active workload drain.
+CANDIDATE_CLEANUP_TIMEOUT = 240  # One aggregate budget, including Docker command timeouts.
+CANDIDATE_DOCKER_TIMEOUT = 10
 ISOLATION_TIMEOUT = 30  # Explicit force may interrupt work; never use this for normal drain.
 PROTOCOL_VERSION = 2
 DEFAULT_OPERATION_LOCK_TIMEOUT = 600
 DEFAULT_DEPLOY_LOCK_TIMEOUT = 14400
 MAX_LOCK_TIMEOUT = 14400
-DEPLOYMENT_RESERVE_SECONDS = 7200  # Budget for preparation, normal switch and bounded shutdown phases.
+DEPLOYMENT_RESERVE_SECONDS = 9000  # Normal phases, or failed preparation plus bounded candidate cleanup, with headroom.
 SWITCH_RESERVE_SECONDS = 1800  # Includes the 660s drain, connection grace, checks and control requests.
 BACKEND_TIME_ZONES = frozenset(available_timezones()) - {'localtime'}
-LEGACY_ZONE_HELPER_SHA256 = 'b9fca0a7d4337f5da2de8e1a684efc239f4116f3a4003efb6f7244d7dbf85ced'
+LEGACY_ZONE_HELPER_SHA256 = '9a00876f81f26c28f4cd701a965360c5e7ae6481f2a5284a8b0b6aec9077cd2d'
 
 def default_lock_timeout(command):
     return DEFAULT_DEPLOY_LOCK_TIMEOUT if command == 'deploy' else DEFAULT_OPERATION_LOCK_TIMEOUT
@@ -590,6 +593,76 @@ def verify_legacy_snapshot(snapshots):
                 runtime != snapshots[app]['runtimeEnvironment']:
             raise RuntimeError('Legacy source changed during preparation; freeze old workflows and retry')
 
+def cleanup_candidate_containers(color, created, unidentified=None):
+    """Clean only this preparation's pinned IDs, within one bounded failure budget."""
+    deadline = time.monotonic() + CANDIDATE_CLEANUP_TIMEOUT
+    results = []
+
+    def unverified(reason):
+        return {'complete': False, 'containers': [{**item, 'removed': False, 'reason': reason}
+                for item in created] + ([{**unidentified, 'removed': False, 'reason': 'identity_unavailable'}]
+                                       if unidentified else [])}
+
+    if created:
+        try:
+            if state()['active'] == color or route_color() == color or \
+                    (HOME / 'control/active').read_text().strip() == color:
+                return unverified('active_environment')
+        except (OSError, KeyError, ValueError, RuntimeError):
+            return unverified('active_state_unverified')
+
+    def command(*args, timeout=CANDIDATE_DOCKER_TIMEOUT):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError('budget_exhausted')
+        try:
+            result = subprocess.run(['docker', *args], text=True, capture_output=True,
+                                    timeout=min(timeout, remaining))
+        except subprocess.TimeoutExpired:
+            raise RuntimeError('command_timeout') from None
+        except (OSError, subprocess.SubprocessError):
+            raise RuntimeError('docker_unavailable') from None
+        if result.returncode:
+            raise RuntimeError('docker_operation_failed')
+        return result.stdout.strip()
+
+    try:
+        inventory = set(command('ps', '--all', '--no-trunc', '--format', '{{.ID}}').splitlines()) if created else set()
+        if any(not re.fullmatch(r'[a-f0-9]{64}', identity) for identity in inventory):
+            raise RuntimeError('inventory_unverified')
+    except RuntimeError as failure:
+        return unverified(str(failure))
+    for item in reversed(created):
+        outcome = {**item, 'removed': False}
+        try:
+            if item['id'] not in inventory:
+                outcome['removed'] = True
+                outcome['reason'] = 'already_absent'
+                continue
+            info = json.loads(command('inspect', item['id']))[0]
+            labels = info['Config'].get('Labels', {}) or {}
+            if info.get('Id') != item['id'] or info.get('Image') != item['image'] or \
+                    info.get('Name') != '/' + item['name'] or \
+                    labels.get('ieum.bluegreen.managed') != 'true' or \
+                    labels.get('ieum.bluegreen.color') != color:
+                raise RuntimeError('identity_changed')
+            # A failed stop must not leave a fresh candidate restarting unattended.
+            command('update', '--restart=no', item['id'])
+            if info['State']['Status'] in ('running', 'restarting', 'paused'):
+                command('stop', '--time', str(CANDIDATE_STOP_TIMEOUT), item['id'],
+                        timeout=CANDIDATE_STOP_TIMEOUT + 5)
+            command('rm', item['id'])
+            outcome['removed'] = True
+        except (KeyError, IndexError, TypeError, ValueError):
+            outcome['reason'] = 'identity_unverified'
+        except RuntimeError as failure:
+            outcome['reason'] = str(failure)
+        finally:
+            results.append(outcome)
+    if unidentified is not None:
+        results.append({**unidentified, 'removed': False, 'reason': 'identity_unavailable'})
+    return {'complete': all(item['removed'] for item in results), 'containers': results}
+
 def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_not_before=None, force=False,
             backend_zone=None, legacy_zone_confirmation=None):
     data = state()
@@ -639,6 +712,7 @@ def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_no
     data['slots'][color] = {'status': 'preparing', 'images': image_ids, 'release': release_id(image_ids)}
     save(data)
     created = []
+    pending_creation = None
     try:
         for app in APPS:
             env = environments[app]
@@ -666,9 +740,13 @@ def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_no
                     '--log-opt', 'max-size=10m', '--log-opt', 'max-file=5',
                     '--stop-timeout', str(STOP_TIMEOUT), '--env-file', str(envfile)]
             if app == 'backend': args += ['--mount', f'type=bind,src={HOME}/control,dst=/deployment,readonly']
-            docker(*args, images[app]['Id'])
-            created.append(name(color, app))
-            docker('start', name(color, app))
+            pending_creation = {'name': name(color, app), 'image': images[app]['Id']}
+            container_id = docker(*args, images[app]['Id'])
+            if not re.fullmatch(r'[a-f0-9]{64}', container_id):
+                raise RuntimeError('Created candidate container ID could not be pinned')
+            created.append({**pending_creation, 'id': container_id})
+            pending_creation = None
+            docker('start', container_id)
         details = check(color)
         if not details.get('draining') or not details.get('schedulerStandby'):
             raise RuntimeError('Candidate background workers started before activation')
@@ -678,11 +756,15 @@ def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_no
         save(data)
         record('prepared', target=color, images=data['slots'][color])
         print('Prepared and healthy:', color)
-    except Exception:
-        for container in reversed(created):
-            with contextlib.suppress(Exception): docker('stop', '--time', str(STOP_TIMEOUT), container)
-            with contextlib.suppress(Exception): docker('rm', container)
+    except Exception as original_error:
+        cleanup = cleanup_candidate_containers(color, created, pending_creation)
         invalidate_slot(color, 'failed')
+        failed = state()
+        failed['slots'][color]['cleanup'] = cleanup
+        save(failed)
+        record('prepare_failed', target=color, cleanup=cleanup)
+        if not cleanup['complete']:
+            raise RuntimeError('Candidate preparation failed; cleanup is incomplete. Inspect status before retrying') from original_error
         raise
 
 def route(color):
@@ -1002,7 +1084,7 @@ def main():
     p.add_argument('--backend-time-zone')
     p.add_argument('--confirm-legacy-time-zone', metavar='CONTAINER_ID')
     p.add_argument('--job-deadline-epoch', type=job_deadline,
-                   help='Conservative CI cancellation deadline; keep two hours after lock acquisition')
+                   help='Conservative CI cancellation deadline; keep 9000 seconds after lock acquisition')
     p.add_argument('--force', action='store_true')
     args = parser.parse_args()
     HOME.mkdir(parents=True, exist_ok=True, mode=0o700)

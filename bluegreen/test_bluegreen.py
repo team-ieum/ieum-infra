@@ -2,7 +2,9 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -387,8 +389,11 @@ class DeploymentSafetyTest(unittest.TestCase):
              patch.object(bg, 'env_values', return_value={}), \
              patch.object(bg, 'remove_inactive', side_effect=lambda c: bg.invalidate_slot(c)), \
              patch.object(bg, 'docker', side_effect=docker):
-            with self.assertRaisesRegex(RuntimeError, 'creation failed'): bg.prepare('blue', {'backend': 'new-backend'})
+            with self.assertRaisesRegex(RuntimeError, 'cleanup is incomplete') as caught:
+                bg.prepare('blue', {'backend': 'new-backend'})
+        self.assertIn('creation failed', str(caught.exception.__cause__))
         self.assertEqual(bg.state()['slots']['blue']['status'], 'failed')
+        self.assertFalse(bg.state()['slots']['blue']['cleanup']['complete'])
         self.assertIsNone(bg.state()['previous'])
         with self.assertRaisesRegex(RuntimeError, 'No retained'): bg.rollback(bg.release_id(images('blue')))
 
@@ -456,10 +461,27 @@ class DeploymentSafetyTest(unittest.TestCase):
                 return json.dumps([{'Id': args[2], 'Config': {'Env': ['BASE=default'],
                     'Labels': {'ieum.bluegreen.capable': 'true', 'ieum.bluegreen.protocol': '2'}}}])
             if args[0] == 'create':
+                container_id = format(len(created) + 100, '064x')
                 created[args[args.index('--name') + 1]] = {
-                    'image': args[-1], 'env': bg.read_env(args[args.index('--env-file') + 1])}
+                    'id': container_id, 'image': args[-1], 'env': bg.read_env(args[args.index('--env-file') + 1])}
+                infos[container_id] = {'Id': container_id, 'Image': args[-1],
+                    'Name': '/' + args[args.index('--name') + 1], 'Config': {'Labels': {
+                        'ieum.bluegreen.managed': 'true', 'ieum.bluegreen.color': 'blue'}},
+                    'State': {'Status': 'running'}}
+                return container_id
             return ''
         return infos, created, docker
+
+    def candidate_cleanup_runner(self, infos, created):
+        def run(args, **kwargs):
+            if args[1] == 'ps':
+                output = '\n'.join(item['id'] for item in created.values())
+            elif args[1] == 'inspect':
+                output = json.dumps([infos[args[-1]]])
+            else:
+                output = ''
+            return SimpleNamespace(returncode=0, stdout=output)
+        return run
 
     def test_legacy_preparation_uses_live_images_and_env_instead_of_init_snapshot(self):
         infos, created, docker = self.legacy_fixture()
@@ -513,12 +535,14 @@ class DeploymentSafetyTest(unittest.TestCase):
             return result
         with patch.object(bg, 'inspect', side_effect=lambda n: infos[n]), \
              patch.object(bg, 'docker', side_effect=create_then_change) as calls, \
+             patch.object(bg.subprocess, 'run', side_effect=self.candidate_cleanup_runner(infos, created)) as cleanup_calls, \
              patch.object(bg, 'remove_inactive', side_effect=bg.invalidate_slot):
             with self.assertRaisesRegex(RuntimeError, 'Legacy source changed'):
                 bg.prepare('blue', {'backend': 'new-backend'})
         self.assertEqual(bg.state()['slots']['blue']['status'], 'failed')
         self.assertEqual(bg.state()['active'], 'legacy')
-        self.assertEqual(len([c for c in calls.call_args_list if c.args[0] == 'rm']), len(bg.APPS))
+        self.assertEqual(len([c for c in cleanup_calls.call_args_list if c.args[0][1] == 'rm']), len(bg.APPS))
+        self.assertTrue(bg.state()['slots']['blue']['cleanup']['complete'])
 
     def test_legacy_new_env_cutoff_can_be_supplied_through_prepare(self):
         infos, created, docker = self.legacy_fixture()
@@ -628,6 +652,7 @@ class DeploymentSafetyTest(unittest.TestCase):
             return result
         with patch.object(bg, 'inspect', side_effect=lambda n: infos[n]), \
              patch.object(bg, 'docker', side_effect=changed), \
+             patch.object(bg.subprocess, 'run', side_effect=self.candidate_cleanup_runner(infos, created)), \
              patch.object(bg, 'remove_inactive', side_effect=bg.invalidate_slot):
             with self.assertRaisesRegex(RuntimeError, 'Legacy source changed'):
                 bg.prepare('blue', {'backend': 'reviewed-image'})
@@ -641,6 +666,193 @@ class DeploymentSafetyTest(unittest.TestCase):
             isolate.assert_not_called()
             bg.remove_inactive('blue', force=True)
         isolate.assert_called_once()
+
+    def test_normal_retained_shutdown_keeps_full_workload_timeout(self):
+        with patch.object(bg, 'exists', side_effect=lambda n: n.startswith('ieum-blue-')), \
+             patch.object(bg, 'inspect', return_value={'Config': {'Labels': {'ieum.bluegreen.managed': 'true'}},
+                 'State': {'Status': 'running'}}), patch.object(bg, 'drain'), patch.object(bg, 'docker') as docker:
+            bg.remove_inactive('blue')
+        stops = [call.args for call in docker.call_args_list if call.args[0] == 'stop']
+        self.assertEqual(stops, [('stop', '--time', '1350', bg.name('blue', app)) for app in reversed(bg.APPS)])
+
+    def test_unpinnable_creation_is_reported_without_name_based_cleanup(self):
+        infos, created, docker = self.legacy_fixture()
+        def invalid_id(*args):
+            result = docker(*args)
+            return 'not-a-container-id' if args[0] == 'create' else result
+        with patch.object(bg, 'inspect', side_effect=lambda n: infos[n]), \
+             patch.object(bg, 'docker', side_effect=invalid_id), patch.object(bg.subprocess, 'run') as cleanup_calls, \
+             patch.object(bg, 'remove_inactive', side_effect=bg.invalidate_slot):
+            with self.assertRaisesRegex(RuntimeError, 'cleanup is incomplete') as caught:
+                bg.prepare('blue', {'backend': 'reviewed-image'})
+        self.assertIn('ID could not be pinned', str(caught.exception.__cause__))
+        cleanup_calls.assert_not_called()
+        cleanup = bg.state()['slots']['blue']['cleanup']
+        self.assertFalse(cleanup['complete'])
+        self.assertEqual(cleanup['containers'][0]['reason'], 'identity_unavailable')
+
+    def test_start_failure_cleans_pinned_id_and_preserves_original_failure(self):
+        infos, created, docker = self.legacy_fixture()
+        failure = RuntimeError('candidate start failed')
+        def failed_start(*args):
+            if args[0] == 'start':
+                self.assertEqual(args[1], next(iter(created.values()))['id'])
+                raise failure
+            return docker(*args)
+        with patch.object(bg, 'inspect', side_effect=lambda n: infos[n]), \
+             patch.object(bg, 'docker', side_effect=failed_start), \
+             patch.object(bg.subprocess, 'run', side_effect=self.candidate_cleanup_runner(infos, created)) as cleanup_calls, \
+             patch.object(bg, 'remove_inactive', side_effect=bg.invalidate_slot):
+            with self.assertRaisesRegex(RuntimeError, 'candidate start failed') as caught:
+                bg.prepare('blue', {'backend': 'reviewed-image'})
+        self.assertIs(caught.exception, failure)
+        self.assertTrue(bg.state()['slots']['blue']['cleanup']['complete'])
+        self.assertEqual([call.args[0][-1] for call in cleanup_calls.call_args_list if call.args[0][1] == 'rm'],
+                         [next(iter(created.values()))['id']])
+
+    def test_incomplete_candidate_cleanup_is_saved_and_chained_to_original(self):
+        infos, created, docker = self.legacy_fixture()
+        failure = RuntimeError('unhealthy candidate')
+        with patch.object(bg, 'inspect', side_effect=lambda n: infos[n]), \
+             patch.object(bg, 'docker', side_effect=docker), patch.object(bg, 'check', side_effect=failure), \
+             patch.object(bg.subprocess, 'run', side_effect=OSError('sensitive daemon detail')), \
+             patch.object(bg, 'remove_inactive', side_effect=bg.invalidate_slot):
+            with self.assertRaisesRegex(RuntimeError, 'cleanup is incomplete') as caught:
+                bg.prepare('blue', {'backend': 'reviewed-image'})
+        self.assertIs(caught.exception.__cause__, failure)
+        slot = bg.state()['slots']['blue']
+        self.assertEqual(slot['status'], 'failed')
+        self.assertFalse(slot['cleanup']['complete'])
+        self.assertEqual(len(slot['cleanup']['containers']), 3)
+        history = (bg.HOME / 'history.jsonl').read_text()
+        self.assertIn('prepare_failed', history)
+        self.assertNotIn('sensitive daemon detail', history)
+        self.assertEqual(bg.state()['active'], 'legacy')
+
+class CandidateCleanupTest(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(); self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        for attribute, value in [('HOME', self.root), ('ROUTE_CONFIG', self.root / 'nginx.conf')]:
+            p = patch.object(bg, attribute, value); p.start(); self.addCleanup(p.stop)
+        bg.save({'active': 'green', 'previous': None, 'slots': {}})
+        bg.atomic(bg.HOME / 'control/active', 'green\n')
+        bg.atomic(bg.ROUTE_CONFIG, '# Managed by ieum-bluegreen-nginx. active=green\n')
+        self.created = [{'id': format(i + 1, '064x'), 'name': bg.name('blue', app), 'image': 'sha256:' + app}
+                        for i, app in enumerate(bg.APPS)]
+        self.infos = {item['id']: {'Id': item['id'], 'Image': item['image'], 'Name': '/' + item['name'],
+            'Config': {'Labels': {'ieum.bluegreen.managed': 'true', 'ieum.bluegreen.color': 'blue'}},
+            'State': {'Status': 'running'}} for item in self.created}
+
+    def docker_run(self, args, **kwargs):
+        if args[1] == 'ps': output = '\n'.join(self.infos)
+        elif args[1] == 'inspect': output = json.dumps([self.infos[args[-1]]])
+        else: output = ''
+        return SimpleNamespace(returncode=0, stdout=output)
+
+    def test_only_new_candidate_ids_get_short_bounded_stop_and_restart_disable(self):
+        with patch.object(bg.subprocess, 'run', side_effect=self.docker_run) as run:
+            outcome = bg.cleanup_candidate_containers('blue', self.created)
+        self.assertTrue(outcome['complete'])
+        stops = [call for call in run.call_args_list if call.args[0][1] == 'stop']
+        self.assertEqual([call.args[0] for call in stops],
+            [['docker', 'stop', '--time', '30', item['id']] for item in reversed(self.created)])
+        self.assertTrue(all(call.kwargs['timeout'] <= 35 for call in run.call_args_list))
+        for item in self.created:
+            mutations = [call.args[0][1:] for call in run.call_args_list if call.args[0][-1] == item['id']]
+            self.assertEqual(mutations[1], ['update', '--restart=no', item['id']])
+            self.assertEqual(mutations[-1], ['rm', item['id']])
+
+    def test_exited_candidate_is_removed_without_stopping(self):
+        for info in self.infos.values(): info['State']['Status'] = 'exited'
+        with patch.object(bg.subprocess, 'run', side_effect=self.docker_run) as run:
+            self.assertTrue(bg.cleanup_candidate_containers('blue', self.created)['complete'])
+        self.assertFalse(any(call.args[0][1] == 'stop' for call in run.call_args_list))
+
+    def test_restarting_or_paused_candidate_is_stopped_before_removal(self):
+        for status in ('restarting', 'paused'):
+            for info in self.infos.values(): info['State']['Status'] = status
+            with patch.object(bg.subprocess, 'run', side_effect=self.docker_run) as run:
+                self.assertTrue(bg.cleanup_candidate_containers('blue', self.created)['complete'])
+            stops = [call.args[0][-1] for call in run.call_args_list if call.args[0][1] == 'stop']
+            self.assertEqual(stops, [item['id'] for item in reversed(self.created)])
+
+    def test_same_name_replacement_is_never_stopped_when_original_id_is_absent(self):
+        self.infos = {'f' * 64: {'Name': '/' + self.created[0]['name']}}
+        with patch.object(bg.subprocess, 'run', side_effect=self.docker_run) as run:
+            outcome = bg.cleanup_candidate_containers('blue', self.created)
+        self.assertTrue(outcome['complete'])
+        self.assertEqual(run.call_count, 1)
+        self.assertTrue(all(item['reason'] == 'already_absent' for item in outcome['containers']))
+
+    def test_id_image_name_and_labels_are_checked_before_mutation(self):
+        for key, replacement in (('Id', 'e' * 64), ('Image', 'sha256:other'), ('Name', '/renamed'),
+                                 ('Config', {'Labels': {'ieum.bluegreen.managed': 'false'}})):
+            original = json.loads(json.dumps(self.infos))
+            for info in self.infos.values(): info[key] = replacement
+            with patch.object(bg.subprocess, 'run', side_effect=self.docker_run) as run:
+                outcome = bg.cleanup_candidate_containers('blue', self.created)
+            self.assertFalse(outcome['complete'])
+            self.assertTrue(all(item['reason'] == 'identity_changed' for item in outcome['containers']))
+            self.assertTrue(all(call.args[0][1] in ('ps', 'inspect') for call in run.call_args_list))
+            self.infos = original
+
+    def test_active_saved_state_route_or_worker_ownership_prevents_short_stop(self):
+        for indicator in ('saved', 'route', 'ownership'):
+            saved = {'active': 'blue' if indicator == 'saved' else 'green', 'slots': {}}
+            bg.save(saved)
+            bg.atomic(bg.ROUTE_CONFIG, '# Managed by ieum-bluegreen-nginx. active=' +
+                      ('blue' if indicator == 'route' else 'green') + '\n')
+            bg.atomic(bg.HOME / 'control/active', ('blue' if indicator == 'ownership' else 'green') + '\n')
+            with patch.object(bg.subprocess, 'run') as run:
+                outcome = bg.cleanup_candidate_containers('blue', self.created)
+            run.assert_not_called()
+            self.assertFalse(outcome['complete'])
+            self.assertTrue(all(item['reason'] == 'active_environment' for item in outcome['containers']))
+
+    def test_command_timeout_remains_visible_and_other_candidates_are_attempted(self):
+        bad_id = self.created[-1]['id']
+        def timeout(args, **kwargs):
+            if args[1] == 'stop' and args[-1] == bad_id:
+                raise subprocess.TimeoutExpired(args, kwargs['timeout'], output='secret')
+            return self.docker_run(args, **kwargs)
+        with patch.object(bg.subprocess, 'run', side_effect=timeout) as run:
+            outcome = bg.cleanup_candidate_containers('blue', self.created)
+        self.assertFalse(outcome['complete'])
+        self.assertEqual(outcome['containers'][0]['reason'], 'command_timeout')
+        self.assertEqual(sum(item['removed'] for item in outcome['containers']), 2)
+        self.assertNotIn('secret', json.dumps(outcome))
+        self.assertNotIn(['docker', 'rm', bad_id], [call.args[0] for call in run.call_args_list])
+
+    def test_aggregate_deadline_caps_commands_and_records_unfinished_cleanup(self):
+        now = [0.0]
+        def slow(args, **kwargs):
+            self.assertGreater(kwargs['timeout'], 0)
+            self.assertLessEqual(kwargs['timeout'], bg.CANDIDATE_CLEANUP_TIMEOUT - now[0])
+            now[0] += kwargs['timeout']
+            return self.docker_run(args, **kwargs)
+        with patch.object(bg.time, 'monotonic', side_effect=lambda: now[0]), \
+             patch.object(bg, 'CANDIDATE_CLEANUP_TIMEOUT', 50), \
+             patch.object(bg.subprocess, 'run', side_effect=slow) as run:
+            outcome = bg.cleanup_candidate_containers('blue', self.created)
+        self.assertEqual(now[0], 50)
+        self.assertFalse(outcome['complete'])
+        self.assertTrue(any(item.get('reason') == 'budget_exhausted' for item in outcome['containers']))
+        self.assertEqual(sum(call.kwargs['timeout'] for call in run.call_args_list), 50)
+
+    def test_unavailable_or_malformed_inventory_never_becomes_absent_success(self):
+        for result in (SimpleNamespace(returncode=1, stdout=''),
+                       SimpleNamespace(returncode=0, stdout='short-id')):
+            with patch.object(bg.subprocess, 'run', return_value=result) as run:
+                outcome = bg.cleanup_candidate_containers('blue', self.created)
+            self.assertFalse(outcome['complete'])
+            self.assertEqual(run.call_count, 1)
+
+    def test_failed_prepare_known_phases_include_cleanup_inside_job_reserve(self):
+        failed_prepare = 2 * bg.JOB_DRAIN_TIMEOUT + bg.CONNECTION_GRACE + \
+            len(bg.APPS) * bg.STOP_TIMEOUT + 120 + bg.CANDIDATE_CLEANUP_TIMEOUT
+        self.assertEqual(failed_prepare, 5760)
+        self.assertLess(failed_prepare, bg.DEPLOYMENT_RESERVE_SECONDS)
 
 class DeploymentLockTest(unittest.TestCase):
     def setUp(self):
@@ -689,17 +901,19 @@ class DeploymentLockTest(unittest.TestCase):
     def test_deploy_default_is_separate_from_operator_wait_and_covers_prior_normal_deployments(self):
         # Three repositories can overlap. Account for two prior normal releases' bounded phases;
         # Docker I/O and arbitrary queue depth remain finite-wait operational limits.
-        normal_phases = 2 * bg.JOB_DRAIN_TIMEOUT + bg.CONNECTION_GRACE + \
+        normal_phases = 2 * (2 * bg.JOB_DRAIN_TIMEOUT + bg.CONNECTION_GRACE) + \
             len(bg.APPS) * bg.STOP_TIMEOUT + 2 * 120 + 2 * 15 + 4 * 30
+        self.assertEqual(normal_phases, 7140)
         self.assertGreater(bg.default_lock_timeout('deploy'), 2 * normal_phases)
         self.assertEqual(bg.default_lock_timeout('recover'), 600)
         self.assertEqual(bg.default_lock_timeout('deploy'), 14400)
         self.assertGreater(bg.DEPLOYMENT_RESERVE_SECONDS, normal_phases)
+        self.assertGreaterEqual(bg.DEPLOYMENT_RESERVE_SECONDS - normal_phases, 1800)
 
     def test_insufficient_job_budget_refuses_before_even_opening_lock(self):
         with patch.object(bg.time, 'time', return_value=1000):
             with self.assertRaisesRegex(RuntimeError, 'Insufficient job time'):
-                with bg.deployment_lock(14400, 'deploy', 8199): self.fail('entered')
+                with bg.deployment_lock(14400, 'deploy', 1000 + bg.DEPLOYMENT_RESERVE_SECONDS - 1): self.fail('entered')
         self.assertFalse((bg.HOME / 'deploy.lock').exists())
         self.assertFalse((bg.HOME / 'lock-owner.json').exists())
 
@@ -711,14 +925,14 @@ class DeploymentLockTest(unittest.TestCase):
              patch.object(bg.time, 'sleep', side_effect=sleep), \
              patch.object(bg.fcntl, 'flock', side_effect=BlockingIOError('busy')):
             with self.assertRaisesRegex(RuntimeError, 'operation was not started'):
-                with bg.deployment_lock(14400, 'deploy', 8300): self.fail('entered')
+                with bg.deployment_lock(14400, 'deploy', 1000 + bg.DEPLOYMENT_RESERVE_SECONDS + 100): self.fail('entered')
         self.assertEqual(elapsed[0], 100)
         self.assertFalse((bg.HOME / 'lock-owner.json').exists())
 
     def test_reserve_is_rechecked_after_lock_acquisition_before_operation(self):
         with patch.object(bg.time, 'time', side_effect=[1000, 1000, 1002]):
             with self.assertRaisesRegex(RuntimeError, 'Insufficient job time'):
-                with bg.deployment_lock(14400, 'deploy', 8201): self.fail('entered')
+                with bg.deployment_lock(14400, 'deploy', 1000 + bg.DEPLOYMENT_RESERVE_SECONDS + 1): self.fail('entered')
         self.assertFalse((bg.HOME / 'lock-owner.json').exists())
         with bg.deployment_lock(0, 'recover'): pass
 
@@ -735,9 +949,10 @@ class DeploymentLockTest(unittest.TestCase):
 
     def test_deploy_keeps_candidate_inactive_when_preparation_consumes_switch_budget(self):
         now = [1000.0]
-        def prepare(*args, **kwargs): now[0] = 10000 - bg.SWITCH_RESERVE_SECONDS + 1
+        deadline = 1000 + bg.DEPLOYMENT_RESERVE_SECONDS + bg.SWITCH_RESERVE_SECONDS
+        def prepare(*args, **kwargs): now[0] = deadline - bg.SWITCH_RESERVE_SECONDS + 1
         with patch.object(bg.sys, 'argv', ['bluegreen', '--lock-timeout', '0', 'deploy',
-             '--service', 'backend', '--image', 'candidate', '--job-deadline-epoch', '10000']), \
+             '--service', 'backend', '--image', 'candidate', '--job-deadline-epoch', str(deadline)]), \
              patch.object(bg.time, 'time', side_effect=lambda: now[0]), \
              patch.object(bg, 'state', return_value={'active': 'blue'}), \
              patch.object(bg, 'prepare', side_effect=prepare) as prepared, patch.object(bg, 'switch') as switch:
