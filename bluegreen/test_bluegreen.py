@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -477,7 +478,7 @@ class DeploymentSafetyTest(unittest.TestCase):
     def candidate_cleanup_runner(self, infos, created):
         def run(args, **kwargs):
             if args[1] == 'ps':
-                output = '\n'.join(item['id'] + ' ' + name for name, item in created.items())
+                output = '\n'.join(item['id'] for item in created.values())
             elif args[1] == 'inspect':
                 output = json.dumps([infos[args[-1]]])
             else:
@@ -576,7 +577,8 @@ class DeploymentSafetyTest(unittest.TestCase):
             bg.main()
         prepare.assert_called_once_with('blue', {'backend': 'reviewed-image'},
             {'backend': '/private/backend.env'}, replace_env=True, recovery_not_before=None, force=False,
-            backend_zone='UTC', legacy_zone_confirmation=None, legacy_probe_timeout=10, legacy_probe_attempts=2)
+            backend_zone='UTC', legacy_zone_confirmation=None, legacy_zone_evidence=None,
+            legacy_probe_timeout=10, legacy_probe_attempts=2)
 
     def test_prepare_cli_forwards_bounded_legacy_probe_settings(self):
         with patch.object(bg.sys, 'argv', ['bluegreen', '--lock-timeout', '0', 'prepare', 'blue',
@@ -584,6 +586,32 @@ class DeploymentSafetyTest(unittest.TestCase):
             bg.main()
         self.assertEqual(prepare.call_args.kwargs['legacy_probe_timeout'], 60)
         self.assertEqual(prepare.call_args.kwargs['legacy_probe_attempts'], 3)
+
+    def test_prepare_cli_forwards_explicit_evidence_fingerprint_and_container_confirmation(self):
+        with patch.object(bg.sys, 'argv', ['bluegreen', '--lock-timeout', '0', 'prepare', 'blue',
+             '--confirm-legacy-time-zone', 'a' * 64, '--confirm-legacy-time-zone-evidence', 'b' * 64]), \
+             patch.object(bg, 'prepare') as prepare:
+            bg.main()
+        self.assertEqual(prepare.call_args.kwargs['legacy_zone_confirmation'], 'a' * 64)
+        self.assertEqual(prepare.call_args.kwargs['legacy_zone_evidence'], 'b' * 64)
+
+    def test_confirmation_fingerprint_is_prepare_only_and_requires_exact_sha256(self):
+        for value in ('', 'a' * 63, 'a' * 65, 'A' * 64, 'x' * 64, None, True):
+            with self.subTest(value=value), self.assertRaises(bg.argparse.ArgumentTypeError):
+                bg.legacy_confirmation_evidence(value)
+        with patch.object(bg, 'state') as state:
+            with self.assertRaises(bg.argparse.ArgumentTypeError):
+                bg.prepare('blue', {}, legacy_zone_evidence='short')
+        state.assert_not_called()
+        with patch.object(bg.sys, 'argv', ['bluegreen', 'deploy', '--service', 'backend', '--image', 'image',
+             '--confirm-legacy-time-zone-evidence', 'b' * 64]), patch.object(bg.sys, 'stderr', io.StringIO()):
+            with self.assertRaises(SystemExit): bg.main()
+
+    def test_nonlegacy_preparation_rejects_confirmation_evidence_without_docker(self):
+        with patch.object(bg, 'docker') as docker:
+            with self.assertRaisesRegex(RuntimeError, 'only valid during Legacy'):
+                bg.prepare('blue', {}, legacy_zone_evidence='b' * 64)
+        docker.assert_not_called()
 
     def test_legacy_probe_cli_and_programmatic_settings_reject_unbounded_or_fractional_values(self):
         for parser, values in ((bg.parse_legacy_probe_timeout, ('5', '61', '6.5', 'NaN', 'inf', True, '-1')),
@@ -668,7 +696,8 @@ class DeploymentSafetyTest(unittest.TestCase):
                            recovery_not_before='2026-10-20T00:00:00Z',
                            legacy_probe_timeout=30, legacy_probe_attempts=3)
         self.assertIs(caught.exception, failure)
-        self.assertEqual(validate.call_args.kwargs, {'probe_timeout': 30, 'probe_attempts': 3})
+        self.assertEqual(validate.call_args.kwargs, {'confirmation_evidence': None,
+            'probe_timeout': 30, 'probe_attempts': 3})
         remove.assert_not_called(); self.assertFalse(created)
         self.assertEqual((bg.HOME / 'state.json').read_bytes(), original_state)
         for path in ('backend-time-zone', 'pending-recovery-not-before', 'backend-time-zone-proof.json'):
@@ -690,6 +719,76 @@ class DeploymentSafetyTest(unittest.TestCase):
             self.assertEqual(event['code'], 'legacy_zone_validation_failed')
             self.assertFalse(event['attemptsKnown']); self.assertNotIn('attempts', event)
         self.assertNotIn('private-', (bg.HOME / 'history.jsonl').read_text())
+
+    def test_confirmation_required_outputs_and_records_reviewable_evidence_before_any_pin_or_mutation(self):
+        infos, created, docker = self.legacy_fixture()
+        for filename in ('backend-time-zone', 'pending-recovery-not-before'):
+            (bg.HOME / 'control' / filename).unlink()
+        original_state = (bg.HOME / 'state.json').read_bytes()
+        summary = {'schemaVersion': 1, 'expectedZone': 'Asia/Seoul',
+            'containerId': infos[bg.LEGACY['backend']]['Id'], 'imageIdentitySha256': 'b' * 64,
+            'containerStartIdentitySha256': 'c' * 64,
+            'configured': {'status': 'unknown', 'sources': [], 'zones': []},
+            'probeUnavailableReason': 'missing_tools',
+            'startupInputs': {'status': 'ambiguous', 'basis': 'jvm-startup-properties', 'zones': ['Etc/UTC'],
+                'processInputsComplete': False, 'reads': {'environment': 'unavailable', 'cmdline': 'ok'},
+                'localtimeSha256': 'unavailable', 'requestedTzifDigestMatches': False,
+                'sourceKinds': {}, 'observedZones': {'cmdline': ['Etc/UTC']},
+                'localtimeResolution': 'missing', 'platformInputsConflict': False}}
+        fingerprint = bg.hashlib.sha256(json.dumps(summary, sort_keys=True,
+            separators=(',', ':'), ensure_ascii=True).encode()).hexdigest()
+        failure = bg.LegacyTimeZoneConfirmationRequired(summary, fingerprint)
+        error_output = io.StringIO()
+        with patch.object(bg, 'inspect', side_effect=lambda n: infos[n]), \
+             patch.object(bg, 'docker', side_effect=docker), patch.object(bg, 'remove_inactive') as remove, \
+             patch.object(bg, 'validate_legacy_time_zone', side_effect=failure), \
+             patch.object(bg.sys, 'stderr', error_output):
+            with self.assertRaises(bg.LegacyTimeZoneConfirmationRequired):
+                bg.prepare('blue', {'backend': 'reviewed-image'}, backend_zone='Asia/Seoul',
+                    recovery_not_before='2026-10-20T00:00:00Z',
+                    legacy_zone_confirmation=summary['containerId'])
+        diagnostic = json.loads(error_output.getvalue())
+        self.assertEqual(diagnostic, {'event': 'legacy_zone_confirmation_required',
+                                     'evidence': summary, 'evidenceSha256': fingerprint})
+        event = json.loads((bg.HOME / 'history.jsonl').read_text().splitlines()[-1])
+        self.assertEqual(event['action'], 'legacy_zone_confirmation_required')
+        self.assertEqual(event['evidence'], summary)
+        self.assertEqual(event['evidenceSha256'], fingerprint)
+        self.assertEqual((bg.HOME / 'state.json').read_bytes(), original_state)
+        for filename in ('backend-time-zone', 'pending-recovery-not-before', 'backend-time-zone-proof.json'):
+            self.assertFalse((bg.HOME / 'control' / filename).exists())
+        remove.assert_not_called(); self.assertFalse(created)
+
+    def test_untrusted_confirmation_attributes_are_not_printed_or_recorded(self):
+        failure = RuntimeError('private-error')
+        failure.code = 'legacy_zone_confirmation_required'
+        failure.summary = {'rawEnvironment': 'private-environment'}
+        failure.fingerprint = 'a' * 64
+        with patch.object(bg.sys, 'stderr', io.StringIO()) as output:
+            bg.record_legacy_probe_failure(failure, 10, 2)
+        self.assertEqual(output.getvalue(), '')
+        self.assertNotIn('private-', (bg.HOME / 'history.jsonl').read_text())
+
+    def test_confirmation_summary_fingerprint_must_match_canonical_bytes(self):
+        summary = {'schemaVersion': 1, 'expectedZone': 'UTC', 'containerId': 'a' * 64,
+            'imageIdentitySha256': 'b' * 64, 'containerStartIdentitySha256': 'c' * 64,
+            'configured': {'status': 'unknown', 'sources': [], 'zones': []},
+            'probeUnavailableReason': 'missing_tools'}
+        with self.assertRaisesRegex(RuntimeError, 'fingerprint is invalid'):
+            bg.LegacyTimeZoneConfirmationRequired(summary, 'a' * 64)
+
+    def test_confirmation_schema_rejects_private_or_malformed_summary_fields(self):
+        summary = {'schemaVersion': 1, 'expectedZone': 'UTC', 'containerId': 'a' * 64,
+            'imageIdentitySha256': 'b' * 64, 'containerStartIdentitySha256': 'c' * 64,
+            'configured': {'status': 'unknown', 'sources': [], 'zones': []},
+            'probeUnavailableReason': 'missing_tools'}
+        changes = [{'rawEnvironment': 'private-environment'}, {'expectedZone': 'private-value'},
+            {'probeUnavailableReason': 'private-error'}, {'pid': True},
+            {'configured': {'status': 'unknown', 'sources': ['PASSWORD'], 'zones': []}},
+            {'configured': {'status': 'unknown', 'sources': [], 'zones': ['private-value']}}]
+        for change in changes:
+            with self.subTest(change=change), self.assertRaisesRegex(RuntimeError, 'summary is invalid'):
+                bg.sanitized_confirmation_summary({**summary, **change})
 
     def test_legacy_proof_is_reverified_before_pin_and_confirmation_is_forwarded(self):
         infos, created, docker = self.legacy_fixture()
@@ -809,8 +908,9 @@ class CandidateCleanupTest(unittest.TestCase):
             'State': {'Status': 'running'}} for item in self.created}
 
     def docker_run(self, args, **kwargs):
-        if args[1] == 'ps': output = '\n'.join(identity + ' ' + info['Name'].removeprefix('/')
-                                              for identity, info in self.infos.items())
+        if args[1] == 'ps':
+            self.assertEqual(args[-1], '{{.ID}}')
+            output = '\n'.join(self.infos)
         elif args[1] == 'inspect': output = json.dumps([self.infos[args[-1]]])
         else: output = ''
         return SimpleNamespace(returncode=0, stdout=output)
@@ -849,6 +949,34 @@ class CandidateCleanupTest(unittest.TestCase):
         self.assertTrue(outcome['complete'])
         self.assertEqual(run.call_count, 1)
         self.assertTrue(all(item['reason'] == 'already_absent' for item in outcome['containers']))
+
+    def test_unrelated_legacy_link_aliases_do_not_block_pinned_candidate_cleanup(self):
+        unrelated_id = 'f' * 64
+        self.infos[unrelated_id] = {'Name': '/phoenix,ieum-x/phoenix'}
+        def linked_host(args, **kwargs):
+            if args[1] == 'ps' and args[-1] == '{{.ID}} {{.Names}}':
+                return SimpleNamespace(returncode=0, stdout='\n'.join(identity + ' ' + info['Name'][1:]
+                    for identity, info in self.infos.items()))
+            return self.docker_run(args, **kwargs)
+        with patch.object(bg.subprocess, 'run', side_effect=linked_host) as run:
+            outcome = bg.cleanup_candidate_containers('blue', self.created)
+        self.assertTrue(outcome['complete'])
+        self.assertEqual(run.call_args_list[0].args[0], ['docker', 'ps', '--all', '--no-trunc', '--format', '{{.ID}}'])
+        self.assertFalse(any(call.args[0][-1] == unrelated_id for call in run.call_args_list))
+        self.assertEqual(sum(call.args[0][1] == 'rm' for call in run.call_args_list), len(self.created))
+
+    def test_unacknowledged_exact_query_failure_does_not_prevent_pinned_id_cleanup(self):
+        unidentified = {'name': 'ieum-blue-backend', 'image': 'sha256:unacknowledged'}
+        def failed_exact_query(args, **kwargs):
+            if '--filter' in args:
+                return SimpleNamespace(returncode=1, stdout='')
+            return self.docker_run(args, **kwargs)
+        with patch.object(bg.subprocess, 'run', side_effect=failed_exact_query) as run:
+            outcome = bg.cleanup_candidate_containers('blue', self.created, unidentified)
+        self.assertFalse(outcome['complete'])
+        self.assertEqual(sum(item['removed'] for item in outcome['containers']), len(self.created))
+        self.assertEqual(outcome['containers'][-1]['reason'], 'docker_operation_failed')
+        self.assertEqual(sum(call.args[0][1] == 'rm' for call in run.call_args_list), len(self.created))
 
     def test_id_image_name_and_labels_are_checked_before_mutation(self):
         for key, replacement in (('Id', 'e' * 64), ('Image', 'sha256:other'), ('Name', '/renamed'),
@@ -915,18 +1043,18 @@ class CandidateCleanupTest(unittest.TestCase):
 
     def test_unacknowledged_create_with_exact_name_absent_needs_no_manual_cleanup(self):
         unidentified = {'name': 'ieum-blue-backend', 'image': 'sha256:backend'}
-        for inventory in ('', 'd' * 64 + ' ieum-blue-backend-old'):
-            with patch.object(bg.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout=inventory)) as run:
-                outcome = bg.cleanup_candidate_containers('blue', [], unidentified)
-            self.assertTrue(outcome['complete'])
-            self.assertEqual(outcome['containers'], [{**unidentified, 'removed': True, 'reason': 'already_absent'}])
-            self.assertEqual(run.call_count, 1)
-            self.assertEqual(run.call_args.args[0], ['docker', 'ps', '--all', '--no-trunc', '--format', '{{.ID}} {{.Names}}'])
+        with patch.object(bg.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='')) as run:
+            outcome = bg.cleanup_candidate_containers('blue', [], unidentified)
+        self.assertTrue(outcome['complete'])
+        self.assertEqual(outcome['containers'], [{**unidentified, 'removed': True, 'reason': 'already_absent'}])
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0], ['docker', 'ps', '--all', '--no-trunc', '--filter',
+            'name=^/ieum-blue-backend$', '--format', '{{.ID}}'])
 
     def test_unacknowledged_same_name_container_is_never_adopted_even_when_image_and_labels_match(self):
         unidentified = {key: self.created[0][key] for key in ('name', 'image')}
         for identity in (self.created[0]['id'], 'f' * 64):
-            inventory = identity + ' ' + unidentified['name']
+            inventory = identity
             with patch.object(bg.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout=inventory)) as run:
                 outcome = bg.cleanup_candidate_containers('blue', [], unidentified)
             self.assertFalse(outcome['complete'])
@@ -936,10 +1064,9 @@ class CandidateCleanupTest(unittest.TestCase):
 
     def test_unacknowledged_create_daemon_failure_or_invalid_inventory_never_proves_absence(self):
         unidentified = {'name': 'ieum-blue-backend', 'image': 'sha256:backend'}
-        rows = ['short ieum-unrelated', 'a' * 64, 'a' * 64 + '  ieum-unrelated',
-                'a' * 64 + ' ieum-first\n' + 'a' * 64 + ' ieum-second',
-                'a' * 64 + ' ieum-same\n' + 'b' * 64 + ' ieum-same',
-                'a' * 64 + ' ieum-first,ieum-second']
+        rows = ['short', ' ', 'a' * 64 + ' ieum-unrelated', 'a' * 64 + ' ',
+                'a' * 64 + '\n' + 'a' * 64, 'a' * 64 + '\n' + 'b' * 64,
+                'a' * 64 + ',ieum-second']
         for result in [SimpleNamespace(returncode=1, stdout='')] + [SimpleNamespace(returncode=0, stdout=row) for row in rows]:
             with patch.object(bg.subprocess, 'run', return_value=result) as run:
                 outcome = bg.cleanup_candidate_containers('blue', [], unidentified)
@@ -1073,8 +1200,9 @@ class DeploymentLockTest(unittest.TestCase):
         self.assertEqual(bg.job_deadline('10000'), 10000)
 
 class LegacyCompanionBindingTest(unittest.TestCase):
-    FORWARDING_HELPER = b'''def validate_legacy_zone(snapshot, requested, confirmation, probe, *, probe_timeout, probe_attempts):
-    return {"output": probe("exec", snapshot["containerId"], timeout=probe_timeout), "timeout": probe_timeout, "attempts": probe_attempts}
+    FORWARDING_HELPER = b'''class LegacyConfirmationRequired(RuntimeError): pass
+def validate_legacy_zone(snapshot, requested, confirmation, probe, *, confirmation_evidence, probe_timeout, probe_attempts):
+    return {"output": probe("exec", snapshot["containerId"], timeout=probe_timeout), "timeout": probe_timeout, "attempts": probe_attempts, "evidence": confirmation_evidence}
 '''
 
     def test_missing_or_modified_companion_is_rejected_before_execution(self):
@@ -1103,13 +1231,37 @@ class LegacyCompanionBindingTest(unittest.TestCase):
         self.assertEqual([call.kwargs['timeout'] for call in run.call_args_list], [5, 10, 5])
         self.assertTrue(all(snapshot['containerId'] in call.args[0] for call in run.call_args_list))
 
+    def test_verified_companion_requires_reviewed_evidence_in_addition_to_container_id(self):
+        snapshot = {'containerId': 'a' * 64, 'image': 'sha256:reviewed',
+                    'startedAt': '2026-10-20T00:00:00Z', 'runtimeEnvironment': {'TZ': 'UTC'}}
+        identity = json.dumps({'id': snapshot['containerId'], 'image': snapshot['image'],
+                               'status': 'running', 'startedAt': snapshot['startedAt']})
+        def observe(evidence):
+            results = [identity, 'ieum-zone-v1|unavailable|missing_tools', identity]
+            with patch.object(bg.subprocess, 'run', side_effect=lambda *a, **kw:
+                              SimpleNamespace(returncode=0, stdout=results.pop(0))):
+                return bg.validate_legacy_time_zone(snapshot, 'UTC', snapshot['containerId'],
+                    confirmation_evidence=evidence)
+        with self.assertRaises(bg.LegacyTimeZoneConfirmationRequired) as caught:
+            observe(None)
+        summary, fingerprint = caught.exception.summary, caught.exception.fingerprint
+        self.assertEqual(summary['configured']['zones'], ['UTC'])
+        self.assertNotIn(snapshot['image'], json.dumps(summary))
+        with self.assertRaises(bg.LegacyTimeZoneConfirmationRequired) as stale:
+            observe('f' * 64)
+        self.assertEqual(stale.exception.fingerprint, fingerprint)
+        proof = observe(fingerprint)
+        self.assertEqual(proof['origin'], 'operator-confirmed')
+        self.assertEqual(proof['proof']['confirmationEvidence'], fingerprint)
+        self.assertEqual(proof['proof']['confirmationSummary'], summary)
+
     def test_companion_receives_only_bounded_probe_settings_and_subprocess_timeout(self):
         with patch.object(bg.Path, 'read_bytes', return_value=self.FORWARDING_HELPER), \
              patch.object(bg, 'LEGACY_ZONE_HELPER_SHA256', bg.hashlib.sha256(self.FORWARDING_HELPER).hexdigest()), \
              patch.object(bg.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout='sanitized')) as run:
             result = bg.validate_legacy_time_zone({'containerId': 'a' * 64}, 'UTC', None,
-                                                probe_timeout=60, probe_attempts=3)
-        self.assertEqual(result, {'output': 'sanitized', 'timeout': 60, 'attempts': 3})
+                                                confirmation_evidence='b' * 64, probe_timeout=60, probe_attempts=3)
+        self.assertEqual(result, {'output': 'sanitized', 'timeout': 60, 'attempts': 3, 'evidence': 'b' * 64})
         self.assertEqual(run.call_args.kwargs['timeout'], 60)
 
     def test_probe_callback_preserves_retryable_categories_without_raw_diagnostics(self):

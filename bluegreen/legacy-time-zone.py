@@ -39,6 +39,20 @@ class LegacyProbeError(RuntimeError):
         super().__init__('Legacy Java process changed or returned incomplete time-zone evidence '
                          f'[{self.code}; attempts={attempts}; timeoutSeconds={timeout_seconds}]')
 
+
+class LegacyConfirmationRequired(RuntimeError):
+    """A review challenge over sanitized evidence, never raw environment values."""
+
+    code = 'legacy_zone_confirmation_required'
+
+    def __init__(self, summary):
+        self.summary = summary
+        self.evidence = summary
+        self.fingerprint = hashlib.sha256(json.dumps(
+            summary, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode()).hexdigest()
+        super().__init__('Running Legacy JVM time zone is unavailable; review the evidence and confirm '
+                         'the exact captured container ID with its evidence SHA-256')
+
 # Only an allowlisted zone, numeric PID and a fixed status may leave the container.
 # jcmd's complete property output and its stderr are never returned to the caller.
 # No new `java -XshowSettings` process is used as evidence about the running JVM.
@@ -170,6 +184,44 @@ END {
 }
 '''
 
+# Compare with the container's own TZDB, not the controller host's TZDB digest.
+# The caller enforces a three-second deadline. Both file sizes and cmp's byte
+# count are capped, and iteration is over the finite caller-supplied allowlist.
+LOCALTIME_RESOLVER_SCRIPT = r'''set -u
+LC_ALL=C
+export LC_ALL
+file=$2
+directory=$3
+command -v cmp >/dev/null 2>&1 && command -v wc >/dev/null 2>&1 || exit 1
+cmp -s -n 1 /dev/null /dev/null >/dev/null 2>&1 || exit 1
+size=$(wc -c < "$file" 2>/dev/null) || exit 1
+size=${size##* }
+case "$size" in ''|*[!0-9]*) exit 1 ;; esac
+[ "$size" -gt 0 ] && [ "$size" -le 1048576 ] || exit 1
+signature=$(od -An -tu1 -N4 "$file" 2>/dev/null | awk '{$1=$1; print}')
+[ "$signature" = '84 90 105 102' ] || exit 1
+count=0
+for zone in $1; do
+    count=$((count + 1))
+    [ "$count" -le 1024 ] || exit 1
+    candidate=$directory/$zone
+    [ -f "$candidate" ] && [ -r "$candidate" ] || continue
+    candidate_size=$(wc -c < "$candidate" 2>/dev/null) || continue
+    candidate_size=${candidate_size##* }
+    [ "$candidate_size" = "$size" ] || continue
+    if cmp -s -n 1048577 "$file" "$candidate" >/dev/null 2>&1; then
+        after=$(wc -c < "$file" 2>/dev/null) || exit 1
+        candidate_after=$(wc -c < "$candidate" 2>/dev/null) || exit 1
+        after=${after##* }
+        candidate_after=${candidate_after##* }
+        [ "$after" = "$size" ] && [ "$candidate_after" = "$size" ] || exit 1
+        printf '%s\n' "$zone"
+        exit 0
+    fi
+done
+exit 1
+'''
+
 PROBE_SCRIPT = r'''set -u
 LC_ALL=C
 export LC_ALL
@@ -236,12 +288,28 @@ case "$link" in
     ../usr/share/zoneinfo/*) link=${link#../usr/share/zoneinfo/} ;;
     *) link= ;;
 esac
-if [ -n "$link" ]; then
+resolution=missing
+if [ -n "$link" ] && case " $1 " in *" $link "*) true ;; *) false ;; esac; then
     printf '%s\n' "$link" | awk -v allowed="$1" -v source=etc-localtime '
 ''' + FILE_FILTER + "'" + r'''
+    resolution=symlink
+elif [ -e /etc/localtime ] || [ -L /etc/localtime ]; then
+    resolution=unresolved
+    resolved=
+    if [ -f /etc/localtime ] && [ -r /etc/localtime ] && command -v timeout >/dev/null 2>&1; then
+        resolved=$(timeout 3s sh -c ''' + shlex.quote(LOCALTIME_RESOLVER_SCRIPT) + r''' ieum-localtime "$1" /etc/localtime /usr/share/zoneinfo 2>/dev/null) || resolved=
+    fi
+    if [ -n "$resolved" ] && case " $1 " in *" $resolved "*) true ;; *) false ;; esac; then
+        printf '%s\n' "$resolved" | awk -v allowed="$1" -v source=etc-localtime '
+''' + FILE_FILTER + "'" + r'''
+        resolution=resolved
+    else
+        printf 'ieum-zone-v2|input|etc-localtime|unsupported\n'
+    fi
 else
     printf 'ieum-zone-v2|input|etc-localtime|missing\n'
 fi
+printf 'ieum-zone-v2|localtime-resolution|%s\n' "$resolution"
 if [ -r /etc/localtime ] && command -v sha256sum >/dev/null 2>&1; then
     head -c 1048577 /etc/localtime 2>/dev/null | sha256sum 2>/dev/null | awk '
         $1 ~ /^[a-f0-9]+$/ && length($1) == 64 { print "ieum-zone-v2|localtime-sha256|" $1; found=1 }
@@ -440,7 +508,7 @@ def _probe_v1(output):
 
 def _probe_v2(output):
     """Decode only the fixed, in-container-sanitized record grammar."""
-    inputs, reads, process, observed, digest = {}, {}, None, None, None
+    inputs, reads, process, observed, digest, resolution = {}, {}, None, None, None, None
     lines = output.rstrip('\n').split('\n')
     if not lines or lines[-1] != 'ieum-zone-v2|complete' or len(lines) > 160:
         return {'status': 'invalid', 'reason': 'incomplete_or_changed_process'}
@@ -471,13 +539,20 @@ def _probe_v2(output):
         elif len(fields) == 3 and fields[:2] == ['ieum-zone-v2', 'localtime-sha256'] and digest is None and \
                 (fields[2] == 'unavailable' or re.fullmatch(r'[a-f0-9]{64}', fields[2])):
             digest = fields[2]
+        elif len(fields) == 3 and fields[:2] == ['ieum-zone-v2', 'localtime-resolution'] and resolution is None and \
+                fields[2] in ('symlink', 'resolved', 'missing', 'unresolved'):
+            resolution = fields[2]
         else:
             return {'status': 'invalid', 'reason': 'invalid_probe_result'}
-    if process is None or observed is None or set(reads) != {'environment', 'cmdline'} or digest is None or \
+    if process is None or observed is None or set(reads) != {'environment', 'cmdline'} or digest is None or resolution is None or \
             any(len(inputs.get(source, [])) != 1 for source in ('etc-timezone', 'etc-localtime')) or \
             (observed['status'] == 'actual' and observed['pid'] != process['pid']):
         return {'status': 'invalid', 'reason': 'incomplete_or_changed_process'}
-    observed.update(process=process, inputs=inputs, reads=reads, localtimeSha256=digest)
+    expected_localtime_status = {'symlink': 'zone', 'resolved': 'zone', 'missing': 'missing', 'unresolved': 'unsupported'}
+    if inputs['etc-localtime'][0]['status'] != expected_localtime_status[resolution]:
+        return {'status': 'invalid', 'reason': 'invalid_probe_result'}
+    observed.update(process=process, inputs=inputs, reads=reads, localtimeSha256=digest,
+                    localtimeResolution=resolution)
     return observed
 
 
@@ -488,10 +563,11 @@ def _startup_inputs(observed, requested):
     and launcher argument files are deliberately not guessed: conflicting possible
     property values reject confirmation when both process inputs were read. With
     no recognized property, TZ precedes the platform files. Unavailable environment
-    or argv may contain an overriding property, so lower evidence cannot establish
-    a mismatch. Invalid or partially read data never reaches this function. JDK 21
-    updates differ in whether /etc/timezone is consulted, so contradictory known
-    platform files also reject confirmation when process inputs are complete.
+    or argv may contain an overriding property, so a single lower-priority zone
+    cannot establish a mismatch. Invalid or partially read data never reaches this
+    function. Contradictory platform files and unresolved localtime require a fully
+    read explicit TZ/property override; incomplete process inputs cannot confirm
+    around either condition. JDK patches may consult different platform files.
     """
     inputs = observed['inputs']
     properties = [item for source in ('JAVA_TOOL_OPTIONS', 'JDK_JAVA_OPTIONS', '_JAVA_OPTIONS', 'cmdline')
@@ -511,9 +587,18 @@ def _startup_inputs(observed, requested):
                         hashlib.sha256(requested_bytes).hexdigest() == observed['localtimeSha256'])
     known_mismatch = any(not _observed_matches(value, requested) for value in zones)
     complete_process_inputs = all(value == 'ok' for value in observed['reads'].values())
+    platform_zones = [item['zone'] for source in ('etc-timezone', 'etc-localtime')
+                      for item in inputs.get(source, []) if item['status'] == 'zone']
+    platform_conflict = bool(platform_zones) and any(
+        not _observed_equivalent(platform_zones[0], value) for value in platform_zones[1:])
+    explicit_override = complete_process_inputs and basis in ('jvm-startup-properties', 'process-TZ')
     uncertain = (any(item['status'] == 'unsupported' for values in inputs.values() for item in values) or
                  not complete_process_inputs)
-    if known_mismatch and complete_process_inputs:
+    if platform_conflict and not explicit_override:
+        status = 'mismatch'
+    elif observed['localtimeResolution'] == 'unresolved' and not explicit_override:
+        status = 'unresolved'
+    elif known_mismatch and complete_process_inputs:
         status = 'mismatch'
     elif not complete_process_inputs:
         status = 'ambiguous'
@@ -524,22 +609,48 @@ def _startup_inputs(observed, requested):
     return {'status': status, 'basis': basis, 'zones': zones,
             'inputs': inputs, 'reads': observed['reads'], 'localtimeSha256': observed['localtimeSha256'],
             'processInputsComplete': complete_process_inputs,
+            'localtimeResolution': observed['localtimeResolution'], 'platformInputsConflict': platform_conflict,
             'requestedTzifDigestMatches': digest_match,
             'limitation': 'startup inputs do not prove cached JVM state or application TimeZone.setDefault overrides'}
 
 
+def _confirmation_summary(snapshot, requested, configured, observed, startup):
+    summary = {'schemaVersion': 1, 'expectedZone': requested, 'containerId': snapshot['containerId'],
+               'imageIdentitySha256': hashlib.sha256(snapshot['image'].encode()).hexdigest(),
+               'containerStartIdentitySha256': hashlib.sha256(snapshot['startedAt'].encode()).hexdigest(),
+               'configured': configured, 'probeUnavailableReason': observed['reason']}
+    if startup is not None:
+        summary['pid'] = observed['process']['pid']
+        summary['pidStartTicks'] = observed['process']['startTicks']
+        summary['startupInputs'] = {key: startup[key] for key in (
+            'status', 'basis', 'zones', 'processInputsComplete', 'reads', 'localtimeSha256',
+            'requestedTzifDigestMatches', 'localtimeResolution', 'platformInputsConflict')}
+        summary['startupInputs']['sourceKinds'] = {
+            source: sorted({item['status'] for item in values})
+            for source, values in startup['inputs'].items()}
+        summary['startupInputs']['observedZones'] = {
+            source: sorted({item['zone'] for item in values if item['status'] == 'zone'})
+            for source, values in startup['inputs'].items()}
+    return summary
+
+
 def validate_legacy_zone(snapshot, requested_zone, confirmation_id, docker_runner, *,
-                         probe_timeout=PROBE_TIMEOUT, probe_attempts=PROBE_ATTEMPTS):
+                         probe_timeout=PROBE_TIMEOUT, probe_attempts=PROBE_ATTEMPTS,
+                         confirmation_evidence=None):
     """Return sanitized evidence, or reject before the immutable zone is written.
 
     The running JVM property is preferred. Startup inputs alone can be overridden
-    or cached, so a matching full container ID is still required without that probe.
+    or cached, so the exact container ID and reviewed evidence SHA-256 are required
+    without that probe. A changed observation invalidates the previous confirmation.
     A known JVM/startup-input mismatch cannot be confirmed away. When higher
     process inputs are unavailable, Config.Env supplies a separate conservative
     check before exact-container operator confirmation may proceed.
     """
     requested = _zone(requested_zone)
     _probe_settings(probe_timeout, probe_attempts)
+    if confirmation_evidence is not None and (not isinstance(confirmation_evidence, str) or
+                                              not re.fullmatch(r'[a-f0-9]{64}', confirmation_evidence)):
+        raise RuntimeError('Legacy time-zone confirmation evidence must be a 64-character SHA-256')
     if not isinstance(snapshot, dict) or not isinstance(snapshot.get('containerId'), str) or \
             not re.fullmatch(r'[a-f0-9]{64}', snapshot['containerId']) or \
             not isinstance(snapshot.get('image'), str) or not snapshot['image'] or \
@@ -570,8 +681,12 @@ def validate_legacy_zone(snapshot, requested_zone, confirmation_id, docker_runne
         if 'process' in observed:
             proof['pidStartTicks'] = observed['process']['startTicks']
         return {'origin': 'running-jvm', 'effectiveZone': observed['zone'], 'proof': proof}
+    startup = None
+    original_configured = configured
     if 'inputs' in observed:
         startup = _startup_inputs(observed, requested)
+        if startup['status'] == 'unresolved':
+            raise RuntimeError('Legacy localtime could not be resolved against the container zoneinfo; explicit process time-zone evidence is required')
         if startup['status'] == 'mismatch':
             raise RuntimeError('Legacy process or platform time-zone startup evidence differs from the requested backend time zone')
         if not startup['processInputsComplete'] and \
@@ -585,8 +700,11 @@ def validate_legacy_zone(snapshot, requested_zone, confirmation_id, docker_runne
         configured = startup
     if configured['status'] == 'mismatch':
         raise RuntimeError('Legacy time-zone configuration differs from the requested backend time zone')
-    if confirmation_id != snapshot['containerId']:
-        raise RuntimeError('Running Legacy JVM time zone is unavailable; confirm the exact captured container ID after operator review')
+    challenge = LegacyConfirmationRequired(_confirmation_summary(
+        snapshot, requested, original_configured, observed, startup))
+    if confirmation_id != snapshot['containerId'] or confirmation_evidence != challenge.fingerprint:
+        raise challenge
     proof.update(method='explicit-container-confirmation', probeUnavailableReason=observed['reason'],
-                 confirmationId=confirmation_id)
+                 confirmationId=confirmation_id, confirmationEvidence=challenge.fingerprint,
+                 confirmationSummary=challenge.summary)
     return {'origin': 'operator-confirmed', 'effectiveZone': requested, 'proof': proof}
