@@ -49,7 +49,7 @@ DEFAULT_LEGACY_PROBE_ATTEMPTS = 2
 LEGACY_PROBE_FAILURE_CODES = frozenset({'probe_timeout', 'probe_transport_failure', 'probe_command_failed',
     'probe_invalid_result', 'probe_incomplete_or_changed_process'})
 BACKEND_TIME_ZONES = frozenset(available_timezones()) - {'localtime'}
-LEGACY_ZONE_HELPER_SHA256 = '6fcae95bacb38b2c07764571c47fa7d8fd7e61834cf280f9066eadac24f41f2a'
+LEGACY_ZONE_HELPER_SHA256 = 'f5cb8a675a43993b9fd16a503a64ecc04287fd3fef1b9d0baaf70f4c76f04341'
 
 def default_lock_timeout(command):
     return DEFAULT_DEPLOY_LOCK_TIMEOUT if command == 'deploy' else DEFAULT_OPERATION_LOCK_TIMEOUT
@@ -94,7 +94,7 @@ def legacy_confirmation_evidence(value):
         raise argparse.ArgumentTypeError('Legacy confirmation evidence must be the displayed 64-character SHA-256 fingerprint')
     return value
 
-def sanitized_confirmation_summary(summary):
+def sanitized_confirmation_summary(summary, *, evidence_only=False):
     """Accept only the companion's fixed, non-secret review-evidence schema."""
     sources = {'TZ', 'JAVA_TOOL_OPTIONS', 'JDK_JAVA_OPTIONS', '_JAVA_OPTIONS', 'cmdline',
                'etc-timezone', 'etc-localtime'}
@@ -112,15 +112,21 @@ def sanitized_confirmation_summary(summary):
         return isinstance(value, dict) and set(value) <= sources and \
             all(bounded_list(items, valid) for items in value.values())
     try:
+        actual = evidence_only and isinstance(summary, dict) and 'observedZone' in summary
         required = {'schemaVersion', 'expectedZone', 'containerId', 'imageIdentitySha256',
-                    'containerStartIdentitySha256', 'configured', 'probeUnavailableReason'}
+                    'containerStartIdentitySha256', 'configured'} | \
+                   ({'observedZone', 'pid'} if actual else {'probeUnavailableReason'})
+        optional = {'pidStartTicks'} if actual else {'pid', 'pidStartTicks', 'startupInputs'}
         if not isinstance(summary, dict) or not required <= set(summary) or \
-                set(summary) - required - {'pid', 'pidStartTicks', 'startupInputs'} or \
+                set(summary) - required - optional or \
                 type(summary['schemaVersion']) is not int or summary['schemaVersion'] != 1 or \
                 summary['expectedZone'] not in BACKEND_TIME_ZONES or \
-                not all(sha256(summary[key]) for key in ('containerId', 'imageIdentitySha256', 'containerStartIdentitySha256')) or \
-                summary['probeUnavailableReason'] not in {'missing_tools', 'ambiguous_jvm', 'attach_failed',
-                                                         'missing_or_unknown_property'}:
+                not all(sha256(summary[key]) for key in ('containerId', 'imageIdentitySha256', 'containerStartIdentitySha256')):
+            raise ValueError()
+        if actual:
+            if not zone(summary['observedZone']): raise ValueError()
+        elif summary['probeUnavailableReason'] not in {'missing_tools', 'ambiguous_jvm', 'attach_failed',
+                                                       'missing_or_unknown_property'}:
             raise ValueError()
         configured = summary['configured']
         if not isinstance(configured, dict) or set(configured) != {'status', 'sources', 'zones'} or \
@@ -138,7 +144,8 @@ def sanitized_confirmation_summary(summary):
             keys = {'status', 'basis', 'zones', 'processInputsComplete', 'reads', 'localtimeSha256',
                     'requestedTzifDigestMatches', 'sourceKinds', 'observedZones', 'localtimeResolution',
                     'platformInputsConflict'}
-            if not isinstance(startup, dict) or set(startup) != keys or startup['status'] not in statuses or \
+            startup_statuses = statuses | ({'unresolved'} if evidence_only else set())
+            if not isinstance(startup, dict) or set(startup) != keys or startup['status'] not in startup_statuses or \
                     startup['basis'] not in {'jvm-startup-properties', 'process-TZ', 'platform-files-jdk-version-unspecified'} or \
                     not bounded_list(startup['zones'], zone) or type(startup['processInputsComplete']) is not bool or \
                     type(startup['platformInputsConflict']) is not bool or \
@@ -153,6 +160,37 @@ def sanitized_confirmation_summary(summary):
         return json.loads(json.dumps(summary, sort_keys=True, separators=(',', ':'), ensure_ascii=True))
     except (AttributeError, KeyError, TypeError, ValueError):
         raise RuntimeError('Legacy confirmation evidence summary is invalid') from None
+
+def sanitized_legacy_evidence_report(report):
+    """Validate inspection diagnostics without turning a blocked SHA into approval."""
+    reasons = {
+        'running-jvm': {'observed_jvm_match'},
+        'confirmation-required': {'operator_confirmation_required'},
+        'blocked': {'observed_jvm_mismatch', 'localtime_unresolved', 'platform_conflict',
+                    'startup_mismatch', 'configuration_mismatch'},
+    }
+    try:
+        if not isinstance(report, dict) or set(report) != {'status', 'reason', 'evidence', 'evidenceSha256'} or \
+                report['status'] not in reasons or report['reason'] not in reasons[report['status']]:
+            raise ValueError()
+        evidence = sanitized_confirmation_summary(report['evidence'], evidence_only=True)
+        actual = 'observedZone' in evidence
+        if actual != (report['reason'] in {'observed_jvm_match', 'observed_jvm_mismatch'}):
+            raise ValueError()
+        if report['status'] == 'confirmation-required' and \
+                evidence.get('startupInputs', {}).get('status') in {'mismatch', 'unresolved'}:
+            raise ValueError()
+        if report['status'] == 'confirmation-required' and 'startupInputs' not in evidence and \
+                evidence['configured']['status'] == 'mismatch':
+            raise ValueError()
+        fingerprint = legacy_confirmation_evidence(report['evidenceSha256'])
+        canonical = json.dumps(evidence, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+        if hashlib.sha256(canonical.encode()).hexdigest() != fingerprint:
+            raise ValueError()
+        return {'status': report['status'], 'reason': report['reason'], 'evidence': evidence,
+                'evidenceSha256': fingerprint}
+    except (AttributeError, KeyError, TypeError, ValueError, RuntimeError, argparse.ArgumentTypeError):
+        raise RuntimeError('Legacy inspection evidence report is invalid') from None
 
 class LegacyTimeZoneConfirmationRequired(RuntimeError):
     """Only the digest-bound companion can supply the sanitized evidence summary."""
@@ -169,11 +207,17 @@ def require_job_budget(deadline, reserve=DEPLOYMENT_RESERVE_SECONDS):
         raise RuntimeError('Insufficient job time remains; deployment was not started. Inspect status and retry in a fresh job')
 
 @contextlib.contextmanager
-def deployment_lock(timeout, command, job_deadline_epoch=None):
+def deployment_lock(timeout, command, job_deadline_epoch=None, *, read_only=False):
     require_job_budget(job_deadline_epoch)
     if job_deadline_epoch is not None:
         timeout = min(timeout, max(0, job_deadline_epoch - time.time() - DEPLOYMENT_RESERVE_SECONDS))
-    with (HOME / 'deploy.lock').open('a') as lock:
+    try:
+        lock_file = (HOME / 'deploy.lock').open('r' if read_only else 'a')
+    except OSError:
+        if read_only:
+            raise RuntimeError('Legacy evidence inspection requires an accessible existing deployment lock') from None
+        raise
+    with lock_file as lock:
         deadline = time.monotonic() + timeout
         while True:
             try:
@@ -185,6 +229,11 @@ def deployment_lock(timeout, command, job_deadline_epoch=None):
                 time.sleep(min(0.25, max(0, deadline - time.monotonic())))
         # Recheck after acquisition: waiting and wall-clock changes must not consume the operation reserve.
         require_job_budget(job_deadline_epoch)
+        if read_only:
+            # The existing file and owner advisory stay byte-identical. The OS
+            # exclusive flock still serializes inspection with deployment.
+            yield
+            return
         owner_path = HOME / 'lock-owner.json'
         owner = {'pid': os.getpid(), 'command': command,
                  'startedAt': datetime.now(timezone.utc).isoformat(), 'lease': secrets.token_hex(8)}
@@ -432,12 +481,7 @@ def backend_time_zone(explicit=None, persist=True):
         record('backend_time_zone_initialized', zone=value)
     return value
 
-def validate_legacy_time_zone(snapshot, requested, confirmation_id,
-                              confirmation_evidence=None,
-                              probe_timeout=DEFAULT_LEGACY_PROBE_TIMEOUT,
-                              probe_attempts=DEFAULT_LEGACY_PROBE_ATTEMPTS):
-    probe_timeout = parse_legacy_probe_timeout(probe_timeout)
-    probe_attempts = parse_legacy_probe_attempts(probe_attempts)
+def legacy_time_zone_companion():
     # The approved controller digest also binds its companion. Execute the exact verified bytes.
     path = Path(__file__).with_name('legacy-time-zone.py')
     try:
@@ -465,11 +509,82 @@ def validate_legacy_time_zone(snapshot, requested, confirmation_id,
             raise RuntimeError('Legacy JVM evidence probe command failed') from None
         except (subprocess.SubprocessError, RuntimeError):
             raise RuntimeError('Legacy JVM evidence probe failed') from None
+    return namespace, probe
+
+def validate_legacy_time_zone(snapshot, requested, confirmation_id,
+                              confirmation_evidence=None,
+                              probe_timeout=DEFAULT_LEGACY_PROBE_TIMEOUT,
+                              probe_attempts=DEFAULT_LEGACY_PROBE_ATTEMPTS):
+    probe_timeout = parse_legacy_probe_timeout(probe_timeout)
+    probe_attempts = parse_legacy_probe_attempts(probe_attempts)
+    namespace, probe = legacy_time_zone_companion()
     try:
         return namespace['validate_legacy_zone'](snapshot, requested, confirmation_id, probe,
             confirmation_evidence=confirmation_evidence, probe_timeout=probe_timeout, probe_attempts=probe_attempts)
     except namespace['LegacyConfirmationRequired'] as failure:
         raise LegacyTimeZoneConfirmationRequired(failure.summary, failure.fingerprint) from None
+
+def inspect_legacy_time_zone(snapshot, requested,
+                             probe_timeout=DEFAULT_LEGACY_PROBE_TIMEOUT,
+                             probe_attempts=DEFAULT_LEGACY_PROBE_ATTEMPTS):
+    probe_timeout = parse_legacy_probe_timeout(probe_timeout)
+    probe_attempts = parse_legacy_probe_attempts(probe_attempts)
+    namespace, probe = legacy_time_zone_companion()
+    report = namespace['inspect_legacy_zone'](snapshot, requested, probe,
+        probe_timeout=probe_timeout, probe_attempts=probe_attempts)
+    return sanitized_legacy_evidence_report(report)
+
+def legacy_zone_evidence(backend_zone=None,
+                         legacy_probe_timeout=DEFAULT_LEGACY_PROBE_TIMEOUT,
+                         legacy_probe_attempts=DEFAULT_LEGACY_PROBE_ATTEMPTS):
+    """Inspect Legacy time-zone evidence without any deployment-file mutation."""
+    legacy_probe_timeout = parse_legacy_probe_timeout(legacy_probe_timeout)
+    legacy_probe_attempts = parse_legacy_probe_attempts(legacy_probe_attempts)
+    try:
+        data = state()
+        if data['active'] != 'legacy':
+            raise RuntimeError()
+        assert_consistent(data)
+        if (HOME / 'transaction.json').exists():
+            raise RuntimeError()
+        expected_zone = backend_time_zone(backend_zone, persist=False)
+        snapshots = capture_legacy_snapshot()
+        report = inspect_legacy_time_zone(snapshots['backend'], expected_zone,
+            probe_timeout=legacy_probe_timeout, probe_attempts=legacy_probe_attempts)
+        report = sanitized_legacy_evidence_report(report)
+        expected_identity = {
+            'expectedZone': expected_zone, 'containerId': snapshots['backend']['containerId'],
+            'imageIdentitySha256': hashlib.sha256(snapshots['backend']['image'].encode()).hexdigest(),
+            'containerStartIdentitySha256': hashlib.sha256(snapshots['backend']['startedAt'].encode()).hexdigest(),
+        }
+        if any(report['evidence'][key] != value for key, value in expected_identity.items()):
+            raise RuntimeError()
+        verify_legacy_snapshot(snapshots)
+        # Revalidate even mocked/adapted producers at the last output boundary.
+        return sanitized_legacy_evidence_report(report)
+    except Exception as failure:
+        code = getattr(failure, 'code', None)
+        if not isinstance(code, str) or code not in LEGACY_PROBE_FAILURE_CODES:
+            code = 'legacy_evidence_unverified'
+        raise RuntimeError('Legacy time-zone evidence unavailable [' + code +
+            ']; inspect initialized Legacy state, identity and bounded probe inputs') from None
+
+def run_legacy_zone_evidence(args):
+    """The inspection CLI has a fixed diagnostic boundary and never initializes files."""
+    try:
+        if not HOME.is_dir() or not (HOME / 'state.json').is_file() or not (HOME / 'deploy.lock').is_file():
+            raise RuntimeError()
+        wait_seconds = default_lock_timeout(args.command) if args.lock_timeout is None else args.lock_timeout
+        with deployment_lock(wait_seconds, args.command, read_only=True):
+            report = legacy_zone_evidence(args.backend_time_zone,
+                legacy_probe_timeout=args.legacy_probe_timeout, legacy_probe_attempts=args.legacy_probe_attempts)
+            report = sanitized_legacy_evidence_report(report)
+            print(json.dumps(report, sort_keys=True, ensure_ascii=True))
+            return 1 if report['status'] == 'blocked' else 0
+    except Exception:
+        print('Legacy time-zone evidence unavailable; inspect initialized Legacy state, identity and bounded probe inputs',
+              file=sys.stderr)
+        return 1
 
 def record_legacy_probe_failure(failure, timeout, attempt_limit):
     if isinstance(failure, LegacyTimeZoneConfirmationRequired):
@@ -1224,6 +1339,14 @@ def main():
                         help='Maximum seconds to wait for the deployment lock (0..14400; deploy default 14400, other commands 600)')
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('init'); sub.add_parser('status'); sub.add_parser('finish-bootstrap')
+    p = sub.add_parser('legacy-zone-evidence', help='Inspect current Legacy JVM evidence without preparing a slot')
+    p.add_argument('--backend-time-zone', help='Reviewed requested zone, or reuse the existing immutable zone pin')
+    p.add_argument('--legacy-probe-timeout', type=parse_legacy_probe_timeout,
+                   default=DEFAULT_LEGACY_PROBE_TIMEOUT,
+                   help='Legacy evidence probe timeout in seconds (6..60; default 10)')
+    p.add_argument('--legacy-probe-attempts', type=parse_legacy_probe_attempts,
+                   default=DEFAULT_LEGACY_PROBE_ATTEMPTS,
+                   help='Legacy evidence probe attempts (1..3; default 2)')
     for verb in ('prepare', 'switch', 'check'):
         p = sub.add_parser(verb); p.add_argument('color', choices=tuple(IPS))
         if verb == 'prepare':
@@ -1259,6 +1382,8 @@ def main():
                    help='Conservative CI cancellation deadline; keep 9000 seconds after lock acquisition')
     p.add_argument('--force', action='store_true')
     args = parser.parse_args()
+    if args.command == 'legacy-zone-evidence':
+        return run_legacy_zone_evidence(args)
     HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
     if args.command == 'status': status(); return
     wait_seconds = default_lock_timeout(args.command) if args.lock_timeout is None else args.lock_timeout
@@ -1294,7 +1419,7 @@ def main():
             switch(target, force=args.force)
 
 if __name__ == '__main__':
-    try: main()
+    try: sys.exit(main())
     except Exception as error:
         print(f'Deployment stopped safely: {error}', file=sys.stderr)
         sys.exit(1)

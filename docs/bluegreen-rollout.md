@@ -1,6 +1,7 @@
 # Blue/Green 수정 반영 및 장애 복구 절차
 
-이 문서는 2026-10-21 v8 재검토에 따라 추가 보완하는 protocol 2의 운영 계약이다.
+이 문서는 2026-10-28의 Backend·Frontend·Agent DEV_ Secrets 자동 수집을 반영한 v15 운영 계약이다.
+v11의 Legacy 증거 전용 조회와 거부 상태 운영 경로 및 앞선 안전성 보완을 유지한다.
 문서의 명령은 운영자가 승인된 반영·점검 시간에 실행할 예시이며, 문서 수정 과정에서 실행하지 않았다.
 로컬 코드 수정은 기존 서버의 실행 중인 이미지나 GitHub workflow 설정을 변경하지 않는다.
 
@@ -26,16 +27,16 @@ Blue/Green 상태 파일을 정상 운영 상태라고 가정하거나 수동으
 
 | 저장소 | 마지막 push된 커밋 | 현재 로컬 HEAD | 현재 HEAD 이후 |
 |---|---|---|---|
-| Infra | `42e06cb` | `93a9558` | 이번 v9 Infra 보완은 미커밋 |
-| Backend | `61d1be3` | `d9d5b37` | 이번 v9 수정 없음; 앱·배포 workflow 유지 |
-| Frontend | `6812f4c` | `ebaa2cc` | 이번 v9 수정 없음; 앱·배포 workflow 유지 |
-| Agent | `b64e0e6` | `4487eed` | 이번 v9 수정 없음; 배포 workflow 유지 |
+| Infra | `42e06cb` | `247faf3` | v11 Legacy 증거 조회·테스트와 v15 설정 운영 문서 변경은 미커밋 |
+| Backend | `61d1be3` | `d9d5b37` | v14 접두사 Secrets 수집·검증·배포 workflow 변경은 미커밋 |
+| Frontend | `6812f4c` | `ebaa2cc` | v15 DEV_ 빌드·배포 설정과 검증·문서 변경은 미커밋 |
+| Agent | `b64e0e6` | `4487eed` | v15 DEV_ 런타임 설정과 검증·문서 변경은 미커밋 |
 
 네 저장소의 현재 HEAD에는 push하지 않은 보완 커밋이 있다. 마지막 push 이후 누적 커밋 수는
-Infra 5개, Backend·Frontend 각각 4개, Agent 3개다. 앞선 v8 Infra 수정은 현재 Infra HEAD에 커밋됐으며,
-이번 v9 Infra 보완은 그 이후의 미커밋 수정이다. 마지막 push→로컬 HEAD의 미push 커밋과
+Infra 6개, Backend·Frontend 각각 4개, Agent 3개다. 앞선 v9 Infra 수정은 현재 Infra HEAD에 커밋됐으며,
+v14 Backend 접두사 설정 전환과 기존 v11 Infra 보완은 그 이후의 미커밋 수정이다. 마지막 push→로컬 HEAD의 미push 커밋과
 로컬 HEAD→working tree의 미커밋 수정을 구분한다. 이 둘 모두 운영에 반영됐다는 뜻이 아니다.
-이번 v9 보완 과정에서는 commit·push·서버 변경을 수행하지 않는다.
+이번 v15 보완 과정에서는 commit·push·서버 변경과 GitHub Secrets·Variables 등록을 수행하지 않는다.
 
 ## 2. 다음 재적용 시 기존 배포 경로를 동결한다
 
@@ -119,8 +120,9 @@ docker exec ieum-postgres sh -c 'exec psql -X -v ON_ERROR_STOP=1 -U "$POSTGRES_U
 ```
 
 두 Backend의 Hikari 최대·최소 pool, autocommit, 실행당 잠금 연결, Quartz와 다른 서비스의 연결을
-합산한다. 잠금용 장기 세션이 DB timeout에 의해 종료될 수 있는지도 확인한다. Backend `.env`는
-비밀값이 있으므로 전체 내용을 로그에 출력하지 않고 pool·timeout 관련 설정만 현장에서 확인한다.
+합산한다. 잠금용 장기 세션이 DB timeout에 의해 종료될 수 있는지도 확인한다. Backend의 전체 사용자
+사용자 설정은 DEV_ 접두사의 개별 Secrets에서 공급한다. pool은 controller 기본값과 앱 기본값도
+적용되므로 승인된 후보와 실제 runtime 설정의 pool·timeout 항목을 대조한다. Secret·임시 후보·색상별 snapshot의 전체 내용을 로그나 채팅에 출력하지 않는다.
 
 오래된 PENDING 행은 과거 이벤트의 외부 부수 효과를 뒤늦게 실행할 수 있다. 운영자가 건수·기간·업무
 의미를 검토하고 **복구 허용 시작 시각을 직접 선택**한다. 현재 시각을 자동 선택하거나 오래된 행을
@@ -253,12 +255,16 @@ Micrometer의 복구 결과 counter는 결과 관측 횟수이며 실행별 고�
 Backend의 `docs/operations/bluegreen-pending-recovery.md`를 함께 확인한다.
 
 명령 형식 예시의 이미지 SHA와 시각은 운영자가 검토한 값으로 바꿔야 한다.
+아래 `BACKEND_CANDIDATE_ENV`는 승인된 실행에서 DEV_ Secrets를 선택·검증·생성한 0600
+임시 후보의 절대 경로다. Secret 내용이나 서버의 옛 공용 `.env` 경로를 이 변수로 대신하지 않는다.
+GitHub Secrets를 터미널에서 평문으로 다시 읽는 명령을 제공하는 예시가 아니다. 실제 수동
+bootstrap·forward-fix에서는 배포 담당자가 승인된 실행의 Secret 공급과 후보 전달·삭제를 먼저 준비한다.
 
 ```bash
 python3 /home/kwung/deploy/bluegreen/bluegreen.py deploy \
   --service backend \
   --image ieum-backend-dev:REVIEWED_COMMIT_SHA \
-  --env-file /home/kwung/deploy/ieum-backend/.env \
+  --env-file "$BACKEND_CANDIDATE_ENV" \
   --replace-env \
   --backend-time-zone OPERATOR_CONFIRMED_IANA_ZONE \
   --pending-recovery-not-before 'YYYY-MM-DDTHH:MM:SS+09:00'
@@ -266,7 +272,8 @@ python3 /home/kwung/deploy/bluegreen/bluegreen.py deploy \
 
 위 `deploy`는 기존 bootstrap이 끝나 controller가 활성 Blue/Green 상태인 경우의 형식이다.
 현재처럼 Legacy로 원복된 서버에서는 상태 점검과 재bootstrap 절차를 먼저 계획한다. 준비 대상 색상과
-이미지를 지정하는 `prepare ... --pending-recovery-not-before ...`, 검증, `switch`, Legacy 종료 확인,
+이미지를 정하기 전에 아래 증거 전용 `legacy-zone-evidence`를 실행·검토한다. 거부 판정이면 점검 경로를
+따르고 준비하지 않는다. 그 뒤 별도의 `prepare ... --pending-recovery-not-before ...`, 검증, `switch`, Legacy 종료 확인,
 `finish-bootstrap` 순서를 해당 기준점에 맞춰 진행한다. 기존 작업과 연결을 확인하지 않고 그대로
 위 명령을 실행하지 않는다.
 
@@ -279,11 +286,13 @@ python3 /home/kwung/deploy/bluegreen/bluegreen.py deploy \
 `prepare`에도 앱별 `--frontend-env-file`, `--backend-env-file`, `--agent-env-file`과 `--replace-env`를
 지원한다. 환경을 명시적으로 바꾸는 앱은 그 앱의 이미지도 명시해야 한다. 다른 앱은 현재 Legacy
 이미지·runtime env를 유지한다. 전체 환경 교체의 의미 비교는 6절을 따른다.
+다음은 **증거 전용 조회와 검토를 끝낸 뒤** 수행할 실제 준비의 형식이다. no-attach 확인 대상이면
+이후 설명하는 검토한 CID와 SHA 확인 인자도 함께 지정한다. 증거만 보려고 이 예시를 실행하지 않는다.
 
 ```bash
 python3 /home/kwung/deploy/bluegreen/bluegreen.py --lock-timeout 30 prepare blue \
   --backend-image ieum-backend-dev:REVIEWED_COMMIT_SHA \
-  --backend-env-file /home/kwung/deploy/ieum-backend/.env \
+  --backend-env-file "$BACKEND_CANDIDATE_ENV" \
   --replace-env \
   --backend-time-zone OPERATOR_CONFIRMED_IANA_ZONE \
   --pending-recovery-not-before 'YYYY-MM-DDTHH:MM:SS+09:00'
@@ -296,8 +305,55 @@ cutoff의 offset/Z가 있어도 `started_at`이 timezone 없는 값이면 기존
 기존 실행의 DB 시각·업무 발생 시각과 대조해 같은 기준을 고정한다. OS `date`, 작업자 PC의 시간대,
 PostgreSQL 세션 `TimeZone`만으로 실행 중 JVM의 실제 시간대를 단정하지 않는다.
 
+#### 준비와 분리한 Legacy 증거 조회
+
+설치된 controller의 **`legacy-zone-evidence`** 명령으로 먼저 증거만 확인한다. 초기화된 Legacy
+상태에서 사용하는 명령이며 후보 색상·이미지·환경 파일이나 확인 플래그를 받지 않는다. 아래는
+승인된 점검 구간의 예시이고, 이 문서 작성 중 실행하지 않았다.
+`--backend-time-zone`을 생략하면 기존 불변 pin만 읽으며 새 기준을 저장하지 않는다. pin이 아직 없으면
+검토할 IANA zone을 명시해야 한다.
+`--lock-timeout`은 잠금 획득 대기만, `--legacy-probe-timeout`은 companion probe 시도만 제한한다.
+Legacy snapshot 캡처·재검증의 기존 Docker inspect/image-inspect에는 공통 I/O timeout이 없으므로
+명령 전체가 이 값들의 합 이내에 끝난다는 보장은 아니다.
+
+```bash
+python3 /home/kwung/deploy/bluegreen/bluegreen.py --lock-timeout 30 legacy-zone-evidence \
+  --backend-time-zone REVIEW_TARGET_IANA_ZONE \
+  --legacy-probe-timeout 10 \
+  --legacy-probe-attempts 2
+```
+
+이 명령은 기존 배포 잠금을 보유하고 현재 Legacy 세 앱과 Backend JVM의 증거를 캡처·재검증한 뒤
+정제된 결과만 출력한다. 후보 `prepare`나 비활성 slot drain·제거·컨테이너 생성을 호출하지 않으며,
+state·slot·cutoff/zone pin·성공 proof·history도 쓰지 않는다. 기존 `deploy.lock`을 읽기 전용으로 열어
+같은 OS 배타 잠금을 얻으며 owner/lease metadata를 쓰거나 삭제하지 않는다. 기존 HOME·state·lock이
+없으면 초기화하거나 만들지 않고 실패한다. OS 잠금과 읽기 과정의 파일 접근 시각 변화는 가능하다.
+raw 환경·옵션·property·Docker stderr를 출력하지 않는다. active가 Legacy가 아니거나 미완료
+transaction이 있거나 route/control/state가 맞지 않으면 새 조회로 통과시키지 않는다.
+
+stdout JSON의 최상위 필드는 `status`, 고정 `reason`, 정제된 `evidence`, canonical JSON의
+`evidenceSha256`이다. Legacy 세 앱의 snapshot을 다시 검증한 뒤에만 출력한다.
+
+| `status` | 의미와 다음 단계 | 종료 코드 |
+|---|---|---|
+| `running-jvm` | 실제 jcmd property가 요청과 일치. 증거만 표시하고 준비하지 않음 | 0 |
+| `confirmation-required` | 업무·DB 기록과 검토한 뒤 같은 CID+SHA를 별도 `prepare`에 전달할 수 있음 | 0 |
+| `blocked` | 알려진 불일치·플랫폼 충돌·미해석. SHA는 진단용이며 승인에 사용할 수 없음 | 1 |
+
+전송·형식·PID/identity 오류 등 관측 자체를 신뢰할 수 없는 실패도 종료 코드 1이다. 이때는 부분
+증거를 정상 JSON으로 내보내지 않고 고정 실패 진단만 stderr에 남긴다. 조회 자체는 history를 쓰지 않는다.
+
+실제 jcmd 관측이 요청 zone과 일치해도 **증거 조회만 끝난다**. 자동으로 준비·전환하지 않는다.
+no-attach 확인 대상이면 운영자가 출력의 source별 zone·부분 관측·container identity와 증거 SHA를
+업무·DB 기록과 대조한다. 검토한 container ID와 SHA는 이후 별도의 실제 `prepare`에 전달한다.
+거부 판정이나 probe 실패는 준비 권한이 아니며, 아래 거부 상태 점검 절차를 따른다. 조회 뒤 Legacy나
+관측 입력이 바뀌면 다음 `prepare`의 fresh 검증과 SHA 대조에서 이전 확인이 거부될 수 있다.
+
+`prepare`는 여전히 실제 후보 준비 명령이다. 증거 출력만 보려는 목적으로 `prepare`를 호출하지 않는다.
+조회와 검토를 마친 뒤 이미지·완전한 Secret 후보·cutoff·운영 영향까지 확정한 별도 실행에서 준비한다.
+
 실제 JVM 조회는 **현재 실행 중인 Legacy Backend의 정확한 container ID와 JVM PID**에 묶는다.
-아래는 승인된 점검 시간에 사용할 읽기 전용 조회 예시다. `jcmd`가 있고 JVM과 같은 사용자로
+추가 수동 확인이 필요한 경우 아래는 승인된 점검 시간에 사용할 읽기 전용 조회 예시다. `jcmd`가 있고 JVM과 같은 사용자로
 attach할 수 있을 때 `/proc/*/comm`에서 단일 Java PID를 확인한 뒤 `CONFIRMED_JVM_PID`를 바꿔 실행한다.
 전체 실행 인자를 내보낼 수 있는 `jcmd -l`이나 `/proc/*/environ`·`cmdline` 원문 출력은 사용하지 않는다.
 
@@ -347,6 +403,41 @@ process 입력을 완전히 읽었다면 명시적인 JVM zone과 `TZ`를 우선
 JVM cached clock의 직접 관측이 아니다. 느린 이미지에서 내부 3초가 만료돼도 `unresolved`로 남는다.
 outer `--legacy-probe-timeout`을 늘리는 것으로 이 내부 3초 제한이 늘어나지는 않는다.
 
+#### 플랫폼 충돌·미해석으로 막힌 경우의 점검과 재적용
+
+`legacy-zone-evidence`의 `blocked`와 `reason=platform_conflict` 또는 `localtime_unresolved`는
+운영자 확인값을 더 넣어 통과시킬 상태가 아니다. 현재 구현은 JRE patch를 추정해 파일 우선순위를
+선택하거나, 내용 비교 실패를 곧바로 `GMT`로 간주하지 않는다. 실제 JVM에 캐시된 기준을 확인하지
+않고 다른 요청 zone을 차례로 시도하거나 파일·pin·cutoff를 바꿔 오류를 없애지 않는다.
+
+1. **인프라 담당자**는 승인된 점검에서 evidence 명령의 고정 reason, CID·PID 시작 식별자,
+   process 입력의 읽기 상태, source별 알려진 zone, `localtimeResolution`, 플랫폼 충돌 여부와
+   소요 시간을 기록한다. 실제 환경값·JVM 전체 인자·Secret·DB 자격 증명은 기록하지 않는다.
+   도구 누락·크기 제한·tzdata 차이·내부 3초 초과는 모두 미해석일 수 있으므로 한 원인으로 단정하지 않는다.
+2. **Backend 담당자와 데이터/업무 담당자**는 기존 실행 기록·업무 발생 시각·naive timestamp의 의미와
+   Legacy 앱의 시간대 설정/변경 이력을 대조해 유지해야 할 기준을 결정한다. OS/PC/DB 세션 시각이나
+   서버 지역만으로 기존 JVM의 기록 기준을 선택하지 않는다. 기존 pin이 있으면 그 정책과의 관계도 확인한다.
+3. 현재 JVM에 같은 사용자로 안전하게 attach할 수 있으면 실제 property 관측을 다시 확인할 수 있다.
+   외부에서 새 Java 프로세스를 띄우거나 JRE 버전 문자열만 읽어 현재 프로세스 clock의 증거로 삼지 않는다.
+   `TimeZone.setDefault`·앱 custom clock·과거 기록과 다른 property 가능성은 별도로 검토한다.
+4. 실제 기준을 보존할 수 있지만 현 Legacy의 증거가 계속 불충분하면 **배포 책임자**가 짧은 점검 구간과
+   재기동·되돌림 계획을 확정한다. 기존 dev workflow 동결과 실행/대기 run 취소, 진행 중 업무·연결·큐 및
+   PENDING 영향 확인이 선행한다. 기존 이미지·실제 주입 설정·route/state/journal 기준점을 비공개로 보존한다.
+5. 승인된 점검에서만, 확인한 기존 데이터 기준과 일치하는 명시적 `TZ`/JVM zone 설정을 가진 Legacy
+   이미지를 준비·재생성하는 경로를 택한다. 필요 도구·일치하는 tzdata를 포함한 이미지나 검토한 mount 구성을
+   사용하고 기존 Legacy 앱/배포 모드를 유지하며 충돌한 파일 입력·JVM 옵션을 정합화한다. 증거를 얻기 위해
+   protocol 2 worker를 기존 Legacy와 임의로 동시에 켜지 않는다. 실행 중 컨테이너 파일을 임의 수정하거나 도구를 즉석
+   설치해 진단을 바꾸는 절차가 아니다. 재기동이 기존 잘못된 timestamp를 자동 교정한다고 가정하지 않는다.
+6. 새 CID/PID에 대해 evidence 명령을 다시 실행하고 업무·DB 기준과 대조한다. 이전 SHA는 재사용하지 않는다.
+   `running-jvm` 또는 검토 가능한 `confirmation-required`가 되고 zone/cutoff·Secret·이미지·데이터 선행조건이
+   확인됐을 때만 별도의 실제 `prepare → check → switch`를 수행한다. 자동 workflow 재개는 기존 절차를 따른다.
+
+내부 3초가 만료되는지의 실제 컨테이너 측정은 승인된 점검에서 수행할 운영 검증으로 남아 있다.
+outer timeout을 늘려도 이 기한이나 파일 한도가 늘지 않는다. 기존 기록의 기준이나 안전한 재생성·복구
+경로를 확정할 수 없으면 Legacy 운영을 유지하고 Blue/Green 재적용을 보류한다. `blocked`를 수동 확인으로
+덮거나 DB 시각 일괄 변환·cutoff 재작성으로 우회하지 않는다. 이 문서 보완 과정에서 서버를 점검하거나
+Legacy를 재기동·수정하지 않았다.
+
 zone 이름 발견은 컨테이너의 zoneinfo를 사용하지만, 발견한 이름과 요청값의 alias 동등성은 기존
 controller 호스트의 전체 TZif 규칙 비교를 유지한다. 호스트·컨테이너 tzdata 버전 차이로 alias가
 보수적으로 거부될 가능성까지 제거한 것은 아니다.
@@ -386,7 +477,7 @@ property와 다른 기본값을 만들었다면 그 값을 증명하지 못한�
 pin하지 않으며, 같은 수동 `prepare`에 `--confirm-legacy-time-zone-evidence EVIDENCE_SHA256`도 공급한다.
 실제 jcmd 관측이 요청 zone과 일치하는 경로에는 이 수동 증거 확인을 추가하지 않는다.
 
-승인된 준비 과정에서 확인이 필요하면 controller는 stderr에 `event=legacy_zone_confirmation_required`,
+실제 `prepare`의 승인된 준비 과정에서 확인이 필요하면 controller는 stderr에 `event=legacy_zone_confirmation_required`,
 `evidence`의 정제 요약, `evidenceSha256`을 JSON으로 출력한다. 같은 이름의 private history action에도
 `evidence`·`evidenceSha256`을 남기고 cutoff·zone·proof pin과 비활성 제거·slot 변경 전에 중단한다.
 controller는 companion이 보낸 schema와 canonical SHA를 재검증하고, 임의 exception의 원시 내용을
@@ -409,9 +500,9 @@ PID/start ticks·요청 zone 또는 관측 입력이 달라져 요약이 바뀌�
 SHA는 관측 요약을 특정하는 fingerprint이며 실제 JVM cached/default clock의 직접 관측이나 별도의
 인증 token이 아니다. 새 확인을 얻기 위해 임의의 zone·cutoff·pin 파일을 바꾸지 않는다.
 
-`prepare`는 실제 후보 준비 명령이다. jcmd 증거가 정상인 경우 일반 준비가 계속될 수 있으므로,
-확인 요구를 보기 위한 호출도 승인된 점검·준비 절차 안에서 수행한다. 별도 read-only dry-run 명령으로
-가정해 운영 중에 실행하지 않는다. 이 문서 작성 과정에서는 해당 명령·서버 조회·확인을 수행하지 않았다.
+증거만 보는 호출은 앞의 `legacy-zone-evidence`로 분리한다. `prepare`의 jcmd 관측이 정상인 경우
+실제 준비가 계속되므로, 증거 조회의 대체 명령으로 사용하지 않는다. 이 문서 작성 과정에서는
+어느 명령도 실행하거나 서버를 조회·확인하지 않았다.
 
 실제 jcmd 불일치, 완전한 process 관측의 알려진 불일치·플랫폼 모순과 부분 관측의 `Config.Env` 불일치는
 확인으로 덮을 수 없다. 상위 실효 입력 없는 unresolved localtime·알려진 플랫폼 충돌도 확인으로
@@ -421,8 +512,8 @@ controller가 tool을 자동 설치하거나 새 Java 프로세스를 기동해 
 
 #### Legacy probe의 유한 재시도와 진단
 
-`prepare`의 `--legacy-probe-timeout`은 **정수 6~60초, 기본 10초**이고
-`--legacy-probe-attempts`는 **정수 1~3회, 기본 2회**다. 이 두 옵션은 수동 Legacy 준비용이다.
+`prepare`와 `legacy-zone-evidence`의 `--legacy-probe-timeout`은 **정수 6~60초, 기본 10초**이고
+`--legacy-probe-attempts`는 **정수 1~3회, 기본 2회**다. 이 두 옵션은 수동 Legacy 증거 조회·준비용이다.
 자동 앱 `deploy`는 완료된 bootstrap을 전제로 하며 이 옵션을 새로 받지 않는다. JVM 내부 `jcmd`는 별도로 5초 제한을 유지한다.
 승인된 점검에서 호스트 부하를 확인한 뒤 범위 안에서 outer probe 기한·횟수를 조정하며, timeout을
 없애거나 `--confirm-legacy-time-zone`으로 실패한 probe를 건너뛰지 않는다.
@@ -439,18 +530,19 @@ exec가 즉시 끝난다고 보장하지 않아 다음 시도와 잠시 겹칠 �
 비교를 유지하며 무조건적인 추가 시도를 하지 않는다. probe 전후의 container ID·image·시작 시각과 PID ticks
 확인은 계속 필요하며, 새 컨테이너나 JVM으로 바뀐 상태에서 이전 시도의 증거를 재사용하지 않는다.
 
-실패에는 raw stderr·환경·옵션 대신 `probe_timeout`, `probe_transport_failure`, `probe_command_failed`,
+실제 `prepare` 실패에는 raw stderr·환경·옵션 대신 `probe_timeout`, `probe_transport_failure`, `probe_command_failed`,
 `probe_invalid_result`, `probe_incomplete_or_changed_process` 같은 **고정 코드**를 남긴다. controller는
 불변 cutoff·zone pin 및 비활성 제거 전에 private `history.jsonl`에 `legacy_zone_probe_failed`를 기록하고
 중단한다. `configuredTimeout`·`configuredAttempts`는 설정값이며 실제 시도 횟수로 해석하지 않는다.
 구조화된 helper 오류는 `attemptsKnown=true`와 실제 `attempts`를 기록하고, 일반 검증 실패는
 `code=legacy_zone_validation_failed`, `attemptsKnown=false`로 기록하며 모르는 실제 횟수는 생략한다.
 실패 이력 기록은 의도한 진단 쓰기이고 불변 pin·기존 slot·active/owner를 바꾸는 조치가 아니다.
+`legacy-zone-evidence`는 이 실패 이력이나 성공 proof를 쓰지 않는다.
 
 성공 증거에는 `proof.probe={code: probe_ok, attempts, timeoutSeconds}`를 남겨 몇 번 만에 관측됐는지
 구분한다. 이 진단은 새 공개 endpoint·원시 Docker 출력·비밀 설정 기록을 추가하지 않는다.
 
-세 Legacy 앱의 snapshot을 재검증한 뒤 검증된 `expectedZone`, `verifiedAt`, `origin`, `effectiveZone`,
+실제 `prepare`는 세 Legacy 앱의 snapshot을 재검증한 뒤 검증된 `expectedZone`, `verifiedAt`, `origin`, `effectiveZone`,
 `proof`를 private 0600 `control/backend-time-zone-proof.json`에 기록하고, `history.jsonl`에
 `legacy_backend_time_zone_verified` 이력을 남긴 다음 불변 cutoff와 zone을 pin한다. jcmd 관측은
 `origin=running-jvm`이고, attach 없는 확인은 `origin=operator-confirmed`,
@@ -615,41 +707,112 @@ malformed/중복 결과·둘 이상 일치·daemon 오류·시간 초과도 부�
 자동 workflow 재시도가 잔존 후보를 무조건 안전하게 지운다고 가정하지 않으며, lock/state 삭제나
 이름 기준 `docker rm -f`로 우회하지 않는다.
 
-### Backend 환경 파일 전체 교체
+### Backend: DEV_ Secrets 자동 수집과 전체 환경 교체
 
-Backend workflow는 테스트·이미지 빌드·설치 파일 핀 검증 이후
-`/home/kwung/deploy/ieum-backend/.env`를 검증해 0600 임시 사본으로 만든다.
-누락·symlink·소유자·권한·파일 종류·크기·형식·중복 키를 확인하고 실패하면 배포하지 않는다.
-원본 `.env`는 읽기만 하며 로그에 내용을 출력하지 않는다. 성공·실패 시 임시 파일을 삭제한다.
+Backend 설정 원본은 **`DEV_` 접두사가 붙은 개별 GitHub Secrets**다.
+접두사를 제거하고 기존 RDS 3개·GH 6개 별칭을 적용한다. 예를 들어
+`DEV_RDS_DB_URL`은 `DB_URL`, `DEV_GH_APP_CLIENT_ID`는
+`GITHUB_APP_CLIENT_ID`가 된다. 새 일반 앱 키는 `DEV_NEW_OPTION`처럼 등록하면
+`NEW_OPTION`으로 자동 수집하며 workflow의 개별 매핑·허용 목록을 수정하지 않는다.
+이 저장소의 DEV_ 항목을 앱 설정으로 취급하고 MAIN_/DEVELOPMENT_/DEVX_는 선택하지 않는다.
+접두사는 한 번만 제거하므로 예전에 DEV_BACKEND_RDS_DB_URL을 등록했다면 DEV_RDS_DB_URL로 정리한다.
+
+실제 적용 전에 현재 접두사 없는 이름 대신 필요한 값을 접두사 이름으로 등록한다.
+기존 Secrets를 삭제·복사·변경한 작업은 수행하지 않았다. prefix 없는 값·서버 원본
+`/home/kwung/deploy/ieum-backend/.env`·묶음 BACKEND_ENV·기존 runtime에서 누락값을 채우지 않는다.
+현재 job에 `environment:`는 없으므로 repository 또는 접근을 허용한 organization Secrets를 쓴다.
+
+workflow의 마지막 배포 step은 `IEUM_BACKEND_SECRETS_JSON: ${{ toJSON(secrets) }}`로
+현재 실행이 접근할 수 있는 전체 Secrets를 JSON으로 받는다. GitHub에서 접두사만 내려받는 기능이
+아니며 runner의 해당 단계에는 AWS/Main/자동 토큰도 원본 JSON 안에 일시 존재할 수 있다.
+Backend builder가 접두사만 선택하므로 비선택 항목은 앱 후보·snapshot에 전달하지 않는다.
+
+후보는 매번 `mktemp`로 새로 만든 빈 0600 파일이다. 기존 원본에 append하거나 설정을 합치지 않고
+이번 선택값만으로 처음부터 작성한다. 실패 시 controller 호출 전에 중단하고 활성 설정은 지우지 않는다.
+검증한 후보를 만든 뒤 shell에서 JSON을 unset하고 `--env-file --replace-env`로 배포한다.
+원시 JSON·값은 shell 코드·argv·로그·GITHUB_ENV·빌드 입력·업로드에 넣지 않는다.
+종료·실패·INT·TERM에서 임시 파일을 지우며 SIGKILL·호스트 장애의 trap 정리는 보장하지 않는다.
+
+기존 필수24개는 누락·빈값·공백전용 값이면 거부한다. profile은 누락/빈값이면dev,
+기존 선택7개는 정확한 빈값이면 생략해 앱 기본값을 보존한다. 새 일반 키의 빈값은 `KEY=`로
+보존하고, Secret을 삭제하면 다음 후보에서 제거한다. 새 앱 필수값을 사전 차단하려면 필수 검증은
+별도로 갱신한다. 기존 이름·기본값·32개 초기 이관 목록은 Backend 운영 문서를 따른다.
+
+JSON은 UTF-8 object와 유일한 이름이어야 한다. NaN/Infinity·잘못된 형식·과도한 중첩을 거부한다.
+선택 이름은 원문 ASCII 검사 뒤 대문자 정규화하고 접두사 뒤 환경변수 형식을 검증한다.
+별칭·대소문자·밑줄을 무시한 Spring 등가 이름이 충돌하면 빈값 생략 전에 거부한다.
+접두사 RDS 별칭과 실제 DB 이름을 동시에 등록하지 않는다. 결과는 앱 키 이름순으로 기록한다.
+선택값은 단일 행 literal이며 LF/CR·NUL·줄 구분자를 거부하고 shell 확장·따옴표 제거를 하지 않는다.
+
+controller의 같은 색 Agent 주소(AGENT_SERVICE_URL과IEUM_AGENT_URL), deployment/scheduler namespace,
+queue consumer/cutoff/expected zone, DDL·TZ·종료·관리 endpoint 설정과 등가 이름은 거부한다.
+SPRING_APPLICATION_JSON, JVM 실행 옵션, SPRING_CONFIG_* 외부 설정 유입,
+SPRING_JPA_* vendor DDL 및 SPRING_SQL_INIT_*·SPRING_FLYWAY_*·SPRING_LIQUIBASE_*의
+스키마 변경 설정과 Hikari connection-init SQL/connection-test query도 별도 운영 설정으로 차단한다.
+일반 pool 튜닝 키는 수집한다. 이 경계는 일반 새 앱 키의 자동 수집을 유지하면서
+기동 drain·같은 색 주소·validate 설정의 우회를 방지한다. 전체 예약 키는 실제 도구 원문을 따른다.
+
+원본 **전체 JSON은96KiB**, 선택 후 후보는48KiB로 제한한다. 비선택 Secrets도 원본 한도에 포함된다.
+전체 JSON이 OS/runner 환경변수·프로세스 생성 제한을 넘으면 도구가 시작되기 전에 실패할 수 있고
+그 경우 도구의 고정 오류까지 보장하지 않는다. 서버 원본이나 기존 설정으로 fallback하지 않는다.
+대상은 배포 계정 소유·0600·일반 파일·단일 hardlink·기존 빈 파일이어야 한다. symlink나 공개 파일,
+잘못된 소유권과 이미 내용이 있는 파일은 덮어쓰지 않는다.
 
 ```text
 deploy --service backend --image ... --env-file PRIVATE_CANDIDATE --replace-env
 ```
 
-`--replace-env`는 지정 서비스의 사용자 환경을 완전한 후보 파일로 교체하므로 **원본에서 삭제한
-키도 다음 배포에 반영**된다. 설정 변경과 키 삭제는 원본 private 파일에서 검토한 뒤 전체 파일을
-준비한다. controller가 관리하는 환경별 주소·분산 제어·복구 cutoff·불변 Backend 시간대 등은
-별도 운영 계약으로 설정된다.
+`--replace-env`는 새 후보의 사용자 설정을 전체 교체한다. controller의 같은 색 Agent 주소·분산 제어·
+DDL validate·복구 cutoff·불변 Backend 시간대는 별도 주입한다. 이미지 기본 환경은 계속 적용될 수 있다.
+Secret을 바꾸기만 해서는 실행 중 설정이 바뀌지 않는다. repository·organization Secrets는 run queue
+시점의 값이므로 변경 후 새 run과 이전 대기 run의 적용 순서를 담당자가 확인한다.
 
-전체 교체를 처음 적용하거나 필수 설정을 바꿀 때는 **현재 컨테이너 runtime env와 완전한 후보 파일을
-비교**한다. `.env`에 없고 옛 workflow의 `docker run -e`로만 주입한 키도 전체 교체에서는 사라진다.
-예를 들어 `SPRING_PROFILES_ACTIVE=dev`, `TZ`, JVM 옵션, 서비스 주소가 후보에 필요한지 각각 결정한다.
+색상별 `/home/kwung/deploy/bluegreen/runtime/{blue|green}/backend.env` snapshot은 유지한다.
+이는 수동 원본이 아니라 각 배포의 실행 기록이며 `docker create --env-file`로 사용한다.
+Secrets 수정·새 후보 준비가 active/retained snapshot을 일괄 덮어쓰지 않는다.
+Frontend·Agent만 배포하면 Backend는 기존 snapshot을 재사용하고 rollback도 당시 이미지·설정을 쓴다.
 
-- 현재 컨테이너의 `Config.Env`에서 현재 이미지의 기본 `Config.Env`와 같은 값은 구분한다.
-- 별도 주입된 키 중 후보에 없는 키, 값이 달라지는 키, 새 키를 목록으로 검토한다.
-- 비밀값은 화면·CI 로그·검토 문서에 출력하지 않고 private 파일 안에서 비교한다. 키 이름과 검토 결과만 기록한다.
-- 의도적으로 삭제할 키와 유지해야 할 키를 구분하고 필요한 값은 완전한 후보 `.env`에 포함한다.
-- controller가 강제로 관리하는 키와 image default까지 사용자 설정으로 잘못 복제하지 않는다.
+전체 교체 적용 전에는 현재 runtime과 image default·새 후보를 비공개 환경에서 비교한다.
+키 이름과 결과만 기록하고 값을 출력하지 않는다. 형식·필수값 검사는 실제 DB/OAuth/SMTP 인증의
+유효성을 보장하지 않으며 기능·health 검증이 필요하다. Docker 관리자는 컨테이너 환경을 볼 수 있다.
+접두사 필터는 앱 전달 범위를 줄이며 runner 원본 접근 범위나 관리자 권한을 대체하지 않는다.
+[GitHub Secrets 컨텍스트](https://docs.github.com/en/actions/reference/workflows-and-actions/contexts#secrets-context),
+[toJSON 함수](https://docs.github.com/en/actions/reference/workflows-and-actions/expressions#tojson).
 
-`.env` 문법·권한 검사는 이 의미 비교를 대신하지 않는다. 현재 코드에 profile별 설정이 없더라도
-기존 runtime 설정을 확인하지 않고 profile 키 삭제를 항상 안전하다고 가정하지 않는다.
+### Frontend·Agent: DEV_ 자동 수집과 전체 교체
 
-### Frontend·Agent 환경 overlay
+세 앱은 각자의 저장소에서 `DEV_` Secrets를 수집한다. 접두사는 한 번만 제거하고 서비스별 기존
+별칭·필수값·기본값을 적용한다. 매번 새 private 후보를 만들고 `--replace-env`로 해당 서비스의
+사용자 환경을 전체 교체하므로 삭제한 사용자 키를 옛 snapshot에서 보충하지 않는다.
+Frontend·Agent의 과거 overlay 경로는 이번 변경에서 전체 교체로 바뀐다.
 
-Frontend·Agent는 테스트·빌드 후 private 후보를 만들고 기본 overlay로 전달한다.
-명시한 키만 바꾸고 후보에 없는 키는 기존 배포 값을 유지한다. 이 경로는 키 삭제용 전체 교체가
-아니다. 공용 `.env`를 다른 저장소 배포 중 덮어쓰지 않는다. 변경하지 않는 앱은 배포된 환경 값을
-재사용한다. Frontend `VITE_API_URL`은 이미지 빌드에 포함되므로 env만 바꿔 기존 이미지를 재설정할 수 없다.
+Frontend는 Vite 빌드 시점에 값이 고정된다. private 후보를 한 번 생성해 같은 설정으로 빌드하고
+그 파일을 배포 snapshot에도 전달한다. 빌드·배포 사이 일치 검증용 해시를 확인하며 같은 runner
+권한자가 후보와 해시를 함께 바꾸는 공격까지 막는 별도 신뢰 저장소로 표현하지 않는다.
+runner의 ambient VITE_*와 repository의 .env 파일을 CI 빌드에서 보충하지 않는다.
+로컬 개발의 dotenv 동작은 유지하고 CI 경로에서만 파일 로딩을 격리한다.
+
+`DEV_VITE_API_URL`은 `VITE_API_URL`, 새 `DEV_VITE_NEW_OPTION`은 `VITE_NEW_OPTION`이 된다.
+빌드에는 선택한 VITE_*와 고정 NODE_ENV=production을 전달하고 다른 일반 선택 키는 runtime 후보에
+보존한다. VITE_*는 브라우저 소스에 포함될 수 있으므로 비밀번호·토큰을 넣지 않는다.
+Node 버전·이미지명은 별도 DEV_ CI 메타데이터이며 앱 설정으로 복제하지 않는다.
+HUSKY=0 설치와 production 빌드 정책을 유지한다.
+[Vite 환경변수 문서](https://vite.dev/guide/env-and-mode#env-variables).
+
+Agent는 `DEV_AGENT_MONGODB_URL → MONGODB_URL`처럼 기존 8개 AGENT_ 별칭을 보존하고
+직접 앱 이름과 중복 등록하면 거부한다. 테스트 전용 MongoDB 설정은 테스트 단계에서만 사용하고
+배포 후보에서 제외한다. 새 일반 DEV_ 앱 키는 자동 수집한다. controller가 관리하는
+TINI_KILL_PROCESS_GROUP와 Python·shell·동적 loader의 bootstrap 설정은 보호한다.
+Agent PORT는 controller·Docker 경로와 일치하는 8000을 검증한다.
+
+Agent image의 COPY . .에 repo .env 파일이 섞여 기존값이 살아나지 않게 build context에서 제외한다.
+서버 원본 .env를 읽거나 갱신하지 않는다. 두 서비스의 JSON·값 형식·private 파일 경계·source 스코프·
+실패 cleanup과 이름 이관 목록은 각 저장소의 운영 문서와 실제 workflow/helper를 따른다.
+
+어느 앱만 새로 배포하더라도 다른 앱은 현재 배포 snapshot을 재사용한다. controller의 같은 색상
+주소·분산 제어값은 별도 주입하고, retained rollback은 당시 이미지·컨테이너·설정을 재사용한다.
+전체 교체를 처음 적용하기 전에 기존 runtime과 새 접두사 설정을 private 환경에서 비교한다.
+수집 성공은 실제 DB 연결·브라우저 API·외부 인증 성공을 대신하지 않는다.
 
 ## 7. 장애 전환·rollback·recover
 
@@ -753,7 +916,7 @@ python3 /home/kwung/deploy/bluegreen/bluegreen.py recover --abandon --force
 python3 /home/kwung/deploy/bluegreen/bluegreen.py --lock-timeout 30 deploy \
   --service backend \
   --image ieum-backend-dev:REVIEWED_FORWARD_FIX_SHA \
-  --env-file /home/kwung/deploy/ieum-backend/.env \
+  --env-file "$BACKEND_CANDIDATE_ENV" \
   --replace-env \
   --force
 ```
@@ -891,29 +1054,45 @@ backend_start를 확인해 상실과 관측 불확실성을 구분한다. 불확
 
 ## 9. 검증 기록과 아직 필요한 운영 검증
 
-아래 표에서 **v9 새 로컬 실행**과 **동일 소스의 과거 실행 재사용**을 구분한다. 이번 수정에서는
-Infra controller/helper·테스트·runbook만 바꿨다. Backend 앱·참고·workflow 73개, Frontend 앱·참고·workflow
-14개의 bytes와 이전 증거를 대조해 기존 검증을 재사용한다. 앱 workflow 3개와 수동 운영 workflow는
-이번에 바꾸지 않았다. 다만 controller CLI의 새 evidence SHA 인자를 포함한 계약·shell·YAML은 현재 소스로
-다시 확인했다. 과거 테스트 건수를 새 실행 건수와 합산하지 않는다. 실제 GitHub Actions나 운영 서버의
-결과가 아니다.
+아래 표의 v15 검증은 2026-10-28 현재 소스에서 합성 설정과 모의 외부 서비스를 사용해 새로 실행했다.
+운영 Docker·GitHub Secrets·DB·서버에는 접근하지 않았다. Backend DEV_ 구현은 v14와 같고,
+Frontend·Agent의 수집 도구·테스트·workflow·운영 문서·이미지 제외 규칙과 Frontend Vite 설정을 갱신했다.
+현재 변경과 과거 앱 테스트 기록을 구분하며 과거 건수를 이번 새 실행에 합산하지 않는다.
 
-| 검증 항목 | v9 새 실행 또는 명시한 과거 결과 |
+| v15 현재 검증 | 결과 |
 |---|---|
-| API 전체 테스트 | v6 과거 실행 971개, 실패·오류·건너뜀 0; v9 재실행 아님 |
-| workflow-core 전체 테스트 | v6 과거 실행 544개, 실패·오류·건너뜀 0; v9 재실행 아님 |
-| API + workflow-core 합계 | v6 과거 실행 1515개, 동일 앱 소스 검증 후 재사용 |
-| 실제 Redis/PostgreSQL 통합 테스트 | 위 v6 API 결과에 포함된 과거 12개 통과 |
-| PENDING 관측 저장소 테스트 | 위 v6 API 결과에 포함된 과거 H2 repository 2개 통과 |
-| API bootJar | v6 빌드 성공 artifact의 현재 bytes·SHA 일치 확인; v9 재빌드 아님 |
-| Frontend 기존 검증 재사용 | v5 당시 61개 파일·407개 및 타입/Vite·TypeScript 5개 lint/format 통과; 현재 앱·참고·workflow 14파일 bytes 동일, v9 재실행 아님 |
-| Infra controller·installer·Legacy helper 회귀 | v9 새 실행 193개 통과 (controller 114 + installer 8 + helper 71) |
-| 앱·수동 운영 workflow 및 CLI 계약 검사 | v9 새 실행 79개 통과 (앱 45 + 수동 20 + CLI 11 + 정책 3); CID+evidence SHA 전달 포함, 실제 원격 명령 실행 아님 |
-| 첫 단계 run attempt REST·deadline 검증 | v7 과거 실행 36개 통과 재사용 (앱별 mock 12개, 9000/8999초 경계); workflow bytes 동일, v9 REST mock 재실행 아님 |
-| Backend private env snapshot | v7 과거 실행 13개 시나리오 통과 재사용; workflow bytes 동일, v9 재실행 아님 |
-| 앱·Infra workflow YAML | v9 현재 4개 중복 키·파싱 및 이전 source 비교 통과 |
-| Workflow shell 구문 | v9 새 실행 26개 블록 통과 |
-| 이전 실제 로컬 Nginx HTTP 검증 | 2026-10-20 Frontend 14개 + archive/proxy 15개 통과; installer·현재 frontend Nginx heredoc bytes 동일, v9 HTTP 재실행 아님 |
+| Backend DEV_ 설정·후보·workflow shell 회귀 | 65개 통과; 합성 설정·모의 controller |
+| Frontend DEV_ 설정·빌드/deploy 일치·정리 회귀 | 39개 통과; 합성 Node/Vite·workflow shell 포함 |
+| Agent DEV_ 설정·별칭·테스트 전용 값 분리 회귀 | 51개 통과; 합성 pytest/controller, 실제 DB 연결 아님 |
+| 세 앱 snapshot·개별/동시 교체·다른 앱 재사용·retained rollback | 6개 통과; 실제 builder/파일/controller와 모의 Docker·route·health |
+| 앱·수동 운영 workflow 및 CLI 계약 | 91개 통과 (앱 54 + 수동 20 + CLI 14 + 정책 3) |
+| Frontend 실제 Vite production build | 성공; 합성 public API 값 반영·repository dotenv의 가짜 값 재유입 없음·같은 후보 검증 |
+| Frontend Vite 설정 TypeScript 검사 | tsconfig.node.json 기준 통과 |
+| 앱·Infra workflow YAML | 4개 파싱·중복 키 거부·on 문자열 보존 확인 |
+| Workflow shell 구문 | 현재 28개 run 블록 bash 구문 검사 통과 |
+| Runbook 예시 구문 | 현재 17개 bash/sh 예시 구문 검사 통과; 실제 운영 명령 실행 아님 |
+| Git 변경 경계 | 기존 브랜치·HEAD 유지, staged diff 없음; 커밋·push·원격 조회·서버 적용 없음 |
+
+Frontend 실제 빌드는 로컬에 있던 bundled Node와 cached Vite CLI로 실행했다. 로컬 npx가 없어
+동일 Vite CLI를 직접 호출하는 argv adapter만 사용했으며 설치·네트워크·Docker build는 수행하지 않았다.
+합성 dotenv probe는 finally에서 삭제했다. 이 결과를 실제 GitHub runner·서버 배포 성공으로 표현하지 않는다.
+Agent 앱 pytest·실제 MongoDB 연결과 Backend Java 전체 테스트는 이번 변경에서 재실행하지 않았다.
+
+아래는 이전 검토 문서에 남은 역사적 결과다. **현재 새로 실행하거나 소실된 원시 산출물을 다시
+검증한 결과로 취급하지 않는다.** 임시 작업사본의 누락 추적 소스는 기존 HEAD에서 현재 존재하는
+파일을 덮지 않고 복원했지만, 과거 JUnit XML·bootJar 빌드 산출물은 복원하지 않았다.
+
+| 과거 검증 기록 | 현재 문서에서의 의미 |
+|---|---|
+| v6 API 971 + workflow-core 544 = 1515개 | 과거 통과 기록. 실제 Redis/PostgreSQL 12개·H2 repository 2개 포함; v15 Gradle 실행 아님 |
+| v6 API bootJar | 과거 빌드 성공 기록. 현재 원시 JAR가 없어 bytes·SHA를 재검증했다고 주장하지 않음 |
+| v5 Frontend 61파일·407개 및 TypeScript/Vite/lint | 과거 통과 기록. 관련 소스 동일성을 확인했지만 v15 앱 전체 테스트 재실행 아님; Vite 빌드·설정 TypeScript는 위 새 검증 참조 |
+| v11 Infra controller 134 + installer 8 + Legacy helper 81 = 223개 | 이전 실행 기록. 관련 소스 bytes 동일, v15 새 실행 아님 |
+| v7 run attempt REST·deadline 36개 | 이전 실행 기록. 이번에 실제 원격 REST나 과거 mock 전체를 재실행한 결과 아님 |
+| 2026-10-20 Nginx HTTP 14 + archive/proxy 15 = 29개 | 이전 로컬 HTTP 통과 기록. v15 실제 Nginx 검증 아님 |
+| v12 명시 매핑 32키·합성 테스트 41개 | 이전 방식의 역사적 검증. 현재 접두사 자동 수집 검증으로 대체 |
+| v10 묶음 BACKEND_ENV 후보 37개 | 더 이전 방식의 역사적 검증. 현재 prefix 입력의 성공 근거로 재사용하지 않음 |
+| v7 서버 원본 env snapshot 13개 | 더 이전 방식의 역사적 검증. 현재 개별 Secrets 경로의 성공 근거로 사용하지 않음 |
 
 Frontend의 기존 MSW 검증은 refresh HTTP와 Axios/SSE 401의 single-flight 공유·취소·계정 교체 경계를
 검증한다. 실제 JWT 만료·운영 브라우저 SSE·STOMP 물리 연결 또는 배포 중 인증 장기 연결을 검증한

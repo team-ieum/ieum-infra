@@ -815,6 +815,140 @@ class LegacyTimeZoneTest(unittest.TestCase):
                 zone.validate_legacy_zone(snapshot(), 'UTC', CID, docker, confirmation_evidence=evidence)
             self.assertFalse(docker.calls)
 
+    def test_inspector_reports_actual_jvm_match_without_confirmation_or_raw_identity_strings(self):
+        docker = DockerProbe()
+        result = zone.inspect_legacy_zone(snapshot({'PASSWORD': SECRET}), 'UTC', docker)
+        self.assertEqual(set(result), {'status', 'reason', 'evidence', 'evidenceSha256'})
+        self.assertEqual((result['status'], result['reason']), ('running-jvm', 'observed_jvm_match'))
+        evidence = result['evidence']
+        self.assertEqual(evidence['observedZone'], 'UTC')
+        self.assertEqual(evidence['pid'], 17)
+        self.assertNotIn('probeUnavailableReason', evidence)
+        self.assertNotIn('startupInputs', evidence)
+        self.assertEqual(evidence['imageIdentitySha256'], zone.hashlib.sha256(IMAGE.encode()).hexdigest())
+        encoded = json.dumps(result, sort_keys=True)
+        self.assertNotIn(SECRET, encoded)
+        self.assertNotIn('PASSWORD', encoded)
+        self.assertNotIn(IMAGE, encoded)
+        self.assertNotIn(snapshot()['startedAt'], encoded)
+        self.assertEqual(result['evidenceSha256'], zone.hashlib.sha256(json.dumps(
+            evidence, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode()).hexdigest())
+        self.assertEqual([args[0] for args, _ in docker.calls], ['inspect', 'exec', 'inspect'])
+
+    def test_inspector_actual_jvm_carries_process_ticks_and_preserves_actual_precedence(self):
+        output = startup_probe('ieum-zone-v2|input|etc-localtime|unsupported',
+                               actual='ieum-zone-v1|actual|17|UTC')
+        report = zone.inspect_legacy_zone(snapshot({'TZ': 'Asia/Seoul'}), 'UTC', DockerProbe(output))
+        self.assertEqual(report['status'], 'running-jvm')
+        self.assertEqual(report['evidence']['pidStartTicks'], '123')
+        self.assertEqual(report['evidence']['configured']['status'], 'mismatch')
+        self.assertNotIn('startupInputs', report['evidence'])
+
+    def test_inspector_challenge_is_exactly_the_prepare_challenge_from_one_capture(self):
+        output = startup_probe('ieum-zone-v2|input|cmdline|zone|UTC', environment_read='unavailable')
+        source = snapshot({'PASSWORD': SECRET})
+        docker = DockerProbe(output)
+        report = zone.inspect_legacy_zone(source, 'Asia/Seoul', docker)
+        challenge = self.confirmation(source, 'Asia/Seoul', output)
+        self.assertEqual((report['status'], report['reason']),
+                         ('confirmation-required', 'operator_confirmation_required'))
+        self.assertEqual(report['evidence'], challenge.summary)
+        self.assertEqual(report['evidenceSha256'], challenge.fingerprint)
+        # Fixed pre-v11 preparation challenge for this fixture. Comparing both
+        # current APIs alone would miss a shared accidental fingerprint change.
+        self.assertEqual(report['evidenceSha256'],
+                         '75f08d49679ed75bd6efc23032d95e031e055f2a9b93ec558492379e525b9af6')
+        self.assertEqual(report['evidence']['startupInputs']['observedZones']['cmdline'], ['UTC'])
+        self.assertEqual([args[0] for args, _ in docker.calls], ['inspect', 'exec', 'inspect'])
+        approved = zone.validate_legacy_zone(source, 'Asia/Seoul', CID, DockerProbe(output),
+                                             confirmation_evidence=report['evidenceSha256'])
+        self.assertEqual(approved['origin'], 'operator-confirmed')
+        self.assertEqual(approved['proof']['confirmationSummary'], report['evidence'])
+
+    def test_inspector_returns_blocked_known_evidence_that_cannot_be_confirmed(self):
+        conflict = startup_probe('ieum-zone-v2|input|etc-timezone|zone|UTC',
+                                 'ieum-zone-v2|input|etc-localtime|zone|Asia/Seoul',
+                                 localtime_resolution='resolved')
+        cases = [
+            (snapshot(), 'Asia/Seoul', 'ieum-zone-v1|actual|17|UTC', 'observed_jvm_mismatch'),
+            (snapshot(), 'UTC', startup_probe('ieum-zone-v2|input|etc-localtime|unsupported'), 'localtime_unresolved'),
+            (snapshot(), 'UTC', conflict, 'platform_conflict'),
+            (snapshot(), 'Asia/Seoul', conflict, 'platform_conflict'),
+            (snapshot(), 'UTC', startup_probe('ieum-zone-v2|input|TZ|zone|Asia/Seoul'), 'startup_mismatch'),
+            (snapshot({'TZ': 'Asia/Seoul'}), 'UTC', 'ieum-zone-v1|unavailable|missing_tools', 'configuration_mismatch'),
+            (snapshot({'TZ': 'Asia/Seoul'}), 'UTC', startup_probe(environment_read='unavailable'), 'configuration_mismatch'),
+        ]
+        for source, requested, output, reason in cases:
+            with self.subTest(reason=reason, requested=requested):
+                docker = DockerProbe(output)
+                report = zone.inspect_legacy_zone(source, requested, docker)
+                self.assertEqual((report['status'], report['reason']), ('blocked', reason))
+                self.assertNotIn('error', report)
+                self.assertNotIn('proof', report)
+                self.assertEqual([args[0] for args, _ in docker.calls], ['inspect', 'exec', 'inspect'])
+                with self.assertRaises(RuntimeError) as failure:
+                    zone.validate_legacy_zone(source, requested, CID, DockerProbe(output),
+                                              confirmation_evidence=report['evidenceSha256'])
+                self.assertNotIsInstance(failure.exception, zone.LegacyConfirmationRequired)
+
+    def test_inspector_unresolved_summary_has_explicit_resolution_and_no_missing_inference(self):
+        output = startup_probe('ieum-zone-v2|input|etc-localtime|unsupported')
+        report = zone.inspect_legacy_zone(snapshot({'PASSWORD': SECRET}), 'UTC', DockerProbe(output))
+        startup = report['evidence']['startupInputs']
+        self.assertEqual((startup['status'], startup['localtimeResolution']), ('unresolved', 'unresolved'))
+        self.assertEqual(startup['sourceKinds']['etc-localtime'], ['unsupported'])
+        self.assertNotIn(SECRET, json.dumps(report))
+        self.assertNotIn('GMT', json.dumps(report))
+
+    def test_inspector_distinguishes_higher_explicit_mismatch_from_overridden_platform_conflict(self):
+        output = startup_probe('ieum-zone-v2|input|cmdline|zone|Asia/Seoul',
+                               'ieum-zone-v2|input|etc-timezone|zone|UTC',
+                               'ieum-zone-v2|input|etc-localtime|zone|Asia/Seoul',
+                               localtime_resolution='resolved')
+        report = zone.inspect_legacy_zone(snapshot(), 'UTC', DockerProbe(output))
+        self.assertEqual((report['status'], report['reason']), ('blocked', 'startup_mismatch'))
+        self.assertEqual(report['evidence']['startupInputs']['basis'], 'jvm-startup-properties')
+        accepted = zone.inspect_legacy_zone(snapshot(), 'Asia/Seoul', DockerProbe(output))
+        self.assertEqual(accepted['status'], 'confirmation-required')
+
+    def test_inspector_does_not_approve_or_reuse_changed_observations(self):
+        first = startup_probe('ieum-zone-v2|input|TZ|zone|UTC')
+        report = zone.inspect_legacy_zone(snapshot(), 'UTC', DockerProbe(first))
+        with self.assertRaises(zone.LegacyConfirmationRequired):
+            zone.validate_legacy_zone(snapshot(), 'UTC', None, DockerProbe(first),
+                                      confirmation_evidence=report['evidenceSha256'])
+        changed = first.replace('|process|17|123', '|process|17|124')
+        with self.assertRaises(zone.LegacyConfirmationRequired) as failure:
+            zone.validate_legacy_zone(snapshot(), 'UTC', CID, DockerProbe(changed),
+                                      confirmation_evidence=report['evidenceSha256'])
+        self.assertNotEqual(failure.exception.fingerprint, report['evidenceSha256'])
+
+    def test_inspector_never_returns_an_assessment_for_malformed_or_failed_probe(self):
+        for output in (SECRET, '', startup_probe().replace('ieum-zone-v2|complete', ''),
+                       RuntimeError(SECRET), TimeoutError(SECRET)):
+            with self.subTest(output_type=type(output).__name__), self.assertRaises(zone.LegacyProbeError) as failure:
+                zone.inspect_legacy_zone(snapshot(), 'UTC', DockerProbe(output), probe_attempts=1)
+            self.assertNotIn(SECRET, str(failure.exception))
+            self.assertEqual(failure.exception.attempts, 1)
+
+    def test_inspector_keeps_identity_before_and_after_probe_and_probe_option_bounds(self):
+        for identities in ([{**identity(), 'startedAt': 'changed'}],
+                           [identity(), {**identity(), 'image': 'changed'}]):
+            with self.subTest(identities=identities), self.assertRaises(RuntimeError):
+                zone.inspect_legacy_zone(snapshot(), 'UTC', DockerProbe(identities=identities))
+        for options in ({'probe_timeout': 5}, {'probe_timeout': True}, {'probe_attempts': 4}):
+            docker = DockerProbe()
+            with self.subTest(options=options), self.assertRaises(RuntimeError):
+                zone.inspect_legacy_zone(snapshot(), 'UTC', docker, **options)
+            self.assertFalse(docker.calls)
+
+    def test_inspector_fingerprint_excludes_probe_attempts_and_timeout(self):
+        output = startup_probe('ieum-zone-v2|input|TZ|zone|UTC')
+        first = zone.inspect_legacy_zone(snapshot(), 'UTC', DockerProbe(output), probe_timeout=6, probe_attempts=1)
+        retried = zone.inspect_legacy_zone(snapshot(), 'UTC', DockerProbe([TimeoutError(SECRET), output]),
+                                           probe_timeout=60, probe_attempts=3)
+        self.assertEqual(first, retried)
+
 
 if __name__ == '__main__':
     unittest.main()

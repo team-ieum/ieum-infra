@@ -1,4 +1,5 @@
 import importlib.util
+import contextlib
 import io
 import json
 import os
@@ -1281,6 +1282,270 @@ def validate_legacy_zone(snapshot, requested, confirmation, probe, *, confirmati
              patch.object(bg.subprocess, 'run', return_value=SimpleNamespace(returncode=1, stdout='private-error')):
             with self.assertRaisesRegex(RuntimeError, 'Legacy JVM evidence probe failed'):
                 bg.validate_legacy_time_zone({'containerId': 'a' * 64}, 'UTC', None)
+
+class LegacyEvidenceInspectionTest(unittest.TestCase):
+    SECRET = 'private-evidence-must-never-be-printed'
+    VALIDATE_LEGACY = staticmethod(bg.validate_legacy_time_zone)
+    FORBIDDEN = ('prepare', 'save', 'atomic', 'record', 'invalidate_slot', 'remove_inactive',
+                 'control', 'route', 'init')
+
+    def setUp(self):
+        self.fixture = DeploymentSafetyTest()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.root = self.fixture.root
+        self.infos, self.created, _ = self.fixture.legacy_fixture()
+        backend = self.infos[bg.LEGACY['backend']]
+        backend['Image'] = 'sha256:' + self.SECRET
+        backend['Config']['Env'].append('PRIVATE=' + self.SECRET)
+        bg.atomic(self.root / 'deploy.lock', 'existing-lock-bytes\n')
+        bg.atomic(self.root / 'lock-owner.json', '{"command":"previous-advisory"}\n')
+        bg.atomic(self.root / 'history.jsonl', '{"action":"existing-history"}\n')
+        bg.atomic(self.root / 'control/backend-time-zone-proof.json', '{"old":"proof"}\n')
+
+    def files(self):
+        return {str(path.relative_to(self.root)):
+                ('directory', path.stat().st_mode & 0o7777) if path.is_dir() else
+                ('file', path.stat().st_mode & 0o7777, path.read_bytes())
+                for path in self.root.rglob('*')}
+
+    def report(self, status='running-jvm', reason=None):
+        backend = self.infos[bg.LEGACY['backend']]
+        evidence = {'schemaVersion': 1, 'expectedZone': 'UTC', 'containerId': backend['Id'],
+            'imageIdentitySha256': bg.hashlib.sha256(backend['Image'].encode()).hexdigest(),
+            'containerStartIdentitySha256': bg.hashlib.sha256(backend['State']['StartedAt'].encode()).hexdigest(),
+            'configured': {'status': 'unknown', 'sources': [], 'zones': []}}
+        if status == 'running-jvm' or reason == 'observed_jvm_mismatch':
+            evidence.update(observedZone='UTC' if status == 'running-jvm' else 'Asia/Seoul', pid=17)
+            reason = reason or 'observed_jvm_match'
+        else:
+            evidence['probeUnavailableReason'] = 'missing_tools'
+            reason = reason or ('operator_confirmation_required' if status == 'confirmation-required'
+                                else 'configuration_mismatch')
+        return self.rehash({'status': status, 'reason': reason, 'evidence': evidence})
+
+    def rehash(self, report):
+        report['evidenceSha256'] = bg.hashlib.sha256(json.dumps(report['evidence'], sort_keys=True,
+            separators=(',', ':'), ensure_ascii=True).encode()).hexdigest()
+        return report
+
+    def unavailable_startup(self, status='unresolved', conflict=False):
+        return {'status': status, 'basis': 'platform-files-jdk-version-unspecified', 'zones': [],
+            'processInputsComplete': True, 'reads': {'environment': 'ok', 'cmdline': 'ok'},
+            'localtimeSha256': 'unavailable', 'requestedTzifDigestMatches': False,
+            'sourceKinds': {'etc-localtime': ['unsupported']}, 'observedZones': {},
+            'localtimeResolution': 'unresolved', 'platformInputsConflict': conflict}
+
+    def invoke(self, report=None, *, arguments=None, failure=None, after_probe=None):
+        report = self.report() if report is None else report
+        stdout, stderr = io.StringIO(), io.StringIO()
+        before = self.files()
+        def inspect_evidence(*args, **kwargs):
+            if failure is not None: raise failure
+            if after_probe is not None: after_probe()
+            return report
+        def read_docker(*args):
+            if args[:2] != ('image', 'inspect'):
+                raise AssertionError('Read-only evidence cannot mutate containers')
+            return json.dumps([{'Config': {'Env': ['BASE=default']}}])
+        with contextlib.ExitStack() as stack:
+            forbidden = {name: stack.enter_context(patch.object(bg, name,
+                side_effect=AssertionError('Inspection attempted a deployment mutation'))) for name in self.FORBIDDEN}
+            stack.enter_context(patch.object(bg, 'inspect', side_effect=lambda name: self.infos[name]))
+            docker = stack.enter_context(patch.object(bg, 'docker', side_effect=read_docker))
+            probe = stack.enter_context(patch.object(bg, 'inspect_legacy_time_zone', side_effect=inspect_evidence))
+            stack.enter_context(patch.object(bg.sys, 'stdout', stdout))
+            stack.enter_context(patch.object(bg.sys, 'stderr', stderr))
+            stack.enter_context(patch.object(bg.sys, 'argv', ['bluegreen', '--lock-timeout', '0',
+                'legacy-zone-evidence', *(arguments or [])]))
+            result = bg.main()
+        for method in forbidden.values(): method.assert_not_called()
+        self.assertEqual(self.files(), before)
+        self.assertNotIn(self.SECRET, stdout.getvalue() + stderr.getvalue())
+        self.assertFalse(self.created)
+        return result, stdout.getvalue(), stderr.getvalue(), probe, docker
+
+    def test_actual_jvm_cli_only_reports_evidence_and_preserves_every_file(self):
+        result, stdout, stderr, probe, _ = self.invoke()
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(stdout), self.report())
+        self.assertEqual(stderr, '')
+        self.assertEqual(probe.call_count, 1)
+
+    def test_confirmation_cli_never_pins_absent_zone_or_proof_or_history(self):
+        (self.root / 'control/backend-time-zone').unlink()
+        (self.root / 'control/backend-time-zone-proof.json').unlink()
+        report = self.report('confirmation-required')
+        result, stdout, stderr, _, _ = self.invoke(report, arguments=['--backend-time-zone', 'UTC'])
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(stdout), report)
+        self.assertEqual(stderr, '')
+        self.assertFalse((self.root / 'control/backend-time-zone').exists())
+        self.assertFalse((self.root / 'control/backend-time-zone-proof.json').exists())
+
+    def test_blocked_cli_outputs_diagnostics_and_exits_one_without_mutation(self):
+        for reason in ('configuration_mismatch', 'observed_jvm_mismatch', 'localtime_unresolved', 'platform_conflict'):
+            report = self.report('blocked', reason)
+            if reason in ('localtime_unresolved', 'platform_conflict'):
+                report['evidence']['startupInputs'] = self.unavailable_startup(
+                    'unresolved' if reason == 'localtime_unresolved' else 'mismatch', reason == 'platform_conflict')
+                self.rehash(report)
+            with self.subTest(reason=reason):
+                result, stdout, stderr, _, _ = self.invoke(report)
+                self.assertEqual(result, 1)
+                self.assertEqual(json.loads(stdout), report)
+                self.assertEqual(stderr, '')
+
+    def test_fatal_probe_exception_is_fixed_stderr_without_trusted_json(self):
+        result, stdout, stderr, _, _ = self.invoke(failure=RuntimeError(self.SECRET))
+        self.assertEqual((result, stdout), (1, ''))
+        self.assertEqual(stderr, 'Legacy time-zone evidence unavailable; inspect initialized Legacy state, identity and bounded probe inputs\n')
+
+    def test_snapshot_replacement_suppresses_an_otherwise_valid_report(self):
+        def replace(): self.infos[bg.LEGACY['agent']]['State']['StartedAt'] = 'changed-private-start'
+        result, stdout, stderr, _, _ = self.invoke(after_probe=replace)
+        self.assertEqual((result, stdout), (1, ''))
+        self.assertIn('Legacy time-zone evidence unavailable;', stderr)
+
+    def test_report_is_bound_to_requested_zone_and_captured_backend_identity(self):
+        for key, value in [('expectedZone', 'Asia/Seoul'), ('containerId', 'f' * 64),
+                           ('imageIdentitySha256', 'f' * 64), ('containerStartIdentitySha256', 'f' * 64)]:
+            report = self.report(); report['evidence'][key] = value; self.rehash(report)
+            with self.subTest(key=key):
+                result, stdout, stderr, _, _ = self.invoke(report)
+                self.assertEqual((result, stdout), (1, ''))
+                self.assertIn('unavailable;', stderr)
+
+    def test_nonlegacy_state_rejects_before_container_reads(self):
+        data = bg.state(); data['active'] = 'green'; bg.save(data)
+        result, stdout, _, probe, docker = self.invoke()
+        self.assertEqual((result, stdout), (1, ''))
+        probe.assert_not_called(); docker.assert_not_called()
+
+    def test_uninitialized_home_is_not_created(self):
+        missing = self.root / 'missing-home'
+        with patch.object(bg, 'HOME', missing), patch.object(bg.sys, 'stdout', io.StringIO()) as stdout, \
+             patch.object(bg.sys, 'stderr', io.StringIO()) as stderr, \
+             patch.object(bg.sys, 'argv', ['bluegreen', 'legacy-zone-evidence', '--backend-time-zone', 'UTC']):
+            self.assertEqual(bg.main(), 1)
+        self.assertFalse(missing.exists()); self.assertEqual(stdout.getvalue(), '')
+        self.assertIn('unavailable;', stderr.getvalue())
+
+    def test_missing_existing_lock_is_not_created(self):
+        (self.root / 'deploy.lock').unlink()
+        result, stdout, _, probe, _ = self.invoke()
+        self.assertEqual((result, stdout), (1, ''))
+        self.assertFalse((self.root / 'deploy.lock').exists()); probe.assert_not_called()
+
+    def test_private_malformed_state_is_not_echoed_or_modified(self):
+        (self.root / 'state.json').write_text(self.SECRET)
+        result, stdout, stderr, probe, docker = self.invoke()
+        self.assertEqual((result, stdout), (1, ''))
+        self.assertIn('unavailable;', stderr); probe.assert_not_called(); docker.assert_not_called()
+
+    def test_unfinished_transaction_rejects_without_probe_or_new_records(self):
+        bg.atomic(self.root / 'transaction.json', self.SECRET)
+        result, stdout, _, probe, docker = self.invoke()
+        self.assertEqual((result, stdout), (1, ''))
+        probe.assert_not_called(); docker.assert_not_called()
+
+    def test_cli_forwards_only_requested_zone_and_bounded_probe_options(self):
+        result, _, _, probe, _ = self.invoke(arguments=['--backend-time-zone', 'UTC',
+            '--legacy-probe-timeout', '60', '--legacy-probe-attempts', '3'])
+        self.assertEqual(result, 0)
+        self.assertEqual(probe.call_args.args[1], 'UTC')
+        self.assertEqual(probe.call_args.kwargs, {'probe_timeout': 60, 'probe_attempts': 3})
+
+    def test_cli_cannot_accept_candidate_color_mutation_or_confirmation_flags(self):
+        for arguments in (['blue'], ['--force'], ['--backend-image', 'image'],
+                          ['--confirm-legacy-time-zone', 'a' * 64],
+                          ['--confirm-legacy-time-zone-evidence', 'a' * 64],
+                          ['--legacy-probe-timeout', '61'], ['--legacy-probe-attempts', '0']):
+            with self.subTest(arguments=arguments), patch.object(bg.sys, 'stderr', io.StringIO()), \
+                 patch.object(bg.sys, 'argv', ['bluegreen', 'legacy-zone-evidence', *arguments]), \
+                 patch.object(bg, 'legacy_zone_evidence') as inspect_evidence:
+                with self.assertRaises(SystemExit): bg.main()
+            inspect_evidence.assert_not_called()
+
+    def test_requested_zone_cannot_replace_an_existing_immutable_pin(self):
+        result, stdout, _, probe, docker = self.invoke(arguments=['--backend-time-zone', 'Asia/Seoul'])
+        self.assertEqual((result, stdout), (1, ''))
+        probe.assert_not_called(); docker.assert_not_called()
+
+    def test_inspection_report_schema_rejects_raw_fields_hash_or_status_spoofing(self):
+        for change in ({'rawEnvironment': self.SECRET}, {'evidenceSha256': '0' * 64},
+                       {'reason': self.SECRET}, {'status': 'approved'}):
+            report = self.report(); report.update(change)
+            with self.subTest(fields=list(change)), self.assertRaisesRegex(RuntimeError, 'inspection evidence report is invalid'):
+                bg.sanitized_legacy_evidence_report(report)
+        report = self.report(); report['evidence']['rawArguments'] = self.SECRET; self.rehash(report)
+        with self.assertRaisesRegex(RuntimeError, 'inspection evidence report is invalid'):
+            bg.sanitized_legacy_evidence_report(report)
+        report = self.report('confirmation-required')
+        report['evidence']['configured'] = {'status': 'mismatch', 'sources': ['TZ'], 'zones': ['Asia/Seoul']}
+        self.rehash(report)
+        with self.assertRaisesRegex(RuntimeError, 'inspection evidence report is invalid'):
+            bg.sanitized_legacy_evidence_report(report)
+
+    def test_unresolved_and_actual_inspection_summaries_are_never_confirmation_payloads(self):
+        report = self.report('blocked', 'localtime_unresolved')
+        report['evidence']['startupInputs'] = self.unavailable_startup(); self.rehash(report)
+        self.assertEqual(bg.sanitized_legacy_evidence_report(report), report)
+        for summary in (report['evidence'], self.report()['evidence']):
+            with self.subTest(actual='observedZone' in summary), self.assertRaisesRegex(RuntimeError, 'summary is invalid'):
+                bg.LegacyTimeZoneConfirmationRequired(summary,
+                    bg.hashlib.sha256(json.dumps(summary, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode()).hexdigest())
+
+    def test_read_only_lock_is_exclusive_and_leaves_existing_owner_advisory_untouched(self):
+        before = self.files()
+        with patch.object(bg, 'atomic', side_effect=AssertionError('readonly lock cannot write advisory')), \
+             patch.object(bg.fcntl, 'flock') as flock:
+            with bg.deployment_lock(0, 'legacy-zone-evidence', read_only=True): pass
+        self.assertEqual(flock.call_args.args[1], bg.fcntl.LOCK_EX | bg.fcntl.LOCK_NB)
+        self.assertEqual(self.files(), before)
+
+    def test_busy_read_only_lock_fails_without_probe_or_file_changes(self):
+        with patch.object(bg.fcntl, 'flock', side_effect=BlockingIOError(self.SECRET)):
+            result, stdout, stderr, probe, docker = self.invoke()
+        self.assertEqual((result, stdout), (1, ''))
+        self.assertIn('unavailable;', stderr); probe.assert_not_called(); docker.assert_not_called()
+
+    def test_verified_inspection_challenge_matches_the_later_prepare_validation(self):
+        snapshot = {'containerId': 'a' * 64, 'image': 'sha256:' + self.SECRET,
+                    'startedAt': '2026-10-20T00:00:00Z', 'runtimeEnvironment': {'TZ': 'UTC'}}
+        identity = json.dumps({'id': snapshot['containerId'], 'image': snapshot['image'],
+                               'status': 'running', 'startedAt': snapshot['startedAt']})
+        def observe(function, *args, **kwargs):
+            results = [identity, 'ieum-zone-v1|unavailable|missing_tools', identity]
+            with patch.object(bg.subprocess, 'run', side_effect=lambda *a, **kw:
+                              SimpleNamespace(returncode=0, stdout=results.pop(0))) as run:
+                result = function(snapshot, 'UTC', *args, **kwargs)
+            self.assertEqual([call.kwargs['timeout'] for call in run.call_args_list], [5, 10, 5])
+            return result
+        report = observe(bg.inspect_legacy_time_zone)
+        with self.assertRaises(bg.LegacyTimeZoneConfirmationRequired) as required:
+            observe(self.VALIDATE_LEGACY, None)
+        self.assertEqual(report['status'], 'confirmation-required')
+        self.assertEqual(report['evidence'], required.exception.summary)
+        self.assertEqual(report['evidenceSha256'], required.exception.fingerprint)
+        proof = observe(self.VALIDATE_LEGACY, snapshot['containerId'],
+                        confirmation_evidence=report['evidenceSha256'])
+        self.assertEqual(proof['origin'], 'operator-confirmed')
+        self.assertNotIn(self.SECRET, json.dumps(report))
+
+    def test_verified_actual_probe_reports_match_or_block_without_preparation(self):
+        snapshot = {'containerId': 'a' * 64, 'image': 'sha256:' + self.SECRET,
+                    'startedAt': '2026-10-20T00:00:00Z', 'runtimeEnvironment': {}}
+        identity = json.dumps({'id': snapshot['containerId'], 'image': snapshot['image'],
+                               'status': 'running', 'startedAt': snapshot['startedAt']})
+        for zone, status, reason in [('UTC', 'running-jvm', 'observed_jvm_match'),
+                                     ('Asia/Seoul', 'blocked', 'observed_jvm_mismatch')]:
+            values = [identity, 'ieum-zone-v1|actual|17|' + zone, identity]
+            with self.subTest(zone=zone), patch.object(bg.subprocess, 'run', side_effect=lambda *a, **kw:
+                    SimpleNamespace(returncode=0, stdout=values.pop(0))):
+                report = bg.inspect_legacy_time_zone(snapshot, 'UTC')
+            self.assertEqual((report['status'], report['reason']), (status, reason))
+            self.assertNotIn(self.SECRET, json.dumps(report))
 
 class BackendIsolationTest(unittest.TestCase):
     def setUp(self):

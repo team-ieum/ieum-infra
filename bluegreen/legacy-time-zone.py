@@ -634,23 +634,27 @@ def _confirmation_summary(snapshot, requested, configured, observed, startup):
     return summary
 
 
-def validate_legacy_zone(snapshot, requested_zone, confirmation_id, docker_runner, *,
-                         probe_timeout=PROBE_TIMEOUT, probe_attempts=PROBE_ATTEMPTS,
-                         confirmation_evidence=None):
-    """Return sanitized evidence, or reject before the immutable zone is written.
+def _observed_summary(snapshot, requested, configured, observed):
+    summary = {'schemaVersion': 1, 'expectedZone': requested, 'containerId': snapshot['containerId'],
+               'imageIdentitySha256': hashlib.sha256(snapshot['image'].encode()).hexdigest(),
+               'containerStartIdentitySha256': hashlib.sha256(snapshot['startedAt'].encode()).hexdigest(),
+               'configured': configured, 'observedZone': observed['zone'], 'pid': observed['pid']}
+    if 'process' in observed:
+        summary['pidStartTicks'] = observed['process']['startTicks']
+    return summary
 
-    The running JVM property is preferred. Startup inputs alone can be overridden
-    or cached, so the exact container ID and reviewed evidence SHA-256 are required
-    without that probe. A changed observation invalidates the previous confirmation.
-    A known JVM/startup-input mismatch cannot be confirmed away. When higher
-    process inputs are unavailable, Config.Env supplies a separate conservative
-    check before exact-container operator confirmation may proceed.
+
+def _assess_legacy_zone(snapshot, requested_zone, docker_runner, *,
+                        probe_timeout=PROBE_TIMEOUT, probe_attempts=PROBE_ATTEMPTS,
+                        confirmation_id=None):
+    """Capture once and classify evidence without granting operator approval.
+
+    Both the read-only inspection command and preparation use this path. Invalid
+    transport, process, or identity evidence still raises instead of becoming a
+    displayable or attestable assessment.
     """
     requested = _zone(requested_zone)
     _probe_settings(probe_timeout, probe_attempts)
-    if confirmation_evidence is not None and (not isinstance(confirmation_evidence, str) or
-                                              not re.fullmatch(r'[a-f0-9]{64}', confirmation_evidence)):
-        raise RuntimeError('Legacy time-zone confirmation evidence must be a 64-character SHA-256')
     if not isinstance(snapshot, dict) or not isinstance(snapshot.get('containerId'), str) or \
             not re.fullmatch(r'[a-f0-9]{64}', snapshot['containerId']) or \
             not isinstance(snapshot.get('image'), str) or not snapshot['image'] or \
@@ -674,24 +678,32 @@ def validate_legacy_zone(snapshot, requested_zone, confirmation_id, docker_runne
     proof = {'containerId': snapshot['containerId'], 'image': snapshot['image'],
              'startedAt': before['startedAt'], 'configured': configured, 'probe': observed['probe']}
     if observed['status'] == 'actual':
+        summary = _observed_summary(snapshot, requested, configured, observed)
         if not _observed_matches(observed['zone'], requested):
-            raise RuntimeError('Legacy running JVM time zone differs from the requested backend time zone')
+            return {'status': 'blocked', 'reason': 'observed_jvm_mismatch', 'evidence': summary,
+                    'error': 'Legacy running JVM time zone differs from the requested backend time zone'}
         proof.update(method='jcmd-VM.system_properties', pid=observed['pid'], observedZone=observed['zone'],
                      limitation='user.timezone property does not prove a later application TimeZone.setDefault override')
         if 'process' in observed:
             proof['pidStartTicks'] = observed['process']['startTicks']
-        return {'origin': 'running-jvm', 'effectiveZone': observed['zone'], 'proof': proof}
-    startup = None
-    original_configured = configured
-    if 'inputs' in observed:
-        startup = _startup_inputs(observed, requested)
+        return {'status': 'running-jvm', 'reason': 'observed_jvm_match', 'evidence': summary,
+                'result': {'origin': 'running-jvm', 'effectiveZone': observed['zone'], 'proof': proof}}
+    startup = _startup_inputs(observed, requested) if 'inputs' in observed else None
+    summary = _confirmation_summary(snapshot, requested, configured, observed, startup)
+    if startup is not None:
         if startup['status'] == 'unresolved':
-            raise RuntimeError('Legacy localtime could not be resolved against the container zoneinfo; explicit process time-zone evidence is required')
+            return {'status': 'blocked', 'reason': 'localtime_unresolved', 'evidence': summary,
+                    'error': 'Legacy localtime could not be resolved against the container zoneinfo; explicit process time-zone evidence is required'}
         if startup['status'] == 'mismatch':
-            raise RuntimeError('Legacy process or platform time-zone startup evidence differs from the requested backend time zone')
+            explicit_override = startup['processInputsComplete'] and startup['basis'] in (
+                'jvm-startup-properties', 'process-TZ')
+            reason = 'platform_conflict' if startup['platformInputsConflict'] and not explicit_override else 'startup_mismatch'
+            return {'status': 'blocked', 'reason': reason, 'evidence': summary,
+                    'error': 'Legacy process or platform time-zone startup evidence differs from the requested backend time zone'}
         if not startup['processInputsComplete'] and \
                 any(not _observed_matches(value, requested) for value in configured['zones']):
-            raise RuntimeError('Legacy time-zone configuration differs from the requested backend time zone')
+            return {'status': 'blocked', 'reason': 'configuration_mismatch', 'evidence': summary,
+                    'error': 'Legacy time-zone configuration differs from the requested backend time zone'}
         proof.update(startupInputs=startup, pid=observed['process']['pid'],
                      pidStartTicks=observed['process']['startTicks'])
         # Fully read process inputs supersede Config.Env hints. When one is not
@@ -699,12 +711,52 @@ def validate_legacy_zone(snapshot, requested_zone, confirmation_id, docker_runne
         # JAVA_OPTS is not consumed directly by the JVM and may be launcher-specific.
         configured = startup
     if configured['status'] == 'mismatch':
-        raise RuntimeError('Legacy time-zone configuration differs from the requested backend time zone')
-    challenge = LegacyConfirmationRequired(_confirmation_summary(
-        snapshot, requested, original_configured, observed, startup))
+        return {'status': 'blocked', 'reason': 'configuration_mismatch', 'evidence': summary,
+                'error': 'Legacy time-zone configuration differs from the requested backend time zone'}
+    return {'status': 'confirmation-required', 'reason': 'operator_confirmation_required',
+            'evidence': summary, 'proof': proof, 'requestedZone': requested,
+            'probeUnavailableReason': observed['reason']}
+
+
+def inspect_legacy_zone(snapshot, requested_zone, docker_runner, *,
+                        probe_timeout=PROBE_TIMEOUT, probe_attempts=PROBE_ATTEMPTS):
+    """Return sanitized diagnostic evidence without approving or persisting it.
+
+    Only a confirmation-required result supplies a fingerprint that can be used
+    with the exact container ID during prepare. A blocked result's fingerprint is
+    diagnostic only; it never turns a refusal into operator approval.
+    """
+    assessment = _assess_legacy_zone(snapshot, requested_zone, docker_runner,
+        probe_timeout=probe_timeout, probe_attempts=probe_attempts)
+    summary = assessment['evidence']
+    return {'status': assessment['status'], 'reason': assessment['reason'], 'evidence': summary,
+            'evidenceSha256': hashlib.sha256(json.dumps(
+                summary, sort_keys=True, separators=(',', ':'), ensure_ascii=True).encode()).hexdigest()}
+
+
+def validate_legacy_zone(snapshot, requested_zone, confirmation_id, docker_runner, *,
+                         probe_timeout=PROBE_TIMEOUT, probe_attempts=PROBE_ATTEMPTS,
+                         confirmation_evidence=None):
+    """Return a verified preparation proof or reject before immutable values.
+
+    Read-only inspection and prepare share one capture/classification path, but
+    inspecting never approves evidence. No-attach preparation still needs both
+    the exact captured container ID and the unchanged sanitized evidence SHA-256.
+    """
+    if confirmation_evidence is not None and (not isinstance(confirmation_evidence, str) or
+                                              not re.fullmatch(r'[a-f0-9]{64}', confirmation_evidence)):
+        raise RuntimeError('Legacy time-zone confirmation evidence must be a 64-character SHA-256')
+    assessment = _assess_legacy_zone(snapshot, requested_zone, docker_runner,
+        probe_timeout=probe_timeout, probe_attempts=probe_attempts, confirmation_id=confirmation_id)
+    if assessment['status'] == 'blocked':
+        raise RuntimeError(assessment['error'])
+    if assessment['status'] == 'running-jvm':
+        return assessment['result']
+    challenge = LegacyConfirmationRequired(assessment['evidence'])
     if confirmation_id != snapshot['containerId'] or confirmation_evidence != challenge.fingerprint:
         raise challenge
-    proof.update(method='explicit-container-confirmation', probeUnavailableReason=observed['reason'],
+    proof = assessment['proof']
+    proof.update(method='explicit-container-confirmation', probeUnavailableReason=assessment['probeUnavailableReason'],
                  confirmationId=confirmation_id, confirmationEvidence=challenge.fingerprint,
                  confirmationSummary=challenge.summary)
-    return {'origin': 'operator-confirmed', 'effectiveZone': requested, 'proof': proof}
+    return {'origin': 'operator-confirmed', 'effectiveZone': assessment['requestedZone'], 'proof': proof}
