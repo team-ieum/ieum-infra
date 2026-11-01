@@ -6,7 +6,7 @@ Phoenix UI는 인증이 없으므로 호스트의 `127.0.0.1`에만 바인딩한
 ## 설정
 
 - 공용 Compose: `${HOST_BIND_IP:-127.0.0.1}:${PHOENIX_UI_PORT}:6006`.
-- DEV reset: `HOST_BIND_IP` Secret을 전달하고, 누락·빈 값이면 localhost를 사용한다.
+- DEV deploy: `DEV_COM_HOST_BIND_IP` Secret을 읽고, 누락·빈 값이면 localhost를 사용한다.
 - Main deploy: `AWS_HOST_BIND_IP` Secret을 `HOST_BIND_IP`로 전달한다.
 - 두 workflow 모두 비어 있지 않은 값이 `127.0.0.1`과 다르면 변경 전에 중단한다.
   Redis 등 다른 서비스가 사용하는 공용 Secret의 값도 확인한다. 다른 서비스를 위해 값이 다르면
@@ -16,8 +16,11 @@ Phoenix UI는 인증이 없으므로 호스트의 `127.0.0.1`에만 바인딩한
 
 ## 트레이스를 보존하는 포트 변경
 
-`Reset Green Phoenix`는 기존 초기화 기능을 유지하며 `down -v`로 트레이스 볼륨을 삭제한다.
-포트 바인딩 변경에 이 reset workflow를 사용하지 않는다.
+현재 브랜치의 `phoenix-green-reset.yml`은 이름을 `Deploy DEV Shared Phoenix`로 바꾸고
+`up -d`로 기존 볼륨을 보존한다. 공유 데이터망·기존 프로젝트·볼륨 검증과 앱 배포 잠금을 사용한다.
+예전 커밋의 `Reset Green Phoenix`에는 `down -v`가 있으므로 포트 변경에 사용하지 않는다.
+새 workflow도 최초 네트워크 이동 도구는 아니며, 공용 데이터망 준비가 끝나지 않으면 중단한다.
+전체 DEV Secrets·사전 조건은 [인프라 DEV 설정](dev-infra-secrets.md)을 따른다.
 
 승인된 적용 시 기존 Compose 프로젝트명·env 파일·볼륨명을 먼저 확인하고 설정과 SQLite를 백업한다.
 같은 프로젝트와 env 파일을 사용해 Phoenix 서비스만 다시 생성한다.
