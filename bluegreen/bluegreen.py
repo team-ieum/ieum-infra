@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 import errno
 import fcntl
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -21,6 +22,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 
 HOME = Path(os.environ.get('IEUM_BLUEGREEN_HOME', '/home/kwung/deploy/bluegreen'))
 APPS = ('frontend', 'agent', 'backend')
@@ -29,6 +31,10 @@ IPS = {'blue': {'frontend': '10.10.10.20', 'backend': '10.10.10.21', 'agent': '1
 PORTS = {'frontend': 80, 'agent': 8000, 'backend': 8080}
 HEALTH = {'frontend': '/', 'agent': '/health', 'backend': '/actuator/health/readiness'}
 LEGACY = {a: 'ieum-' + a for a in APPS}
+INSTALLED_HOME = Path('/home/kwung/deploy/bluegreen')
+FRONTEND_POLICY = Path('/etc/nginx/ieum-frontend-deployment.json')
+NGINX_HELPER = '/usr/local/sbin/ieum-bluegreen-nginx'
+FRONTEND_SETTINGS = None
 ROUTE_CONFIG = Path('/etc/nginx/conf.d/ieum-bluegreen.conf')
 ASSETS = Path('/var/lib/ieum-bluegreen/assets')
 JOB_DRAIN_TIMEOUT = 660
@@ -264,7 +270,263 @@ def exists(name):
                           stderr=subprocess.DEVNULL).returncode == 0
 
 def name(color, app):
+    if FRONTEND_SETTINGS is not None and color in IPS and app == 'frontend':
+        return FRONTEND_SETTINGS[color]['containerName']
     return LEGACY[app] if color == 'legacy' else f'ieum-{color}-{app}'
+
+def frontend_settings_text(value):
+    return json.dumps(value, sort_keys=True, separators=(',', ':')) + '\n'
+
+def load_frontend_settings(candidate=None):
+    """All app workflows and recovery commands reuse the same root-owned pin."""
+    global FRONTEND_SETTINGS
+    pin = HOME / 'control/frontend-deployment-sha256'
+    configured = os.path.lexists(FRONTEND_POLICY)
+    if not configured:
+        if candidate is not None or pin.exists():
+            raise RuntimeError('Configure frontend deployment settings before bootstrap; no hardcoded fallback is allowed')
+        return
+    value = json.loads(run('python3', NGINX_HELPER, 'read-frontend'))
+    if not isinstance(value, dict):
+        raise RuntimeError('Frontend deployment policy is unavailable')
+    if candidate is not None:
+        supplied = json.loads(run('python3', NGINX_HELPER, 'validate-frontend', str(candidate)))
+        if supplied != value:
+            raise RuntimeError('Frontend deployment Secrets differ from the pinned topology; plan a migration')
+    digest = hashlib.sha256(frontend_settings_text(value).encode()).hexdigest()
+    if pin.exists() and pin.read_text().strip() != digest:
+        raise RuntimeError('Frontend deployment policy changed; inspect before operating')
+    FRONTEND_SETTINGS = value
+    for color in IPS:
+        IPS[color]['frontend'] = value[color]['ip']
+        if value['version'] == 2:
+            IPS[color]['backend'], IPS[color]['agent'] = value[color]['backendIp'], value[color]['agentIp']
+    return value
+
+def configure_frontend_settings(candidate):
+    value = json.loads(run('python3', NGINX_HELPER, 'validate-frontend', str(candidate)))
+    if os.path.lexists(FRONTEND_POLICY):
+        load_frontend_settings(candidate)
+        pin = HOME / 'control/frontend-deployment-sha256'
+        if not pin.exists():
+            atomic(pin, hashlib.sha256(frontend_settings_text(value).encode()).hexdigest() + '\n')
+        return
+    if (HOME / 'state.json').exists():
+        current = state()
+        if current['active'] != 'legacy' or current.get('slots'):
+            raise RuntimeError('Configure frontend deployment settings before any managed slots are created')
+    if route_color() != 'legacy':
+        raise RuntimeError('Configure frontend deployment settings while Legacy is active')
+    targets = {f'ieum-{color}-{app}' for color in IPS for app in APPS} | \
+        {value[color]['containerName'] for color in IPS}
+    containers = set(docker('ps', '--all', '--no-trunc', '--format', '{{.Names}}').replace(',', '\n').splitlines())
+    if containers & targets:
+        raise RuntimeError('Existing Blue/Green containers require a reviewed topology migration')
+    if value['version'] != 2:
+        raise RuntimeError('New configuration requires separated Blue/Green networks')
+    validate_frontend_network(value)
+    for color in IPS:
+        verify_frontend_runtime_path(color, value)
+    if HOME != INSTALLED_HOME:
+        raise RuntimeError('Frontend configuration requires the installed deployment directory')
+    delivery = HOME / 'frontend-deployment-candidate.json'
+    try:
+        atomic(delivery, frontend_settings_text(value))
+        run('sudo', '-n', NGINX_HELPER, 'configure-frontend')
+        load_frontend_settings(candidate)
+        atomic(HOME / 'control/frontend-deployment-sha256',
+               hashlib.sha256(frontend_settings_text(value).encode()).hexdigest() + '\n')
+    finally:
+        delivery.unlink(missing_ok=True)
+
+def runtime_env_file(color, app):
+    if app == 'frontend' and FRONTEND_SETTINGS is not None:
+        return Path(FRONTEND_SETTINGS[color]['envFile'])
+    return HOME / 'runtime' / color / (app + '.env')
+
+def verify_frontend_runtime_path(color, settings=None):
+    settings = FRONTEND_SETTINGS if settings is None else settings
+    if settings is None:
+        return
+    path = Path(settings[color]['envFile'])
+    if HOME / 'runtime' not in path.parents or '..' in path.parts:
+        raise RuntimeError('Frontend environment path is outside the deployment runtime')
+    directory = HOME
+    for part in ('', *path.parent.relative_to(HOME).parts):
+        if part: directory = directory / part
+        relative = str(directory.relative_to(HOME))
+        try:
+            metadata = directory.lstat()
+        except FileNotFoundError:
+            return
+        except OSError:
+            raise RuntimeError('Unable to verify frontend runtime directory: ' + relative) from None
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
+            raise RuntimeError('Frontend runtime directory must be private and owned by the deployment account: ' + relative)
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError:
+        raise RuntimeError('Unable to verify frontend runtime file: ' + str(path.relative_to(HOME))) from None
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid() or \
+            metadata.st_mode & 0o077 or metadata.st_nlink != 1:
+        raise RuntimeError('Frontend runtime file must be private and owned by the deployment account: ' + str(path.relative_to(HOME)))
+
+def write_runtime_env(color, app, content):
+    path = runtime_env_file(color, app)
+    if app == 'frontend' and FRONTEND_SETTINGS is not None:
+        verify_frontend_runtime_path(color)
+        # Never follow a symlinked runtime directory or replace a public/foreign file.
+        base = HOME / 'runtime'
+        if base not in path.parents:
+            raise RuntimeError('Frontend environment path is outside the deployment runtime')
+        directory = HOME
+        for part in path.parent.relative_to(HOME).parts:
+            directory = directory / part
+            directory.mkdir(mode=0o700, exist_ok=True)
+            metadata = directory.lstat()
+            if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
+                raise RuntimeError('Frontend runtime directory must be private and owned by the deployment account')
+        if os.path.lexists(path):
+            metadata = path.lstat()
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid() or \
+                    metadata.st_mode & 0o077 or metadata.st_nlink != 1:
+                raise RuntimeError('Frontend runtime file must be private and owned by the deployment account')
+    atomic(path, content)
+    return path
+
+def validate_frontend_network(settings=None, colors=('blue', 'green'), replaceable=frozenset()):
+    settings = FRONTEND_SETTINGS if settings is None else settings
+    if settings is None:
+        return
+    if settings.get('version') == 2:
+        return validate_split_networks(settings, colors=colors, replaceable=replaceable)
+    try:
+        network = json.loads(docker('network', 'inspect', settings['network']))
+        expected = settings['subnet']
+        if not isinstance(network, list) or len(network) != 1 or network[0].get('Driver') != 'bridge' or \
+                [item.get('Subnet') for item in network[0]['IPAM']['Config'] if ':' not in item.get('Subnet', '')] != [expected] or \
+                any(item.get('Gateway') == settings[color]['ip']
+                    for item in network[0]['IPAM']['Config'] for color in IPS):
+            raise ValueError()
+        endpoints = network[0].get('Containers') or {}
+        if not isinstance(endpoints, dict): raise ValueError()
+        targets = {ipaddress.IPv4Address(address) for color in colors
+                   for address in (settings[color]['ip'], IPS[color]['backend'], IPS[color]['agent'])}
+        for endpoint in endpoints.values():
+            container_name = endpoint['Name']
+            if not isinstance(container_name, str) or not container_name: raise ValueError()
+            address = ipaddress.IPv4Interface(endpoint['IPv4Address']).ip
+            if address in targets and container_name not in replaceable:
+                raise ValueError()
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise RuntimeError('Configured Docker network/subnet does not match the existing bridge network') from None
+
+def split_networks():
+    return FRONTEND_SETTINGS is not None and FRONTEND_SETTINGS.get('version') == 2
+
+def app_network(color):
+    if split_networks(): return FRONTEND_SETTINGS[color]['network']
+    return FRONTEND_SETTINGS['network'] if FRONTEND_SETTINGS else 'ieum_net_green'
+
+def data_store_name(store):
+    if split_networks(): return FRONTEND_SETTINGS['data']['stores'][store]
+    return {'postgres': 'ieum-postgres', 'redis': 'ieum-redis', 'mongo': 'ieum-mongo'}[store]
+
+def validate_split_networks(settings, colors=('blue', 'green'), replaceable=frozenset(), require_data_only=False):
+    """Read-only checks before any candidate removal; never create/migrate a network."""
+    try:
+        versions = docker('version', '--format', '{{.Client.APIVersion}} {{.Server.APIVersion}}').split()
+        if len(versions) != 2 or any(not re.fullmatch(r'[0-9]+\.[0-9]+', v) or tuple(map(int, v.split('.'))) < (1, 48) for v in versions):
+            raise ValueError()
+        definitions = [('data', settings['data'])] + [(color, settings[color]) for color in colors]
+        observed = {}
+        for key, definition in definitions:
+            values = json.loads(docker('network', 'inspect', definition['network']))
+            if not isinstance(values, list) or len(values) != 1:
+                raise ValueError()
+            network = values[0]
+            if network.get('Name') != definition['network'] or network.get('Driver') != 'bridge' or \
+                    [item.get('Subnet') for item in network['IPAM']['Config'] if ':' not in item.get('Subnet', '')] != [definition['subnet']]:
+                raise ValueError()
+            endpoints = network.get('Containers') or {}
+            if not isinstance(endpoints, dict): raise ValueError()
+            for cid, endpoint in endpoints.items():
+                if not re.fullmatch(r'[a-f0-9]{64}', cid) or not isinstance(endpoint.get('Name'), str) or not endpoint['Name']:
+                    raise ValueError()
+                address = ipaddress.IPv4Interface(endpoint['IPv4Address'])
+                if address.network != ipaddress.IPv4Network(definition['subnet']): raise ValueError()
+            if key != 'data':
+                if network.get('Internal') is not False:
+                    raise ValueError()
+                targets = {ipaddress.IPv4Address(definition[k]) for k in ('ip', 'backendIp', 'agentIp')}
+                if any(ipaddress.IPv4Address(item['Gateway']) in targets for item in network['IPAM']['Config'] if item.get('Gateway')):
+                    raise ValueError()
+                for endpoint in endpoints.values():
+                    if ipaddress.IPv4Interface(endpoint['IPv4Address']).ip in targets and endpoint['Name'] not in replaceable:
+                        raise ValueError()
+            observed[key] = network
+        data_name = settings['data']['network']; data_endpoints = observed['data'].get('Containers') or {}
+        frontend_names = {settings[c]['containerName'] for c in ('blue', 'green')}
+        if any(endpoint['Name'] in frontend_names for endpoint in data_endpoints.values()): raise ValueError()
+        phase_file = HOME / 'control/phase'
+        phase = phase_file.read_text().strip() if phase_file.exists() else 'legacy'
+        if phase not in {'legacy', 'ready'}: raise ValueError()
+        stores = {}
+        for store, container_name in settings['data']['stores'].items():
+            info = inspect(container_name)
+            cid = info['Id']; attached = info['NetworkSettings']['Networks']
+            if not re.fullmatch(r'[a-f0-9]{64}', cid) or info['Name'] != '/' + container_name or info['State']['Status'] != 'running' or \
+                    cid not in data_endpoints or data_endpoints[cid]['Name'] != container_name or data_name not in attached:
+                raise ValueError()
+            address = attached[data_name]['IPAddress']
+            if str(ipaddress.IPv4Interface(data_endpoints[cid]['IPv4Address']).ip) != address: raise ValueError()
+            if (require_data_only or phase == 'ready') and set(attached) != {data_name}:
+                raise RuntimeError('Shared datastore containers must use only the data network; finish the reviewed Legacy network migration')
+            stores[store] = {'name': container_name, 'ip': address}
+        return stores
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise RuntimeError('Split network preflight failed; verify Docker API 1.48+, bridge/subnets, IP occupancy and shared datastore attachments') from None
+
+def validate_data_environment(environments, stores):
+    if not split_networks(): return
+    def endpoint(value, kind):
+        if not isinstance(value, str): raise ValueError()
+        if kind == 'postgres':
+            if not value.startswith('jdbc:postgresql://'): raise ValueError()
+            parsed = urllib.parse.urlsplit(value[5:])
+        elif kind == 'mongo':
+            parsed = urllib.parse.urlsplit(value)
+            if parsed.scheme != 'mongodb': raise ValueError()
+        else:
+            return value
+        if not parsed.hostname or ',' in parsed.netloc.rsplit('@', 1)[-1]: raise ValueError()
+        return parsed.hostname
+    try:
+        for app, key, store in [('backend', 'DB_URL', 'postgres'), ('backend', 'REDIS_HOST', 'redis'),
+                                ('backend', 'MONGO_URI', 'mongo'), ('agent', 'MONGODB_URL', 'mongo')]:
+            host = endpoint(environments[app].get(key), store)
+            if host.lower() not in {stores[store]['name'].lower(), stores[store]['ip']}:
+                raise ValueError()
+    except (AttributeError, KeyError, TypeError, ValueError):
+        raise RuntimeError('Application datastore settings must target the shared data-network containers; values were not logged') from None
+
+def validate_slot_networks(color):
+    if not split_networks(): return
+    data = FRONTEND_SETTINGS['data']['network']; primary = FRONTEND_SETTINGS[color]['network']
+    environments = {}
+    for app in APPS:
+        info = inspect(name(color, app)); attached = info['NetworkSettings']['Networks']
+        expected = {primary} if app == 'frontend' else {primary, data}
+        if set(attached) != expected or attached[primary]['IPAddress'] != IPS[color][app] or attached[primary].get('GwPriority') != 0 or \
+                (app != 'frontend' and attached[data].get('GwPriority') != -1):
+            raise RuntimeError('Application network attachments do not match the pinned color/data topology')
+        environments[app] = dict(item.split('=', 1) for item in info['Config'].get('Env', []))
+    if environments['agent'].get('BACKEND_BASE_URL') != base(color, 'backend'):
+        raise RuntimeError('Agent backend URL does not match its environment')
+    validate_data_environment(environments, validate_split_networks(FRONTEND_SETTINGS, colors=(), replaceable=frozenset()))
+
 
 def atomic(path, value, mode=0o600):
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -657,6 +919,7 @@ def control(color, action=None):
                               timeout=30 if action else 5)[1])
 
 def check(color, timeout=120):
+    validate_slot_networks(color)
     deadline = time.monotonic() + timeout
     pending = set(APPS)
     while pending and time.monotonic() < deadline:
@@ -801,7 +1064,7 @@ def env_values(app, snapshot, active, override=None, replace=False):
     if active == 'legacy':
         values = dict(snapshot['environment'])
     else:
-        path = HOME / 'runtime' / active / (app + '.env')
+        path = runtime_env_file(active, app)
         if path.exists():
             values = read_env(path)
         else:
@@ -930,6 +1193,149 @@ def cleanup_candidate_containers(color, created, unidentified=None):
         results.append(outcome)
     return {'complete': all(item['removed'] for item in results), 'containers': results}
 
+def stale_slot_command(*args):
+    try:
+        result = subprocess.run(['docker', *args], text=True, capture_output=True, timeout=CANDIDATE_DOCKER_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError('command_timeout') from None
+    except (OSError, subprocess.SubprocessError):
+        raise RuntimeError('docker_unavailable') from None
+    if result.returncode or not isinstance(result.stdout, str):
+        raise RuntimeError('docker_operation_failed')
+    return result.stdout
+
+def stale_slot_ids(output):
+    identities = output.splitlines()
+    if any(not re.fullmatch(r'[a-f0-9]{64}', identity) for identity in identities) or len(set(identities)) != len(identities):
+        raise RuntimeError('inventory_unverified')
+    return set(identities)
+
+def stale_slot_identity(color, app, identity):
+    try:
+        result = json.loads(stale_slot_command('inspect', identity))
+        if not isinstance(result, list) or len(result) != 1: raise ValueError()
+        info = result[0]
+        labels = info['Config'].get('Labels', {}) or {}
+        container_name = f'ieum-{color}-{app}'
+        if info['Id'] != identity or info['Name'] != '/' + container_name or \
+                labels.get('ieum.bluegreen.managed') != 'true' or labels.get('ieum.bluegreen.color') != color or \
+                info['State']['Running'] is not False or info['State']['Status'] not in ('exited', 'created') or \
+                info['HostConfig']['RestartPolicy']['Name'] != 'no' or \
+                not re.fullmatch(r'sha256:[a-f0-9]{64}', info['Image']):
+            raise ValueError()
+        return {'color': color, 'app': app, 'name': container_name, 'id': identity,
+                'image': info['Image'], 'status': info['State']['Status']}
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        raise RuntimeError('identity_unverified') from None
+
+def stale_slot_plan():
+    try:
+        if os.path.lexists(FRONTEND_POLICY) or os.path.lexists(HOME / 'control/frontend-deployment-sha256') or \
+                os.path.lexists(HOME / 'transaction.json'):
+            raise ValueError()
+        slots = None
+        if os.path.lexists(HOME / 'state.json'):
+            raw = json.loads((HOME / 'state.json').read_text())
+            if not isinstance(raw, dict) or not isinstance(raw.get('slots', {}), dict) or \
+                    any(not isinstance(slot, dict) for slot in raw.get('slots', {}).values()):
+                raise ValueError()
+            data = state()
+            if data['active'] != 'legacy' or not isinstance(data.get('slots', {}), dict) or set(data.get('slots', {})) - set(IPS):
+                raise ValueError()
+            slots = {}
+            for color, slot in data.get('slots', {}).items():
+                status, release = slot['status'], slot.get('release')
+                if status not in ('active', 'retained', 'candidate', 'preparing', 'failed', 'isolated', 'unavailable') or \
+                        release is not None and (not isinstance(release, str) or not re.fullmatch(r'[a-f0-9]{16}', release)):
+                    raise ValueError()
+                slots[color] = {'status': status, 'release': release}
+        for file, disallowed in [('active', lambda value: value != 'legacy'), ('phase', lambda value: value == 'ready')]:
+            path = HOME / 'control' / file
+            if os.path.lexists(path) and disallowed(path.read_text().strip()): raise ValueError()
+        if route_color() != 'legacy': raise ValueError()
+    except (AttributeError, KeyError, OSError, TypeError, ValueError, RuntimeError):
+        raise RuntimeError('Stale slot retirement preconditions could not be verified') from None
+    containers, identities = [], set()
+    for color in sorted(IPS):
+        for app in sorted(APPS):
+            matching = stale_slot_ids(stale_slot_command('ps', '--all', '--no-trunc', '--filter',
+                'name=^/' + f'ieum-{color}-{app}' + '$', '--format', '{{.ID}}'))
+            if len(matching) > 1 or identities & matching:
+                raise RuntimeError('inventory_unverified')
+            for identity in matching:
+                containers.append(stale_slot_identity(color, app, identity))
+            identities.update(matching)
+    managed = stale_slot_ids(stale_slot_command('ps', '--all', '--no-trunc', '--filter',
+        'label=ieum.bluegreen.managed=true', '--format', '{{.ID}}'))
+    if managed != identities:
+        raise RuntimeError('inventory_unverified')
+    return {'schemaVersion': 1, 'containers': containers, 'stateSlots': slots}
+
+def retire_stale_slots(confirm_plan=None):
+    try:
+        plan = stale_slot_plan()
+    except RuntimeError:
+        raise RuntimeError('Unable to verify stale slot retirement plan') from None
+    canonical = json.dumps(plan, sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+    digest = hashlib.sha256(canonical.encode()).hexdigest()
+    if confirm_plan is None or confirm_plan != digest:
+        print(json.dumps({'plan': plan, 'planSha256': digest}, sort_keys=True, separators=(',', ':'), ensure_ascii=True))
+        return 0 if confirm_plan is None else 1
+    try:
+        original = (HOME / 'state.json').read_text() if plan['stateSlots'] is not None else None
+    except OSError:
+        raise RuntimeError('Unable to preserve stale slot state before retirement') from None
+    outcomes = [{'id': item['id'], 'name': item['name'], 'removed': False, 'reason': 'not_attempted'}
+                for item in plan['containers']]
+    results = {item['id']: item for item in outcomes}
+    ordered = sorted(plan['containers'], key=lambda item: (item['color'], tuple(reversed(APPS)).index(item['app'])))
+    try:
+        for item in ordered:
+            outcome = results[item['id']]
+            try:
+                if stale_slot_identity(item['color'], item['app'], item['id']) != item:
+                    raise RuntimeError('identity_changed')
+                stale_slot_command('rm', item['id'])
+                outcome.update(removed=True, reason='removed')
+            except RuntimeError as failure:
+                outcome['reason'] = str(failure)
+                raise
+        try:
+            remaining = stale_slot_ids(stale_slot_command('ps', '--all', '--no-trunc', '--format', '{{.ID}}'))
+        except RuntimeError:
+            for outcome in outcomes: outcome['reason'] = 'absence_unverified'
+            raise
+        retained = remaining & set(results)
+        if retained:
+            for identity in retained: results[identity].update(removed=False, reason='still_present')
+            raise RuntimeError('absence_unverified')
+    except RuntimeError:
+        try: record('stale_slots_retire_failed', containers=outcomes)
+        except OSError:
+            raise RuntimeError('Unable to record stale slot retirement failure; inspect state and containers') from None
+        raise RuntimeError('Stale slot retirement failed; state was preserved; inspect the retirement history') from None
+    archive = None
+    try:
+        if original is not None:
+            archive = HOME / 'retired-slots' / (str(time.time_ns()) + '.json')
+            atomic(archive, original)
+            data = state()
+            data['slots'] = {}; data['previous'] = None
+            save(data)
+    except (AttributeError, KeyError, OSError, TypeError, ValueError):
+        for outcome in outcomes: outcome['reason'] = 'state_finalization_failed'
+        try: record('stale_slots_retire_failed', containers=outcomes)
+        except OSError:
+            raise RuntimeError('Unable to record stale slot retirement failure; inspect state and containers') from None
+        raise RuntimeError('Stale slot retirement state finalization failed; inspect state archive and history') from None
+    try:
+        record('stale_slots_retired', containers=[{key: item[key] for key in ('id', 'name', 'image')}
+               for item in plan['containers']], stateArchive=str(archive) if archive is not None else None)
+    except OSError:
+        raise RuntimeError('Unable to record completed stale slot retirement; inspect state archive and containers') from None
+    print('Stale Blue/Green slots retired; Legacy services are unchanged')
+    return 0
+
 def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_not_before=None, force=False,
             backend_zone=None, legacy_zone_confirmation=None, legacy_zone_evidence=None,
             legacy_probe_timeout=DEFAULT_LEGACY_PROBE_TIMEOUT,
@@ -948,6 +1354,8 @@ def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_no
         raise RuntimeError('Environment changes require an explicit image deployment of the same service')
     if replace_env and not env_overrides:
         raise RuntimeError('--replace-env requires --env-file')
+    stores = validate_frontend_network(colors=(color,), replaceable={name(color, app) for app in APPS})
+    verify_frontend_runtime_path(color)
     snapshots = capture_legacy_snapshot() if data['active'] == 'legacy' else {
         app: {'image': inspect(name(data['active'], app))['Image']} for app in APPS}
     images = {app: json.loads(docker('image', 'inspect', overrides.get(app, snapshots[app]['image'])))[0]
@@ -960,6 +1368,7 @@ def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_no
         replace=replace_env and app in env_overrides) for app in APPS}
     if any('\n' in value or '\r' in value for env in environments.values() for value in env.values()):
         raise RuntimeError('Multiline environment values require an explicit deployment configuration')
+    validate_data_environment(environments, stores)
     configured_cutoff = environments['backend'].get('IEUM_WORKFLOW_QUEUE_PENDING_RECOVERY_NOT_BEFORE')
     if recovery_not_before and configured_cutoff and normalized_cutoff(recovery_not_before) != normalized_cutoff(configured_cutoff):
         raise RuntimeError('CLI and backend environment specify different pending recovery cutoffs')
@@ -997,6 +1406,7 @@ def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_no
             env = environments[app]
             if app == 'agent':
                 env['TINI_KILL_PROCESS_GROUP'] = '1'
+                if split_networks(): env['BACKEND_BASE_URL'] = base(color, 'backend')
             if app == 'backend':
                 env.pop('IEUM_WORKFLOW_QUEUE_CONSUMER_NAME', None)
                 env.setdefault('DB_POOL_MAX_SIZE', '35')
@@ -1009,12 +1419,11 @@ def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_no
                     'IEUM_SCHEDULER_AUTO_STARTUP': 'false', 'SPRING_JPA_HIBERNATE_DDL_AUTO': 'validate',
                     'SERVER_SHUTDOWN': 'graceful', 'SPRING_LIFECYCLE_TIMEOUT_PER_SHUTDOWN_PHASE': '600s',
                     'MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE': 'health,deployment'})
-            envfile = HOME / 'runtime' / color / (app + '.env')
             if any('\n' in v or '\r' in v for v in env.values()):
                 raise RuntimeError('Multiline environment values require an explicit deployment configuration')
-            atomic(envfile, ''.join(k + '=' + v + '\n' for k, v in env.items()))
+            envfile = write_runtime_env(color, app, ''.join(k + '=' + v + '\n' for k, v in env.items()))
             args = ['create', '--init', '--name', name(color, app), '--restart', 'unless-stopped',
-                    '--network', 'ieum_net_green', '--ip', IPS[color][app],
+                    '--network', app_network(color), '--ip', IPS[color][app],
                     '--label', 'ieum.bluegreen.managed=true', '--label', 'ieum.bluegreen.color=' + color,
                     '--log-opt', 'max-size=10m', '--log-opt', 'max-file=5',
                     '--stop-timeout', str(STOP_TIMEOUT), '--env-file', str(envfile)]
@@ -1025,6 +1434,8 @@ def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_no
                 raise RuntimeError('Created candidate container ID could not be pinned')
             created.append({**pending_creation, 'id': container_id})
             pending_creation = None
+            if split_networks() and app in ('backend', 'agent'):
+                docker('network', 'connect', '--gw-priority', '-1', FRONTEND_SETTINGS['data']['network'], container_id)
             docker('start', container_id)
         details = check(color)
         if not details.get('draining') or not details.get('schedulerStandby'):
@@ -1270,20 +1681,21 @@ def rollback(expected_release, force=False):
     else: switch(previous)
 
 def pg(sql):
-    return run('docker', 'exec', 'ieum-postgres', 'sh', '-c',
+    return run('docker', 'exec', data_store_name('postgres'), 'sh', '-c',
         'exec psql -X -A -t -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "$1"', 'sh', sql)
 
 def finish_bootstrap():
     data = state()
     if data['active'] == 'legacy': raise RuntimeError('Switch to a healthy enhanced environment first')
     if (HOME / 'control/phase').read_text().strip() == 'ready':
+        if split_networks(): validate_split_networks(FRONTEND_SETTINGS, colors=(), require_data_only=True)
         print('Already migrated'); return
     # The legacy application has in-memory events and a fixed queue consumer. Never overlap its
     # background workers with distributed workers. Wait for its requests and durable jobs to finish.
     deadline = time.monotonic() + 180
     while time.monotonic() < deadline:
         jobs = int(pg("select count(*) from workflow_runs where status in ('PENDING','RUNNING')"))
-        queue = int(docker('exec', 'ieum-redis', 'redis-cli', '--raw', 'XLEN', 'ieum:exec:jobs'))
+        queue = int(docker('exec', data_store_name('redis'), 'redis-cli', '--raw', 'XLEN', 'ieum:exec:jobs'))
         active_connections = 0
         for app, port in (('backend', 8080), ('agent', 8000)):
             if not exists(LEGACY[app]) or inspect(LEGACY[app])['State']['Status'] != 'running': continue
@@ -1298,7 +1710,9 @@ def finish_bootstrap():
     for app in ('backend', 'agent', 'frontend'):
         if exists(LEGACY[app]) and inspect(LEGACY[app])['State']['Status'] == 'running':
             docker('stop', '--time', str(STOP_TIMEOUT), LEGACY[app])
-    docker('exec', 'ieum-redis', 'redis-cli', 'SET', 'ieum:deployment:mode', 'distributed-v1')
+    if split_networks():
+        validate_split_networks(FRONTEND_SETTINGS, colors=(), require_data_only=True)
+    docker('exec', data_store_name('redis'), 'redis-cli', 'SET', 'ieum:deployment:mode', 'distributed-v1')
     atomic(HOME / 'control/phase', 'ready\n', 0o644)
     deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
@@ -1339,6 +1753,10 @@ def main():
                         help='Maximum seconds to wait for the deployment lock (0..14400; deploy default 14400, other commands 600)')
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('init'); sub.add_parser('status'); sub.add_parser('finish-bootstrap')
+    p = sub.add_parser('retire-stale-slots', help='Plan or confirm removal of stopped pre-pin Blue/Green slots')
+    p.add_argument('--confirm-plan', type=legacy_confirmation_evidence, metavar='SHA256')
+    p = sub.add_parser('configure-frontend', help='Pin approved frontend deployment Secrets before bootstrap')
+    p.add_argument('--settings-file', required=True)
     p = sub.add_parser('legacy-zone-evidence', help='Inspect current Legacy JVM evidence without preparing a slot')
     p.add_argument('--backend-time-zone', help='Reviewed requested zone, or reuse the existing immutable zone pin')
     p.add_argument('--legacy-probe-timeout', type=parse_legacy_probe_timeout,
@@ -1374,6 +1792,7 @@ def main():
     p = sub.add_parser('deploy'); p.add_argument('--service', choices=APPS, required=True)
     p.add_argument('--image', required=True)
     p.add_argument('--env-file')
+    p.add_argument('--frontend-deployment-file', help='Private frontend deployment settings matching the installed pin')
     p.add_argument('--replace-env', action='store_true')
     p.add_argument('--pending-recovery-not-before')
     p.add_argument('--backend-time-zone')
@@ -1382,15 +1801,29 @@ def main():
                    help='Conservative CI cancellation deadline; keep 9000 seconds after lock acquisition')
     p.add_argument('--force', action='store_true')
     args = parser.parse_args()
+    if args.command in ('legacy-zone-evidence', 'status'):
+        load_frontend_settings()
     if args.command == 'legacy-zone-evidence':
         return run_legacy_zone_evidence(args)
-    HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if args.command != 'retire-stale-slots': HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
     if args.command == 'status': status(); return
     wait_seconds = default_lock_timeout(args.command) if args.lock_timeout is None else args.lock_timeout
     deadline = args.job_deadline_epoch if args.command == 'deploy' else None
-    with deployment_lock(wait_seconds, args.command, deadline):
+    with deployment_lock(wait_seconds, args.command, deadline, read_only=args.command == 'retire-stale-slots'):
         if (HOME / 'transaction.json').exists() and args.command not in ('recover', 'check'):
             raise RuntimeError('Interrupted switch detected; run recover or inspect status first')
+        if args.command == 'retire-stale-slots':
+            return retire_stale_slots(args.confirm_plan)
+        if args.command == 'configure-frontend':
+            configure_frontend_settings(args.settings_file)
+            return
+        if args.command == 'deploy' and args.service != 'frontend' and args.frontend_deployment_file:
+            raise RuntimeError('Frontend deployment settings can only be supplied by a frontend deployment')
+        if args.command == 'deploy' and args.service == 'frontend' and not args.frontend_deployment_file:
+            raise RuntimeError('Frontend deployment requires explicit deployment Secrets')
+        settings = load_frontend_settings(args.frontend_deployment_file if args.command == 'deploy' else None)
+        if args.command in ('prepare', 'deploy') and (settings is None or settings.get('version') != 2):
+            raise RuntimeError('Configure frontend deployment Secrets before preparing or deploying any service')
         if args.command == 'recover':
             recover(force=args.force, target=args.target, abandon=args.abandon)
         elif args.command == 'init': init()

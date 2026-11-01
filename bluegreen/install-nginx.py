@@ -155,7 +155,8 @@ def install_locked(owner):
         module.atomic_write(nginx_main, changed_main)
         module.atomic_write(rule,
             'kwung ALL=(root) NOPASSWD: /usr/local/sbin/ieum-bluegreen-nginx legacy, '
-            '/usr/local/sbin/ieum-bluegreen-nginx blue, /usr/local/sbin/ieum-bluegreen-nginx green\n')
+            '/usr/local/sbin/ieum-bluegreen-nginx blue, /usr/local/sbin/ieum-bluegreen-nginx green, '
+            '/usr/local/sbin/ieum-bluegreen-nginx configure-frontend\n')
         os.chmod(rule, 0o440)
         subprocess.run(['/usr/sbin/nginx', '-t'], check=True)
         subprocess.run(['/usr/sbin/visudo', '-cf', str(rule)], check=True)

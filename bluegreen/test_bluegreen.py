@@ -487,6 +487,47 @@ class DeploymentSafetyTest(unittest.TestCase):
             return SimpleNamespace(returncode=0, stdout=output)
         return run
 
+    def test_preparation_uses_secret_frontend_name_ip_network_and_runtime_file(self):
+        infos, created, legacy_docker = self.legacy_fixture()
+        settings = {'network': 'custom_network', 'subnet': '10.10.10.0/24'}
+        addresses = json.loads(json.dumps(bg.IPS))
+        for color, ip in [('blue', '10.10.10.40'), ('green', '10.10.10.50')]:
+            directory = self.root / 'runtime' / color / 'custom'
+            settings[color] = {'containerName': 'custom-' + color + '-frontend', 'ip': ip,
+                'envDir': str(directory), 'envFile': str(directory / '.env')}
+            addresses[color]['frontend'] = ip
+        calls = []
+        def docker(*args):
+            calls.append(args)
+            if args[:2] == ('network', 'inspect'):
+                return json.dumps([{'Driver': 'bridge', 'IPAM': {'Config': [
+                    {'Subnet': '10.10.10.0/24', 'Gateway': '10.10.10.1'}]}}])
+            return legacy_docker(*args)
+        with patch.object(bg, 'FRONTEND_SETTINGS', settings), patch.object(bg, 'IPS', addresses), \
+             patch.object(bg, 'inspect', side_effect=lambda n: infos[n]), patch.object(bg, 'docker', side_effect=docker), \
+             patch.object(bg, 'remove_inactive', side_effect=bg.invalidate_slot):
+            old = bg.write_runtime_env('green', 'frontend', 'OLD=preserved\n')
+            bg.prepare('blue', {'backend': 'reviewed-backend'})
+            self.assertEqual(old.read_text(), 'OLD=preserved\n')
+        creates = [args for args in calls if args[0] == 'create']
+        self.assertEqual(len(creates), 3)
+        self.assertTrue(all(args[args.index('--network') + 1] == 'custom_network' for args in creates))
+        front = creates[0]
+        self.assertEqual(front[front.index('--name') + 1], 'custom-blue-frontend')
+        self.assertEqual(front[front.index('--ip') + 1], '10.10.10.40')
+        self.assertEqual(front[front.index('--env-file') + 1], settings['blue']['envFile'])
+        self.assertEqual(created['custom-blue-frontend']['env']['CURRENT'], 'frontend')
+
+    def test_invalid_secret_network_never_replaces_a_slot_or_writes_recovery_pins(self):
+        before = {path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()}
+        with patch.object(bg, 'FRONTEND_SETTINGS', {'network': 'custom', 'subnet': '10.10.10.0/24',
+                 'blue': {'containerName': 'ieum-blue-frontend'}}), \
+             patch.object(bg, 'docker', return_value='[]') as docker, patch.object(bg, 'remove_inactive') as remove:
+            with self.assertRaisesRegex(RuntimeError, 'network'): bg.prepare('blue', {})
+        remove.assert_not_called()
+        self.assertEqual(docker.call_args_list[0].args, ('network', 'inspect', 'custom'))
+        self.assertEqual(before, {path: path.read_bytes() for path in self.root.rglob('*') if path.is_file()})
+
     def test_legacy_preparation_uses_live_images_and_env_instead_of_init_snapshot(self):
         infos, created, docker = self.legacy_fixture()
         original_snapshot = (bg.HOME / 'snapshots/legacy.json').read_bytes()
@@ -574,7 +615,7 @@ class DeploymentSafetyTest(unittest.TestCase):
         with patch.object(bg.sys, 'argv', ['bluegreen', '--lock-timeout', '0', 'prepare', 'blue',
              '--backend-image', 'reviewed-image', '--backend-env-file', '/private/backend.env', '--replace-env',
              '--backend-time-zone', 'UTC']), \
-             patch.object(bg, 'prepare') as prepare:
+             patch.object(bg, 'prepare') as prepare, patch.object(bg, 'load_frontend_settings', return_value={'configured': True, 'version': 2}):
             bg.main()
         prepare.assert_called_once_with('blue', {'backend': 'reviewed-image'},
             {'backend': '/private/backend.env'}, replace_env=True, recovery_not_before=None, force=False,
@@ -583,7 +624,7 @@ class DeploymentSafetyTest(unittest.TestCase):
 
     def test_prepare_cli_forwards_bounded_legacy_probe_settings(self):
         with patch.object(bg.sys, 'argv', ['bluegreen', '--lock-timeout', '0', 'prepare', 'blue',
-             '--legacy-probe-timeout', '60', '--legacy-probe-attempts', '3']), patch.object(bg, 'prepare') as prepare:
+             '--legacy-probe-timeout', '60', '--legacy-probe-attempts', '3']), patch.object(bg, 'prepare') as prepare, patch.object(bg, 'load_frontend_settings', return_value={'configured': True, 'version': 2}):
             bg.main()
         self.assertEqual(prepare.call_args.kwargs['legacy_probe_timeout'], 60)
         self.assertEqual(prepare.call_args.kwargs['legacy_probe_attempts'], 3)
@@ -591,7 +632,7 @@ class DeploymentSafetyTest(unittest.TestCase):
     def test_prepare_cli_forwards_explicit_evidence_fingerprint_and_container_confirmation(self):
         with patch.object(bg.sys, 'argv', ['bluegreen', '--lock-timeout', '0', 'prepare', 'blue',
              '--confirm-legacy-time-zone', 'a' * 64, '--confirm-legacy-time-zone-evidence', 'b' * 64]), \
-             patch.object(bg, 'prepare') as prepare:
+             patch.object(bg, 'prepare') as prepare, patch.object(bg, 'load_frontend_settings', return_value={'configured': True, 'version': 2}):
             bg.main()
         self.assertEqual(prepare.call_args.kwargs['legacy_zone_confirmation'], 'a' * 64)
         self.assertEqual(prepare.call_args.kwargs['legacy_zone_evidence'], 'b' * 64)
@@ -1187,7 +1228,7 @@ class DeploymentLockTest(unittest.TestCase):
              '--service', 'backend', '--image', 'candidate', '--job-deadline-epoch', str(deadline)]), \
              patch.object(bg.time, 'time', side_effect=lambda: now[0]), \
              patch.object(bg, 'state', return_value={'active': 'blue'}), \
-             patch.object(bg, 'prepare', side_effect=prepare) as prepared, patch.object(bg, 'switch') as switch:
+             patch.object(bg, 'load_frontend_settings', return_value={'configured': True, 'version': 2}), patch.object(bg, 'prepare', side_effect=prepare) as prepared, patch.object(bg, 'switch') as switch:
             with self.assertRaisesRegex(RuntimeError, 'active route is unchanged'): bg.main()
         prepared.assert_called_once(); switch.assert_not_called()
         self.assertFalse((bg.HOME / 'transaction.json').exists())

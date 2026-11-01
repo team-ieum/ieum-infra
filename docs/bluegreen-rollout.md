@@ -1,6 +1,7 @@
 # Blue/Green 수정 반영 및 장애 복구 절차
 
-이 문서는 2026-10-28의 Backend·Frontend·Agent DEV_ Secrets 자동 수집을 반영한 v15 운영 계약이다.
+이 문서는 2026-11-01 색상별 앱 망과 공용 데이터망을 반영한 v17 운영 계약이다.
+Backend·Frontend·Agent의 기존 DEV_ 앱 설정 수집과 색상별 스냅샷 계약을 유지한다.
 v11의 Legacy 증거 전용 조회와 거부 상태 운영 경로 및 앞선 안전성 보완을 유지한다.
 문서의 명령은 운영자가 승인된 반영·점검 시간에 실행할 예시이며, 문서 수정 과정에서 실행하지 않았다.
 로컬 코드 수정은 기존 서버의 실행 중인 이미지나 GitHub workflow 설정을 변경하지 않는다.
@@ -23,20 +24,19 @@ Blue/Green 상태 파일을 정상 운영 상태라고 가정하거나 수동으
 
 ### 로컬 코드와 원격 브랜치의 구분
 
-아래 push 여부는 기존 작업 기록 기준이며 이번 수정 과정에서 원격을 조회하지 않았다.
+2026-10-29에 네 브랜치의 다음 커밋까지 push를 완료했다. 이 표는 해당 작업 기록 및 로컬
+원격 추적 ref 기준이며 이번 수정 중 원격을 다시 조회하거나 push하지 않았다.
 
-| 저장소 | 마지막 push된 커밋 | 현재 로컬 HEAD | 현재 HEAD 이후 |
+| 저장소 | 브랜치 | 마지막 push 커밋 | 이번 미커밋 수정 |
 |---|---|---|---|
-| Infra | `42e06cb` | `247faf3` | v11 Legacy 증거 조회·테스트와 v15 설정 운영 문서 변경은 미커밋 |
-| Backend | `61d1be3` | `d9d5b37` | v14 접두사 Secrets 수집·검증·배포 workflow 변경은 미커밋 |
-| Frontend | `6812f4c` | `ebaa2cc` | v15 DEV_ 빌드·배포 설정과 검증·문서 변경은 미커밋 |
-| Agent | `b64e0e6` | `4487eed` | v15 DEV_ 런타임 설정과 검증·문서 변경은 미커밋 |
+| Infra | infra/IEUM-SRV-28 | 751cb7d | Frontend 설정 pin·Nginx 연동·테스트·문서 |
+| Backend | infra/IEUM-BE-102 | d7861d3 | 없음 |
+| Frontend | infra/IEUM-FE-69 | 3f53648 | 배포 Secrets·metadata seal·수동 최초 등록·테스트·문서 |
+| Agent | infra/IEUM-AI-81 | 471c803 | 없음 |
 
-네 저장소의 현재 HEAD에는 push하지 않은 보완 커밋이 있다. 마지막 push 이후 누적 커밋 수는
-Infra 6개, Backend·Frontend 각각 4개, Agent 3개다. 앞선 v9 Infra 수정은 현재 Infra HEAD에 커밋됐으며,
-v14 Backend 접두사 설정 전환과 기존 v11 Infra 보완은 그 이후의 미커밋 수정이다. 마지막 push→로컬 HEAD의 미push 커밋과
-로컬 HEAD→working tree의 미커밋 수정을 구분한다. 이 둘 모두 운영에 반영됐다는 뜻이 아니다.
-이번 v15 보완 과정에서는 commit·push·서버 변경과 GitHub Secrets·Variables 등록을 수행하지 않는다.
+이번 v17 변경은 commit·push·merge·서버 적용과 GitHub Secrets·Variables 등록을 수행하지 않는다. 앱은 색상별 망, DB·Redis·MongoDB는 공용 데이터망 한 세트로 구성한다.
+현재 GitHub dev에는 Slack·Discord·AGENT_INTERNAL_TOKEN·Agent의 BACKEND_BASE_URL 등 후속 변경이
+있으므로 실제 머지 전 별도 통합 검토가 필요하다. 이번 변경으로 그 기능까지 통합했다고 간주하지 않는다.
 
 ## 2. 다음 재적용 시 기존 배포 경로를 동결한다
 
@@ -90,6 +90,24 @@ docker inspect --format '{{.Name}} {{.Id}} {{.Image}} {{.State.Status}} {{.HostC
 protocol 2 운영 중에는 state의 active, `control/active`, Nginx 관리 파일의 active가 같아야 한다.
 미완료 transaction이 있으면 새 배포 전에 복구 절차를 판단한다. Legacy에서 다시 시작하는 경우에는
 별도 bootstrap 기준점이 필요하므로 기존 상태 파일을 protocol 2의 정상 상태로 간주하지 않는다.
+
+### Frontend runtime 디렉터리 사전 점검
+
+다음은 실제 반영 때 운영자가 확인할 명령이다. 없는 경로는 이후 쓰기에서 0700으로 생성하며,
+존재하는 각 디렉터리는 배포 계정 소유·실제 디렉터리·0700인지 확인한다.
+
+```bash
+stat -c '%a %U %F %n' /home/kwung/deploy/bluegreen/runtime /home/kwung/deploy/bluegreen/runtime/blue /home/kwung/deploy/bluegreen/runtime/green
+```
+
+0700이 아니면 담당자가 소유권·symlink·현재 사용처와 영향을 검토한 뒤 존재하는 대상에만
+`chmod 700`을 수행한다. 예를 들어 세 디렉터리가 모두 존재하고 검토를 완료한 경우의 형식은 다음과 같다.
+자동 배포·정리 명령이 권한을 자동 변경하지 않는다. 사용자 지정 하위 디렉터리와 기존 env 파일도
+0700/0600·소유권·단일 hardlink를 확인한다. HOME부터 env 부모까지 검사하며 env 파일의 symlink도 거부한다.
+
+```bash
+chmod 700 /home/kwung/deploy/bluegreen/runtime /home/kwung/deploy/bluegreen/runtime/blue /home/kwung/deploy/bluegreen/runtime/green
+```
 
 ### Redis 버전·영속성·eviction·큐
 
@@ -156,7 +174,7 @@ sudo cat /etc/nginx/conf.d/ieum-bluegreen.conf
 3. **installer를 먼저 실행**해 공개 자산 경로·소유권, 새 upstream 구성, Nginx 정책을 설치한다.
 4. 검토한 controller와 `legacy-time-zone.py`를 같은 private 배포 디렉터리에 함께 설치하고
    원본과 SHA-256이 일치하는지 확인한다.
-5. 네 저장소의 승인된 SHA 변수를 등록한 뒤 수동 Backend 적용과 검증을 진행한다.
+5. 네 저장소의 승인된 SHA 변수를 등록한다. 아래 Frontend 최초 설정 등록을 먼저 완료한 뒤 수동 Backend 적용과 검증을 진행한다.
 
 ```bash
 # kwung 계정에서 준비한다. root 소유 작업 디렉터리를 만들지 않는다.
@@ -255,17 +273,19 @@ Micrometer의 복구 결과 counter는 결과 관측 횟수이며 실행별 고�
 Backend의 `docs/operations/bluegreen-pending-recovery.md`를 함께 확인한다.
 
 명령 형식 예시의 이미지 SHA와 시각은 운영자가 검토한 값으로 바꿔야 한다.
-아래 `BACKEND_CANDIDATE_ENV`는 승인된 실행에서 DEV_ Secrets를 선택·검증·생성한 0600
-임시 후보의 절대 경로다. Secret 내용이나 서버의 옛 공용 `.env` 경로를 이 변수로 대신하지 않는다.
-GitHub Secrets를 터미널에서 평문으로 다시 읽는 명령을 제공하는 예시가 아니다. 실제 수동
-bootstrap·forward-fix에서는 배포 담당자가 승인된 실행의 Secret 공급과 후보 전달·삭제를 먼저 준비한다.
+수동 설정 공급의 기본안 A를 사용한다. bootstrap `prepare`는 현재 실행 중인 Legacy 컨테이너의
+runtime env를 재사용한다. 별도 Secret 후보나 서버의 옛 원본 `.env` 파일을 읽는 경로가 아니다.
+bootstrap 완료 뒤 **첫 일반 Backend workflow 배포**에서 DEV_ Secrets로 전체 교체한다. 그 전에
+`status`로 대상 비활성 색상이 비어 있어 retained release를 잃지 않는지 확인한다.
+
+아래 수동 `deploy`는 bootstrap 뒤 이미지 교체만 할 때의 형식이며 active 색상의
+`runtime/<active>/backend.env`를 재사용한다. GitHub Secrets를 평문으로 다시 조회해 임시 후보를
+만들 수 있다고 가정하지 않는다. 설정 원인 복구에는 별도 승인 절차가 필요하다(B안 미구현).
 
 ```bash
 python3 /home/kwung/deploy/bluegreen/bluegreen.py deploy \
   --service backend \
   --image ieum-backend-dev:REVIEWED_COMMIT_SHA \
-  --env-file "$BACKEND_CANDIDATE_ENV" \
-  --replace-env \
   --backend-time-zone OPERATOR_CONFIRMED_IANA_ZONE \
   --pending-recovery-not-before 'YYYY-MM-DDTHH:MM:SS+09:00'
 ```
@@ -285,15 +305,15 @@ python3 /home/kwung/deploy/bluegreen/bluegreen.py deploy \
 
 `prepare`에도 앱별 `--frontend-env-file`, `--backend-env-file`, `--agent-env-file`과 `--replace-env`를
 지원한다. 환경을 명시적으로 바꾸는 앱은 그 앱의 이미지도 명시해야 한다. 다른 앱은 현재 Legacy
-이미지·runtime env를 유지한다. 전체 환경 교체의 의미 비교는 6절을 따른다.
+이미지·runtime env를 유지한다. 이 옵션의 CLI 지원은 남아 있지만 기본안 A의 수동 bootstrap에서는
+사용하지 않는다. DEV_ Secrets 전체 교체는 bootstrap 뒤 첫 일반 Backend workflow 배포에서 한다.
+전체 환경 교체의 의미 비교는 6절을 따른다.
 다음은 **증거 전용 조회와 검토를 끝낸 뒤** 수행할 실제 준비의 형식이다. no-attach 확인 대상이면
 이후 설명하는 검토한 CID와 SHA 확인 인자도 함께 지정한다. 증거만 보려고 이 예시를 실행하지 않는다.
 
 ```bash
 python3 /home/kwung/deploy/bluegreen/bluegreen.py --lock-timeout 30 prepare blue \
   --backend-image ieum-backend-dev:REVIEWED_COMMIT_SHA \
-  --backend-env-file "$BACKEND_CANDIDATE_ENV" \
-  --replace-env \
   --backend-time-zone OPERATOR_CONFIRMED_IANA_ZONE \
   --pending-recovery-not-before 'YYYY-MM-DDTHH:MM:SS+09:00'
 ```
@@ -814,6 +834,96 @@ Agent image의 COPY . .에 repo .env 파일이 섞여 기존값이 살아나지 
 전체 교체를 처음 적용하기 전에 기존 runtime과 새 접두사 설정을 private 환경에서 비교한다.
 수집 성공은 실제 DB 연결·브라우저 API·외부 인증 성공을 대신하지 않는다.
 
+### 색상별 앱 네트워크와 공용 데이터망의 최초 등록 (v17)
+
+| 역할 | 네트워크 | subnet 예시 | 연결 |
+|---|---|---|---|
+| Blue 앱 | ieum_net_blue | 10.20.10.0/24 | Blue Frontend·Backend·Agent |
+| Green 앱 | ieum_net_green | 10.10.10.0/24 | Green Frontend·Backend·Agent |
+| 공용 데이터 | ieum_net_data | 10.30.10.0/24 | 두 색상의 Backend·Agent 및 PostgreSQL·Redis·MongoDB 한 세트 |
+
+예시는 실제 서버에 생성·적용하지 않았다. 데이터베이스 복제/동기화는 하지 않으며 기존 데이터 컨테이너와
+볼륨을 유지한다. 프론트는 데이터망에 연결하지 않는다. 공용 데이터망에 연결된 앱 사이의 모든 포트 접근을
+차단하는 방화벽까지 구성한 것은 아니다. 별도의 엄격한 포트 격리가 필요하면 정책을 추가 검토한다.
+기존 서버 IP·도메인·Nginx 외부 수신 포트를 유지하는 Docker bridge 구성으로 pfSense 전달 대상은 유지한다.
+
+Frontend 저장소가 topology 설정을 공급한다. 공통 DEV_COM_NODE_VERSION·DEV_COM_IMAGE_NAME·
+DEV_COM_VITE_API_URL, 데이터망 5개, 색상별 8개씩 총 24개 Secrets를 등록한다. 전체 이름·예시는
+Frontend docs/operations/bluegreen-secrets.md를 따른다. 이전 단일 DEV_DOCKER_NETWORK 계열은
+새 형식으로 대체하며 기존 Legacy workflow의 접두사 없는 Secrets는 유지한다.
+서버 원본 env 파일은 재사용하지 않고 runtime/{blue|green} 아래 색상별 private snapshot을 사용한다.
+
+최초 적용 순서:
+1. 팀 점검·기존 배포 동결·실행 취소·DB 백업 및 live 네트워크/DB 연결을 확인한다.
+2. 새 controller/helper를 설치하고 SHA Variables를 맞춘다. 아래 옛 slot 정리를 먼저 완료한다.
+3. 겹치지 않는 세 bridge/subnet을 준비한다. 예시와 같다면 기존 ieum_net_green은 재사용한다.
+   CLI·Engine API 1.48 이상이어야 한다. 다른 LAN·VPN·Docker subnet과 실제 충돌 여부는 별도 확인한다.
+4. 기존 PostgreSQL·Redis·MongoDB를 공용 데이터망에 추가 연결한다. 이 단계에서는 Legacy용 옛 연결을 유지한다.
+   네트워크 추가 시 기존 DB의 기본 경로를 바꾸지 않도록 gw-priority=-1을 사용하고 접속을 검증한다.
+5. Frontend 수동 operation=configure-frontend로 schema 2 root pin을 등록한다. 이 모드는 앱 교체·
+   Nginx reload·트래픽 전환·네트워크 생성·DB 네트워크 연결을 수행하지 않는다.
+6. Backend·Agent의 DB/Redis/Mongo URI를 데이터망 이름 또는 해당 데이터망 IP로 준비하고, 논리 DB명·schema·
+   Redis DB/queue prefix는 보존한다. 이전 앱망 IP는 후보에서 거부한다. 필요 시 두 서비스 env 후보를 함께 공급한다.
+7. 기존 시간대/cutoff 확인 뒤 protocol-2 prepare → check → switch를 수행한다. 후보 앱은 자기 색상망에서
+   시작하며 Backend·Agent만 data망에 추가 연결한다. 같은 색상의 Agent/Backend 주소를 controller가 주입한다.
+8. finish-bootstrap이 기존 작업/연결 0을 기다려 Legacy 앱을 중지한다. DB의 옛 망 연결이 남아 있으면
+   phase=legacy를 유지하고 distributed mode를 켜지 않는다. 실제로 Legacy가 멈췄는지 확인한 담당자가
+   데이터 컨테이너의 옛 네트워크 연결만 분리하고 데이터망 연결·볼륨은 보존한다. 자동 detach는 하지 않는다.
+9. finish-bootstrap 재실행으로 데이터 컨테이너가 data망에만 있는지 확인하고 ready로 전환한다. 실제 브라우저·
+   SSE/STOMP·큐/스케줄러·전환/rollback·외부 API 호출·pfSense/Snort 경로를 검증한 뒤 자동 배포를 재개한다.
+
+이 최초 이전은 점검 구간을 전제로 한다. 아직 실제 서버에서 수행하거나 검증하지 않았다.
+
+이번 경로는 서버에 아직 `/etc/nginx/ieum-frontend-deployment.json` pin이 없다는 작업 전제를 사용한다.
+이번 수정에서 서버를 조회해 새로 확인한 사실은 아니다. helper는 root pin을 읽을 때마다 경로 규칙을
+검사하므로 이미 pin이 있다면 새 규칙을 그대로 적용하지 말고 별도 migration을 검토한다. envDir의
+색상 루트 아래 각 디렉터리 이름은 영문·숫자로 시작하고 영문·숫자·밑줄·하이픈만 쓰며 64자 이하다.
+`backend.env`, `agent.env`, `.hidden`, `a.b` 같은 디렉터리 이름은 허용하지 않는다.
+
+신규 controller를 설치한 뒤, pin 이전의 옛 slot 정리는 **CLI 전용** `retire-stale-slots`를 사용한다.
+수동 운영 workflow에는 추가하지 않았다. installer가 만든 기존 deploy.lock을 독점 잠그며 dry-run은
+lock-owner·state·history를 쓰지 않는다. root policy/control pin/미완료 transaction이 없어야 하고,
+state·control·route가 Legacy이며 phase가 ready가 아닌지 먼저 확인한다.
+
+```bash
+python3 /home/kwung/deploy/bluegreen/bluegreen.py --lock-timeout 30 retire-stale-slots
+```
+
+stdout 계획의 ID·이미지·상태와 slot 요약을 검토하고 출력된 64자리 `planSha256`으로 확인 실행한다.
+조회 실패·시간 초과·이름 중복·기본 이름 밖의 관리 컨테이너·실행 중 컨테이너·restart policy 불일치는
+부재로 보지 않으며 제거 전에 거부한다. 관리 label이 있고 정지된 restart=no 컨테이너만 ID로 제거한다.
+확인 실행에서 계획이 바뀌었으면 새 계획과 SHA를 출력하고 종료 코드 1로 중단하므로 다시 검토한다.
+
+```bash
+python3 /home/kwung/deploy/bluegreen/bluegreen.py --lock-timeout 30 retire-stale-slots \
+  --confirm-plan REVIEWED_PLAN_SHA256
+python3 /home/kwung/deploy/bluegreen/bluegreen.py status
+```
+
+완료 후 `slots={}`, `previous=null`, `active=legacy`를 확인하고 runtime 권한 점검을 끝낸 뒤
+Frontend 수동 `operation=configure-frontend`를 진행한다. 이전 state는 private retired-slots 사본에
+보존한다. 중간 제거 실패는 실패 이력을 남기고 state를 유지하며 즉시 중단하므로 새 dry-run부터
+다시 검토한다. runtime env·Legacy snapshot·cutoff/zone pin·자산 archive·Redis·DB는 정리하지 않고
+Legacy 컨테이너를 stop/start하지 않는다. 전제가 맞지 않으면 임의 state 편집이나 docker rm으로 우회하지 않는다.
+
+등록 전에는 두 색상, prepare 전에는 대상 색상의 frontend·backend·agent IP가 현재 다른 endpoint에
+점유되지 않았는지 확인한다. prepare에서 교체 대상 slot 자신의 컨테이너 이름만 제외한다. Docker network
+inspect의 Containers에는 보통 실행 중인 endpoint만 보여 정지 컨테이너의 정적 IP 예약은 놓칠 수 있다.
+이 검사는 모든 IP 충돌을 보장하지 않으며 남아 있는 정지 컨테이너·외부 주소 예약은 별도 점검한다.
+
+
+controller가 deploy.lock 안에서 검증한 JSON만 고정 전달 파일에 기록하고 root helper가 재검증해
+/etc/nginx/ieum-frontend-deployment.json에 root:root 0644로 저장한다. schema 2는 세 subnet의
+비중첩과 Blue/Green 각각 세 앱의 IP, datastore 이름 및 private runtime 경로를 포함한다. 비밀번호는 없다.
+control/frontend-deployment-sha256으로 pin을 확인하며 Nginx도 이 pin의 세 upstream IP를 사용한다.
+후보 metadata 불일치·runtime 경로 문제·gateway/endpoint 점유·datastore 접속 대상 오류는 제거 전에 거부한다.
+모든 Backend·Agent의 candidate는 data망 연결 후 시작한다. 기본 gateway는 앱망이 되도록 data망 priority=-1을
+사용한다. 실패하면 기존 bounded cleanup이 새 candidate ID만 정리하고 active는 보존한다.
+check/switch/rollback은 실제 네트워크 membership·IP·Agent 역방향 Backend 주소·공용 datastore를 재확인한다.
+schema 1은 옛 점검·recover용으로 읽지만 새 prepare/deploy는 schema 2를 요구한다. pin 변경은 자동 채택하지
+않으며 별도 migration이 필요하다. 이번 코드가 네트워크 생성/삭제·데이터 컨테이너 재생성·복제를 수행하지는 않는다.
+
+
 ## 7. 장애 전환·rollback·recover
 
 ```bash
@@ -910,14 +1020,16 @@ python3 /home/kwung/deploy/bluegreen/bluegreen.py recover --abandon --force
 
 **abandon 이후 첫 forward-fix는 자동 앱 workflow가 아니라 담당자의 수동 `deploy --force`로 수행한다.**
 자동 workflow에는 `--force`가 없으므로 정지된 source의 drain에 실패하고 새 journal을 남길 수 있다.
-검토한 후보·source identity와 원본 journal 사본을 확인한 뒤 다음 형식으로 진행한다.
+검토한 이미지·source identity와 원본 journal 사본을 확인한 뒤 다음 형식으로 진행한다.
+아래는 **이미지 원인** forward-fix이며 env-file을 생략해 active 색상의
+`runtime/<active>/backend.env`를 재사용한다. **설정 원인** forward-fix는 별도 승인 절차가 필요하다
+(B안 미구현). Backend workflow에 승인자를 둔 별도 설정 공급 job을 추가하는 대안 B는 팀 결정 전에는
+구현하지 않으며, 설정 원인에 대한 실행 예시도 제공하지 않는다.
 
 ```bash
 python3 /home/kwung/deploy/bluegreen/bluegreen.py --lock-timeout 30 deploy \
   --service backend \
   --image ieum-backend-dev:REVIEWED_FORWARD_FIX_SHA \
-  --env-file "$BACKEND_CANDIDATE_ENV" \
-  --replace-env \
   --force
 ```
 
@@ -1053,6 +1165,28 @@ backend_start를 확인해 상실과 관측 불확실성을 구분한다. 불확
 외부 서비스의 멱등 키·중복 감지 정책은 별도로 적용해야 한다.
 
 ## 9. 검증 기록과 아직 필요한 운영 검증
+
+v17 로컬 검증: Infra 287개·Frontend 52개, 총 339개 통과. 실제 Frontend builder JSON과 root helper validator의 상호 호환도 확인했다.
+workflow YAML 2개·run 블록 14개·runbook bash/sh 21개를 구문 검사했다. 실제 Docker daemon·서버·DB·Secrets에 접근하지 않았다.
+네트워크 생성·DB 연결 변경·첫 bootstrap·실제 전환/rollback·Nginx reload는 아직 운영 검증 전이다.
+아래 v16/v15는 당시 실행 기록이며 현재 결과에 합산하지 않는다.
+
+2026-11-01 v16 후속 지시 검증: Infra 269개(초기 244개에서 25개 증가), Frontend 49개(초기 46개에서
+3개 증가)가 통과했고 실패·오류·건너뜀은 모두 0이다. 요청된 두 명령을 python3 -B로 실행했다.
+runbook bash/sh 예시 21개를 bash -n으로 검사했으며 workflow YAML 12개는 후속 작업 시작 시점과
+바이트가 같다. Docker·root helper·sudo는 모의 호출이며 실제 운영 작업을 실행하지 않았다.
+Backend·Agent의 workflow shell 테스트 보완은 .git 링크가 없어 미수정이며 링크 복구도 하지 않았다.
+당시 기본안 B는 미구현이었다. 이후 사용자 선택으로 v17에서 앱 망 분리·공용 데이터망을 구현했다. 아래 초기 v16 검증 기록과 이번 결과를 합산하지 않는다.
+
+
+2026-11-01 v16 로컬 검증: Infra 244개(기존 회귀와 신규 topology/hand-off/route/private-file 검증),
+Frontend 46개(메타데이터 분리·필수값·seal·workflow 포함), 합계 290개 통과.
+변경 Frontend 및 공용 운영 workflow YAML 2개에서 중복 키를 검사하고 run 14개를 bash 구문 검사했다.
+Runbook 예시 17개도 구문만 검사했다. 실제 Secrets·서버·Docker daemon·Nginx reload·DB에 접근하지 않았으며
+새 root 정책 설치의 root 소유권 경계는 mock으로 검증했다. 이번에 실제 Vite 빌드·브라우저·전체 FE 앱
+테스트·BE Java·Agent pytest를 재실행하지 않았다. 실제 bootstrap·전환·rollback은 별도 운영 검증 대상이다.
+
+아래 v15 결과는 2026-10-28의 역사적 기록이며 새 메타데이터 계약의 테스트 결과로 합산하지 않는다.
 
 아래 표의 v15 검증은 2026-10-28 현재 소스에서 합성 설정과 모의 외부 서비스를 사용해 새로 실행했다.
 운영 Docker·GitHub Secrets·DB·서버에는 접근하지 않았다. Backend DEV_ 구현은 v14와 같고,
