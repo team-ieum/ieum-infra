@@ -16,6 +16,7 @@ env:
 
   PHOENIX_CONTAINER_NAME: ${{ secrets.PHOENIX_CONTAINER_NAME }}
   PHOENIX_UI_PORT: ${{ secrets.PHOENIX_UI_PORT }}
+  HOST_BIND_IP: ${{ secrets.HOST_BIND_IP }}
 
   GREEN_NETWORK: ${{ secrets.GREEN_NETWORK }}
   GREEN_NETWORK_SUBNET: ${{ secrets.GREEN_NETWORK_SUBNET }}
@@ -31,6 +32,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Validate Phoenix bind address
+        run: |
+          set -euo pipefail
+
+          if [ "${HOST_BIND_IP:-127.0.0.1}" != "127.0.0.1" ]; then
+            echo "::error::Phoenix must bind to localhost. Set HOST_BIND_IP to 127.0.0.1 or leave it unset."
+            exit 1
+          fi
+
       - name: Ensure env directory exists
         run: |
           mkdir -p "$(dirname "$ENV_FILE")"
@@ -40,6 +50,7 @@ jobs:
           printf "%s\n" \
             "PHOENIX_CONTAINER_NAME=${PHOENIX_CONTAINER_NAME}" \
             "PHOENIX_UI_PORT=${PHOENIX_UI_PORT}" \
+            "HOST_BIND_IP=${HOST_BIND_IP:-127.0.0.1}" \
             "GREEN_NETWORK=${GREEN_NETWORK}" \
             "GREEN_NETWORK_SUBNET=${GREEN_NETWORK_SUBNET}" \
             > "$ENV_FILE"
@@ -53,6 +64,8 @@ jobs:
 
       - name: Reset Phoenix
         run: |
+          # Destructive reset: down -v deletes trace data. For a port-only change,
+          # use the volume-preserving up -d procedure in docs/phoenix-security.md.
           docker compose \
             -f "$COMPOSE_FILE" \
             --env-file "$ENV_FILE" \
