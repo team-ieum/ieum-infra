@@ -18,6 +18,7 @@ env:
   COMPOSE_FILE: compose/phoenix.green.compose.yml
   PHOENIX_CONTAINER_NAME: ${{ secrets.AWS_PHOENIX_CONTAINER_NAME }}
   PHOENIX_UI_PORT: ${{ secrets.AWS_PHOENIX_UI_PORT }}
+  HOST_BIND_IP: ${{ secrets.AWS_HOST_BIND_IP }}
   GREEN_NETWORK: ${{ secrets.AWS_DOCKER_NETWORK }}
   GREEN_NETWORK_SUBNET: ${{ secrets.AWS_DOCKER_NETWORK_SUBNET }}
 
@@ -56,6 +57,11 @@ jobs:
 
           if [ ${#missing_vars[@]} -gt 0 ]; then
             echo "::error::Missing secrets for: ${missing_vars[*]}"
+            exit 1
+          fi
+
+          if [ "${HOST_BIND_IP:-127.0.0.1}" != "127.0.0.1" ]; then
+            echo "::error::Phoenix must bind to localhost. Set AWS_HOST_BIND_IP to 127.0.0.1 or leave it unset."
             exit 1
           fi
 

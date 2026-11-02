@@ -1,4 +1,4 @@
-name: Reset Green PostgreSQL
+name: Deploy DEV Shared PostgreSQL
 
 on:
   workflow_dispatch:
@@ -6,30 +6,15 @@ on:
 permissions:
   contents: read
 
+# Shared data services serialize with each other; the helper also holds the app deploy lock.
 concurrency:
-  group: reset_green_postgres
+  group: infra_dev_shared_services
   cancel-in-progress: false
 
-env:
-  COMPOSE_FILE: compose/postgres.green.compose.yml
-  ENV_FILE: ${{ secrets.POSTGRES_ENV_FILE }}
-
-  POSTGRES_CONTAINER_NAME: ${{ secrets.POSTGRES_CONTAINER_NAME }}
-  POSTGRES_IP: ${{ secrets.POSTGRES_IP }}
-  POSTGRES_PORT: ${{ secrets.POSTGRES_PORT }}
-  POSTGRES_HOST_PORT: ${{ secrets.POSTGRES_HOST_PORT }}
-  POSTGRES_DB: ${{ secrets.POSTGRES_DB }}
-  POSTGRES_USER: ${{ secrets.POSTGRES_USER }}
-  POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
-
-  HOST_BIND_IP: ${{ secrets.HOST_BIND_IP }}
-
-  GREEN_NETWORK: ${{ secrets.GREEN_NETWORK }}
-  GREEN_NETWORK_SUBNET: ${{ secrets.GREEN_NETWORK_SUBNET }}
-
 jobs:
-  reset-postgres:
-    name: Reset PostgreSQL Container
+  deploy-postgres:
+    name: Preserve volumes and update PostgreSQL
+    timeout-minutes: 30
     runs-on:
       group: ieum_dev_server
       labels: [self-hosted, linux, x64, ieum-infra]
@@ -38,57 +23,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Ensure env directory exists
+      - name: Test infrastructure configuration
         run: |
-          mkdir -p "$(dirname "$ENV_FILE")"
+          set -euo pipefail
+          python3 -m unittest discover -s scripts/dev -p 'test_*.py'
 
-      - name: Create env file from GitHub Secrets
+      - name: Deploy existing shared PostgreSQL from DEV_COM Secrets
+        env:
+          IEUM_INFRA_SECRETS_JSON: ${{ toJSON(secrets) }}
         run: |
-          printf "%s\n" \
-            "POSTGRES_CONTAINER_NAME=${POSTGRES_CONTAINER_NAME}" \
-            "POSTGRES_IP=${POSTGRES_IP}" \
-            "POSTGRES_PORT=${POSTGRES_PORT}" \
-            "POSTGRES_HOST_PORT=${POSTGRES_HOST_PORT}" \
-            "POSTGRES_DB=${POSTGRES_DB}" \
-            "POSTGRES_USER=${POSTGRES_USER}" \
-            "POSTGRES_PASSWORD=${POSTGRES_PASSWORD}" \
-            "HOST_BIND_IP=${HOST_BIND_IP}" \
-            "GREEN_NETWORK=${GREEN_NETWORK}" \
-            "GREEN_NETWORK_SUBNET=${GREEN_NETWORK_SUBNET}" \
-            > "$ENV_FILE"
-
-      - name: Ensure Docker network
-        run: |
-          docker network inspect "$GREEN_NETWORK" >/dev/null 2>&1 \
-            || docker network create \
-                 --subnet "$GREEN_NETWORK_SUBNET" \
-                 "$GREEN_NETWORK"
-
-      - name: Reset PostgreSQL
-        run: |
-          docker compose \
-            -f "$COMPOSE_FILE" \
-            --env-file "$ENV_FILE" \
-            down -v --remove-orphans
-
-          docker rm -f "$POSTGRES_CONTAINER_NAME" >/dev/null 2>&1 || true
-
-          docker compose \
-            -f "$COMPOSE_FILE" \
-            --env-file "$ENV_FILE" \
-            up -d
-
-      - name: Health check
-        run: |
-          for i in $(seq 1 30); do
-            if docker exec "$POSTGRES_CONTAINER_NAME" pg_isready \
-              -U "$POSTGRES_USER" \
-              -d "$POSTGRES_DB"; then
-              exit 0
-            fi
-
-            sleep 2
-          done
-
-          docker logs --tail 100 "$POSTGRES_CONTAINER_NAME"
-          exit 1
+          set +x
+          set -euo pipefail
+          umask 077
+          # Existing data network/container/project/volumes must already match.
+          # No reset, volume removal, network creation or automatic network migration.
+          python3 scripts/dev/infra_env.py --service postgres --deploy
