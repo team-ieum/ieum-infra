@@ -1461,18 +1461,35 @@ def route(color):
     run('sudo', '-n', '/usr/local/sbin/ieum-bluegreen-nginx', color)
 
 def verify_ingress(color, timeout=15):
+    agent_env = dict(item.split('=', 1) for item in inspect(name(color, 'agent'))['Config'].get('Env', [])
+                     if '=' in item)
+    protected_agent_docs = bool(agent_env.get('AGENT_INTERNAL_TOKEN', '').strip())
+
+    def environment_matches(headers):
+        values = [value.strip() for line in headers.splitlines()
+                  for key, separator, value in (line.partition(':'),)
+                  if separator and key.strip().lower() == 'x-ieum-environment']
+        return values == [color]
+
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         result = subprocess.run(['curl', '--fail', '--silent', '--show-error', '--max-time', '5',
             '--resolve', 'green.kiacms.co.kr:11111:127.0.0.1', '-D', '-', '-o', '/dev/null',
             'https://green.kiacms.co.kr:11111/'], capture_output=True, text=True)
-        if result.returncode == 0 and ('x-ieum-environment: ' + color) in result.stdout.lower():
+        if result.returncode == 0 and environment_matches(result.stdout):
             try:
                 for path in ('/v3/api-docs', '/openapi.json'):
                     probe = subprocess.run(['curl', '--fail', '--silent', '--show-error', '--max-time', '5',
                         '--resolve', 'green.kiacms.co.kr:11111:127.0.0.1', '-D', '-', '-o', '/dev/null',
                         'https://green.kiacms.co.kr:11111' + path], capture_output=True, text=True)
-                    if probe.returncode or ('x-ieum-environment: ' + color) not in probe.stdout.lower():
+                    # Agent requires its internal token on every path except /health.
+                    # Check that protection without sending a credential through ingress.
+                    if path == '/openapi.json' and protected_agent_docs:
+                        healthy = probe.returncode == 22 and re.search(
+                            r'^HTTP/\S+\s+401(?:\s|$)', probe.stdout, re.MULTILINE) is not None
+                    else:
+                        healthy = probe.returncode == 0
+                    if not healthy or not environment_matches(probe.stdout):
                         raise RuntimeError('Ingress route not ready')
                 return
             except RuntimeError:

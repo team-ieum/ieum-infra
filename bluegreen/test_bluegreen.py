@@ -1770,4 +1770,74 @@ class NginxRenderingTest(unittest.TestCase):
         self.assertNotIn('ieum_frontend_previous', rendered)
         self.assertEqual(rendered.count('location ^~ /assets/'), 1)
 
+class IngressAuthenticationTest(unittest.TestCase):
+    def verify(self, *, color='blue', token='test', agent_status=401, backend_status=200,
+               frontend_status=200, agent_returncode=None, agent_environment=None,
+               duplicate_environment=False):
+        def probe(arguments, **_kwargs):
+            url = arguments[-1]
+            status = agent_status if url.endswith('/openapi.json') else \
+                backend_status if url.endswith('/v3/api-docs') else frontend_status
+            environment = color
+            if url.endswith('/openapi.json') and agent_environment is not None:
+                environment = agent_environment
+            headers = f'HTTP/1.1 {status} Response\r\nX-IEUM-Environment: {environment}\r\n'
+            if duplicate_environment and url.endswith('/openapi.json'):
+                headers += 'X-IEUM-Environment: green\r\n'
+            returncode = 0 if status < 400 else 22
+            if url.endswith('/openapi.json') and agent_returncode is not None:
+                returncode = agent_returncode
+            return SimpleNamespace(returncode=returncode, stdout=headers + '\r\n', stderr='')
+
+        info = {'Config': {'Env': ['AGENT_INTERNAL_TOKEN=' + token]}}
+        with patch.object(bg, 'inspect', return_value=info), \
+             patch.object(bg.subprocess, 'run', side_effect=probe) as calls, \
+             patch.object(bg.time, 'monotonic', side_effect=[0, 0, 2]), \
+             patch.object(bg.time, 'sleep'):
+            bg.verify_ingress(color, timeout=1)
+            return calls
+
+    def test_token_protected_agent_docs_require_authentication_failure(self):
+        token = 'synthetic-private-agent-token-for-ingress'
+        calls = self.verify(token=token)
+        self.assertEqual(calls.call_count, 3)
+        self.assertTrue(all('AGENT_INTERNAL_TOKEN' not in str(call) for call in calls.call_args_list))
+        self.assertTrue(all(token not in str(call) for call in calls.call_args_list))
+
+    def test_legacy_with_protected_agent_docs_can_be_verified_for_recovery(self):
+        self.verify(color='legacy')
+
+    def test_unprotected_legacy_agent_still_requires_success(self):
+        self.verify(token='', agent_status=200)
+        with self.assertRaisesRegex(RuntimeError, 'TLS ingress'):
+            self.verify(token='', agent_status=401)
+
+    def test_configured_internal_token_must_not_leave_docs_public(self):
+        with self.assertRaisesRegex(RuntimeError, 'TLS ingress'):
+            self.verify(agent_status=200)
+
+    def test_other_agent_failures_do_not_pass_as_authentication(self):
+        for status in (403, 404, 500, 503):
+            with self.subTest(status=status), self.assertRaisesRegex(RuntimeError, 'TLS ingress'):
+                self.verify(agent_status=status)
+
+    def test_agent_transport_failure_does_not_pass_as_authentication(self):
+        with self.assertRaisesRegex(RuntimeError, 'TLS ingress'):
+            self.verify(agent_returncode=7)
+
+    def test_backend_and_frontend_must_remain_successful(self):
+        for arguments in ({'backend_status': 401}, {'frontend_status': 401}):
+            with self.subTest(arguments=arguments), self.assertRaisesRegex(RuntimeError, 'TLS ingress'):
+                self.verify(**arguments)
+
+    def test_authentication_response_must_have_exact_environment(self):
+        for environment in ('green', 'blue-other'):
+            with self.subTest(environment=environment), self.assertRaisesRegex(RuntimeError, 'TLS ingress'):
+                self.verify(agent_environment=environment)
+
+    def test_duplicate_environment_headers_are_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, 'TLS ingress'):
+            self.verify(duplicate_environment=True)
+
+
 if __name__ == '__main__': unittest.main()
