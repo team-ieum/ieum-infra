@@ -1125,10 +1125,27 @@ cat /home/kwung/deploy/bluegreen/lock-owner.json
 
 ## 8. DB 스키마·자산·이벤트 정책
 
-Flyway를 일괄 도입하지 않았으며 후보의 `ddl-auto=validate`를 유지한다. 스키마 변경 릴리스는
-양쪽 버전이 함께 읽을 수 있는 expand 변경부터 적용한다. DDL·백업 복원 리허설·enum·Redis payload·
+DEV 배포는 DB 스키마를 자동 변경하지 않으며 후보 Backend의 `ddl-auto=validate`를 유지한다.
+스키마 변경 SQL의 원본은 Backend 저장소의 `docs/schema/V<n>__*.sql`이며, 담당자가 대상 DEV
+PostgreSQL에 수동 적용한 뒤 Backend PR을 `dev`에 병합한다. 인프라 controller와 배포 workflow는
+SQL 파일을 실행하거나 Flyway 이력을 생성하지 않는다.
+
+스키마를 변경하는 릴리스는 다음 순서를 따른다.
+
+1. 해당 릴리스의 SQL과 현재 DB 적용 상태를 확인한다. 버전 파일이 있다는 이유로 적용 완료로
+   간주하거나 과거 SQL을 일괄 재실행하지 않는다.
+2. 현재 active와 이전 버전이 함께 사용할 수 있는 변경인지 검토하고, 백업·복구 절차와 DDL 잠금
+   영향을 확인한 뒤 필요한 SQL만 수동 적용한다. 기존 행이 있는 테이블의 NOT NULL 컬럼은
+   기본값·데이터 보정 순서를 함께 검토한다.
+3. 컬럼·테이블뿐 아니라 CHECK의 허용 값, UNIQUE·인덱스 등 SQL에 포함된 변경도 실제 DB에서
+   확인한다. Hibernate `validate` 통과만으로 모든 제약과 데이터 이전의 완료를 증명하지 않는다.
+4. 적용 결과를 확인한 뒤 Backend PR을 병합하고 기존 배포 절차를 진행한다. 후보 Backend는
+   기동 시 `validate`로 스키마를 검사하며, 불일치로 기동하지 못하면 트래픽 전환을 진행하지 않는다.
+
+스키마 변경 릴리스는 양쪽 버전이 함께 읽을 수 있는 expand 변경부터 적용한다. DDL·백업 복원 리허설·enum·Redis payload·
 Mongo 문서·Agent API 호환성을 검토하고 contract 변경은 이전 버전과 rollback 기간 종료 후 진행한다.
-앱 rollback은 DB rollback을 수행하지 않는다.
+앱 rollback은 DB rollback을 수행하지 않는다. 수동으로 적용한 DB 변경은 이후 앱 배포가 실패해도
+남으므로, 복구 시 현재 active와 되돌릴 버전 모두의 호환성을 다시 확인한다.
 
 정적 파일 archive는 반대 색 컨테이너가 제거되어도 남는다. `/assets/` 누락 요청은 SPA HTML 대신
 404가 되고 독립 archive에서 재확인한다. 같은 URL에 다른 내용이 있으면 전환 전에 거부하므로
