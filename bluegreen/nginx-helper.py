@@ -1,6 +1,8 @@
 #!/usr/bin/python3
 """Root-owned helper: switch validated routes using an immutable frontend policy."""
 import ipaddress
+import contextlib
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -21,6 +23,35 @@ FRONTEND_POLICY = Path('/etc/nginx/ieum-frontend-deployment.json')
 FRONTEND_CANDIDATE = Path('/home/kwung/deploy/bluegreen/frontend-deployment-candidate.json')
 RUNTIME_ROOT = Path('/home/kwung/deploy/bluegreen/runtime')
 MAX_POLICY_BYTES = 16384
+ENVIRONMENT = 'dev'
+NGINX_LOCK = Path('/run/lock/ieum-bluegreen-nginx.lock')
+
+def configure_environment(environment):
+    """The root-installed filename selects the policy; caller environment is ignored."""
+    global ENVIRONMENT, DESTINATION, FRONTEND_POLICY, FRONTEND_CANDIDATE, RUNTIME_ROOT
+    if environment not in {'dev', 'main'}: raise ValueError('Invalid environment')
+    ENVIRONMENT = environment
+    suffix = '-main' if environment == 'main' else ''
+    DESTINATION = Path(f'/etc/nginx/conf.d/ieum{suffix}-bluegreen.conf')
+    FRONTEND_POLICY = Path(f'/etc/nginx/ieum{suffix}-frontend-deployment.json')
+    home = Path('/home/kwung/deploy/bluegreen' + suffix)
+    FRONTEND_CANDIDATE = home / 'frontend-deployment-candidate.json'
+    RUNTIME_ROOT = home / 'runtime'
+
+if Path(__file__).name == 'ieum-main-bluegreen-nginx':
+    configure_environment('main')
+
+@contextlib.contextmanager
+def nginx_lock():
+    descriptor = os.open(NGINX_LOCK, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o077 or info.st_nlink != 1:
+            raise ValueError('Invalid shared Nginx lock')
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(descriptor)
 
 def unique_object(pairs):
     result = {}
@@ -68,7 +99,17 @@ def validate_split_settings(value):
             if any(slot['network'] == existing_name or network.overlaps(existing_net) for existing_name, existing_net in networks):
                 raise ValueError()
             networks.append((slot['network'], network))
-        if value['blue']['network'] != 'ieum_net_blue' or value['green']['network'] != 'ieum_net_green':
+        prefix = 'ieum_main_net_' if ENVIRONMENT == 'main' else 'ieum_net_'
+        if value['blue']['network'] != prefix + 'blue' or value['green']['network'] != prefix + 'green':
+            raise ValueError()
+        if ENVIRONMENT == 'main':
+            if data['network'] != 'ieum_main_net_data' or data['stores'] != {
+                    store: 'ieum-main-' + store for store in ('postgres', 'redis', 'mongo')}:
+                raise ValueError()
+            if any(value[color]['containerName'] != 'ieum-main-' + color + '-frontend' for color in ('blue', 'green')):
+                raise ValueError()
+        elif any(value[color]['containerName'].startswith('ieum-main-') for color in ('blue', 'green')) or \
+                any(container.startswith('ieum-main-') for container in store_names):
             raise ValueError()
         for container in store_names:
             if not isinstance(container, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', container) or container in reserved | names:
@@ -92,6 +133,8 @@ def validate_frontend_settings(value):
     """Only typed deployment data; schema 1 remains readable for old recovery."""
     if isinstance(value, dict) and value.get('version') == 2:
         return validate_split_settings(value)
+    if ENVIRONMENT == 'main':
+        raise ValueError('MAIN requires a separated-network policy')
     try:
         if not isinstance(value, dict) or set(value) != {'version', 'network', 'subnet', 'blue', 'green'} or \
                 type(value['version']) is not int or value['version'] != 1:
@@ -188,16 +231,23 @@ def render(color):
         raise ValueError('Expected legacy, blue, or green')
     front, back, agent = ROUTES[color]
     policy = frontend_policy()
+    if ENVIRONMENT == 'main' and color != 'legacy' and policy is None:
+        raise ValueError('MAIN routing requires its pinned policy')
     if policy is not None and color in ('blue', 'green'):
         front = policy[color]['ip']
         if policy['version'] == 2:
             back, agent = policy[color]['backendIp'], policy[color]['agentIp']
+    prefix = 'ieum_main' if ENVIRONMENT == 'main' else 'ieum'
+    ports = (80, 8080, 8000)
+    if ENVIRONMENT == 'main' and color == 'legacy':
+        front = back = agent = '127.0.0.1'
+        ports = (9, 9, 9)
     return f'''# Managed by ieum-bluegreen-nginx. active={color}
-map $host $ieum_environment {{ default {color}; }}
-map $http_upgrade $ieum_connection_upgrade {{ default upgrade; '' close; }}
-upstream ieum_frontend {{ server {front}:80; }}
-upstream ieum_backend {{ server {back}:8080; }}
-upstream ieum_agent {{ server {agent}:8000; }}
+map $host ${prefix}_environment {{ default {color}; }}
+map $http_upgrade ${prefix}_connection_upgrade {{ default upgrade; '' close; }}
+upstream {prefix}_frontend {{ server {front}:{ports[0]}; }}
+upstream {prefix}_backend {{ server {back}:{ports[1]}; }}
+upstream {prefix}_agent {{ server {agent}:{ports[2]}; }}
 '''
 
 def atomic_write(path, content):
@@ -216,11 +266,19 @@ def atomic_write(path, content):
         if os.path.exists(name):
             os.unlink(name)
 
+def validate_nginx():
+    command = ['/usr/sbin/nginx', '-t']
+    result = subprocess.run(command, check=True, capture_output=True)
+    stderr = result.stderr.decode(errors='replace') if isinstance(result.stderr, bytes) else result.stderr
+    # nginx accepts duplicate server names with exit status 0 and ignores one site.
+    if ENVIRONMENT == 'main' and isinstance(stderr, str) and 'conflicting server name' in stderr.lower():
+        raise subprocess.CalledProcessError(1, command, output=result.stdout, stderr=result.stderr)
+
 def apply(color):
     previous = DESTINATION.read_text() if DESTINATION.exists() else None
     atomic_write(DESTINATION, render(color))
     try:
-        subprocess.run(['/usr/sbin/nginx', '-t'], check=True, capture_output=True)
+        validate_nginx()
         subprocess.run(['/usr/bin/systemctl', 'reload', 'nginx'], check=True, capture_output=True)
     except subprocess.CalledProcessError as error:
         if previous is not None:
@@ -241,9 +299,9 @@ def main(argv=None):
     elif args == ['read-frontend']:
         print(policy_text(frontend_policy()), end='')
     elif os.geteuid() == 0 and args == ['configure-frontend']:
-        configure_frontend()
+        with nginx_lock(): configure_frontend()
     elif os.geteuid() == 0 and len(args) == 1 and args[0] in ROUTES:
-        apply(args[0])
+        with nginx_lock(): apply(args[0])
         print('Nginx active environment:', args[0])
     else:
         raise ValueError('Invalid Nginx helper operation')

@@ -1,0 +1,46 @@
+name: ieum-main-redis
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: ${REDIS_CONTAINER_NAME}
+    restart: unless-stopped
+    cpus: ${SERVICE_CPUS}
+    mem_limit: ${SERVICE_MEMORY}
+    logging:
+      driver: json-file
+      options:
+        max-size: ${INFRA_LOG_MAX_SIZE}
+        max-file: ${INFRA_LOG_MAX_FILES}
+    labels:
+      ieum.bluegreen.environment: main
+      ieum.infra.service: redis
+
+    command: ["redis-server", "--appendonly", "yes"]
+
+    ports:
+      - "${HOST_BIND_IP:-127.0.0.1}:${REDIS_HOST_PORT:-16379}:6379"
+
+    volumes:
+      - ieum_redis_data:/data
+
+    networks:
+      data_network:
+        ipv4_address: ${REDIS_IP}
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  data_network:
+    external: true
+    name: ${GREEN_NETWORK}
+
+volumes:
+  ieum_redis_data:
+    labels:
+      ieum.bluegreen.environment: main
+      ieum.infra.service: redis

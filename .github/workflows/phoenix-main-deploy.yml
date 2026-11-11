@@ -1,106 +1,63 @@
-name: Deploy Main Phoenix
+name: Deploy MAIN Shared phoenix
 
 on:
   workflow_dispatch:
+    inputs:
+      operation:
+        description: Update owned MAIN service, check configuration, or explicitly bootstrap a fresh service
+        type: choice
+        required: true
+        default: check
+        options: [check, deploy, bootstrap]
 
 permissions:
   contents: read
 
 concurrency:
-  group: deploy_main_phoenix
+  group: infra_main_shared_services
   cancel-in-progress: false
 
-defaults:
-  run:
-    shell: bash
-
-env:
-  COMPOSE_FILE: compose/phoenix.green.compose.yml
-  PHOENIX_CONTAINER_NAME: ${{ secrets.AWS_PHOENIX_CONTAINER_NAME }}
-  PHOENIX_UI_PORT: ${{ secrets.AWS_PHOENIX_UI_PORT }}
-  HOST_BIND_IP: ${{ secrets.AWS_HOST_BIND_IP }}
-  GREEN_NETWORK: ${{ secrets.AWS_DOCKER_NETWORK }}
-  GREEN_NETWORK_SUBNET: ${{ secrets.AWS_DOCKER_NETWORK_SUBNET }}
-
 jobs:
-  deploy-phoenix:
-    name: Deploy Phoenix Container
+  deploy:
+    if: >-
+      github.ref == 'refs/heads/main' && (
+      inputs.operation == 'check' ||
+      (inputs.operation == 'bootstrap' && vars.MAIN_BOOTSTRAP_ENABLED == 'true') ||
+      (inputs.operation == 'deploy' && vars.MAIN_DEPLOY_ENABLED == 'true'))
+    environment: main
     runs-on:
       group: ieum_main_server
       labels: [self-hosted, linux, x64, ieum-infra, main, deploy]
-    timeout-minutes: 15
-
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
-      - name: Check runner prerequisites
+      - name: Test infrastructure configuration
         run: |
           set -euo pipefail
+          python3 -m unittest discover -s scripts/dev -p 'test_*.py'
+          python3 -m unittest discover -s scripts/main -p 'test_*.py'
 
-          command -v docker >/dev/null
-          docker compose version >/dev/null
-
-      - name: Validate secrets
+      - name: Validate or update isolated MAIN service
+        env:
+          IEUM_INFRA_SECRETS_JSON: ${{ toJSON(secrets) }}
+          IEUM_INFRA_LIMITS_JSON: ${{ toJSON(vars) }}
+          MAIN_DEPLOY_ENABLED: ${{ vars.MAIN_DEPLOY_ENABLED }}
+          MAIN_BOOTSTRAP_ENABLED: ${{ vars.MAIN_BOOTSTRAP_ENABLED }}
+          OPERATION: ${{ inputs.operation }}
         run: |
+          set +x
           set -euo pipefail
-
-          missing_vars=()
-          for name in \
-            PHOENIX_CONTAINER_NAME \
-            PHOENIX_UI_PORT \
-            GREEN_NETWORK \
-            GREEN_NETWORK_SUBNET
-          do
-            [ -n "${!name}" ] || missing_vars+=("$name")
-          done
-
-          if [ ${#missing_vars[@]} -gt 0 ]; then
-            echo "::error::Missing secrets for: ${missing_vars[*]}"
-            exit 1
-          fi
-
-          if [ "${HOST_BIND_IP:-127.0.0.1}" != "127.0.0.1" ]; then
-            echo "::error::Phoenix must bind to localhost. Set AWS_HOST_BIND_IP to 127.0.0.1 or leave it unset."
-            exit 1
-          fi
-
-      - name: Ensure Docker network
-        run: |
-          set -euo pipefail
-
-          if docker network inspect "$GREEN_NETWORK" >/dev/null 2>&1; then
-            current_subnet="$(docker network inspect -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' "$GREEN_NETWORK")"
-            if [ "$current_subnet" != "$GREEN_NETWORK_SUBNET" ]; then
-              echo "::error::Docker network ${GREEN_NETWORK} already exists with subnet ${current_subnet}, expected ${GREEN_NETWORK_SUBNET}"
-              exit 1
-            fi
-
-            exit 0
-          fi
-
-          docker network create --subnet "$GREEN_NETWORK_SUBNET" "$GREEN_NETWORK"
-
-      - name: Deploy Phoenix
-        run: |
-          set -euo pipefail
-
-          docker compose \
-            -f "$COMPOSE_FILE" \
-            up -d
-
-      - name: Health check
-        run: |
-          set -euo pipefail
-
-          for i in $(seq 1 30); do
-            if docker exec "$PHOENIX_CONTAINER_NAME" \
-              python -c "import urllib.request; urllib.request.urlopen('http://localhost:6006')" >/dev/null 2>&1; then
-              exit 0
-            fi
-
-            sleep 2
-          done
-
-          docker logs --tail 100 "$PHOENIX_CONTAINER_NAME"
-          exit 1
+          umask 077
+          args=(--profile main --service phoenix)
+          case "$OPERATION" in
+            check) ;;
+            deploy) args+=(--deploy) ;;
+            bootstrap) args+=(--bootstrap) ;;
+            *) exit 1 ;;
+          esac
+          python3 scripts/dev/infra_env.py "${args[@]}"

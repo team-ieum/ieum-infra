@@ -1,0 +1,52 @@
+name: ieum-main-phoenix
+
+services:
+  phoenix:
+    image: arizephoenix/phoenix:19.6.0
+    container_name: ${PHOENIX_CONTAINER_NAME}
+    restart: unless-stopped
+    cpus: ${SERVICE_CPUS}
+    mem_limit: ${SERVICE_MEMORY}
+    logging:
+      driver: json-file
+      options:
+        max-size: ${INFRA_LOG_MAX_SIZE}
+        max-file: ${INFRA_LOG_MAX_FILES}
+    labels:
+      ieum.bluegreen.environment: main
+      ieum.infra.service: phoenix
+
+    # 트레이스를 SQLite로 볼륨에 영속화(재시작 후 유지). Phoenix는 PHOENIX_WORKING_DIR
+    # 하위에 DB를 만든다.
+    environment:
+      PHOENIX_WORKING_DIR: /mnt/data
+
+    volumes:
+      - ieum_phoenix_data:/mnt/data
+
+    # 인증 없는 UI는 localhost에만 바인딩하고 뷰어는 SSH 터널로 접근한다.
+    # OTLP HTTP(/v1/traces)는 같은 Docker 네트워크의 컨테이너명:6006으로 수신한다.
+    ports:
+      - "${HOST_BIND_IP:-127.0.0.1}:${PHOENIX_UI_PORT}:6006"
+
+    # 고정 IP를 박지 않는다. ieum-agent는 컨테이너명(Docker 내장 DNS)으로 접근한다.
+    networks:
+      - data_network
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:6006')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+networks:
+  data_network:
+    external: true
+    name: ${GREEN_NETWORK}
+
+volumes:
+  ieum_phoenix_data:
+    labels:
+      ieum.bluegreen.environment: main
+      ieum.infra.service: phoenix

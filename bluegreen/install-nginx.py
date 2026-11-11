@@ -3,6 +3,7 @@
 from importlib.machinery import SourceFileLoader
 from importlib.util import module_from_spec, spec_from_loader
 import contextlib
+import argparse
 import fcntl
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import subprocess
 import time
 
 DEPLOYMENT_HOME = Path(os.environ.get('IEUM_BLUEGREEN_HOME', '/home/kwung/deploy/bluegreen'))
+ENVIRONMENT = 'dev'
 
 PREVIOUS_ARCHIVE_ASSET_LOCATIONS = '''    location ^~ /assets/ {
         proxy_pass http://ieum_frontend;
@@ -83,6 +85,99 @@ def render_main(original):
         return original
     return 'worker_shutdown_timeout 600s;\n' + original
 
+def render_main_site(original):
+    """Derive MAIN from the reviewed TLS/WAF policy without rewriting the DEV site."""
+    if len(re.findall(r'^\s*server\s*\{', original, re.MULTILINE)) != 1 or \
+            len(re.findall(r'^\s*server_name\s+', original, re.MULTILINE)) != 1 or \
+            not re.search(r'^\s*listen\s+11111\s+[^;]*ssl', original, re.MULTILINE) or \
+            'ssl_certificate' not in original:
+        raise RuntimeError('MAIN installation requires one reviewed TLS server on port 11111')
+    hostnames = re.search(r'^\s*server_name\s+([^;]+);', original, re.MULTILINE)[1].split()
+    if 'kiacms.co.kr' in hostnames:
+        raise RuntimeError('DEV site owns the exact MAIN hostname; review its server_name while preserving green.kiacms.co.kr before installing MAIN')
+    rendered = render_site(original)
+    rendered = re.sub(r'(^\s*server_name\s+)[^;]+;', r'\g<1>kiacms.co.kr;', rendered, flags=re.MULTILINE)
+    rendered = re.sub(r'(^\s*listen\s+[^;]*)\bdefault_server\b', r'\1', rendered, flags=re.MULTILINE)
+    rendered = rendered.replace('green.kiacms.co.kr', 'kiacms.co.kr')
+    rendered = rendered.replace('/var/lib/ieum-bluegreen', '/var/lib/ieum-main-bluegreen')
+    for symbol in ('environment', 'connection_upgrade', 'frontend', 'backend', 'agent', 'archived_assets'):
+        rendered = re.sub(r'\bieum_' + symbol + r'\b', 'ieum_main_' + symbol, rendered)
+    for directive, filename in [('access_log', 'ieum-main_access.log'), ('error_log', 'ieum-main_error.log')]:
+        rendered = re.sub(r'(^\s*' + directive + r'\s+)\S+',
+                          r'\g<1>/var/log/nginx/' + filename, rendered, flags=re.MULTILINE)
+    rendered = rendered.replace('server_name kiacms.co.kr;', 'server_name kiacms.co.kr;\n'
+        '    add_header X-IEUM-Deployment main always;\n'
+        '    if ($ieum_main_environment = legacy) { return 503; }')
+    if 'http://ieum_backend' in rendered or 'http://ieum_frontend' in rendered:
+        raise RuntimeError('MAIN site still references DEV upstreams')
+    return '# Managed MAIN site; derived from the reviewed DEV TLS/WAF policy.\n' + rendered
+
+def install_main_locked(owner, module):
+    source = Path(__file__).resolve().parent
+    site = Path('/etc/nginx/sites-available/ieum-main.conf')
+    enabled = Path('/etc/nginx/sites-enabled/ieum-main.conf')
+    helper = Path('/usr/local/sbin/ieum-main-bluegreen-nginx')
+    rule = Path('/etc/sudoers.d/ieum-main-bluegreen')
+    destination = module.DESTINATION
+    if site.exists() and not site.read_text().startswith('# Managed MAIN site;'):
+        raise RuntimeError('Unmanaged MAIN site already exists; review it before installation')
+    if os.path.lexists(enabled) and (not enabled.is_symlink() or enabled.resolve() != site):
+        raise RuntimeError('MAIN site activation path belongs to another configuration')
+    # The old DEV helper must participate in the same lock before MAIN is enabled.
+    dev_helper = Path('/usr/local/sbin/ieum-bluegreen-nginx')
+    if not dev_helper.exists() or 'def nginx_lock():' not in dev_helper.read_text() or \
+            str(module.NGINX_LOCK) not in dev_helper.read_text():
+        raise RuntimeError('Install the reviewed shared-lock DEV helper and update its SHA pins first')
+    original = Path('/etc/nginx/sites-available/ieum-front.conf').read_text()
+    rendered = site.read_text() if site.exists() else render_main_site(original)
+    base = Path('/var/lib/ieum-main-bluegreen')
+    base.mkdir(exist_ok=True, mode=0o755)
+    for name, mode in [('assets', 0o755), ('staging', 0o700)]:
+        path = base / name
+        if path.is_symlink(): raise RuntimeError('MAIN asset directory must not be a symlink')
+        path.mkdir(exist_ok=True, mode=mode)
+        os.chown(path, owner.pw_uid, owner.pw_gid)
+        os.chmod(path, mode)
+    paths = (site, helper, rule, destination)
+    saved = {p: (p.read_bytes(), p.stat()) if p.exists() else None for p in paths}
+    had_enabled = os.path.lexists(enabled)
+    backup = base / 'backups' / time.strftime('%Y%m%dT%H%M%S')
+    backup.mkdir(parents=True, mode=0o700)
+    os.chmod(backup.parent, 0o700)
+    for path in paths:
+        if path.exists(): shutil.copy2(path, backup / path.name)
+    try:
+        module.atomic_write(helper, (source / 'nginx-helper.py').read_text())
+        os.chown(helper, 0, 0); os.chmod(helper, 0o755)
+        previous_color = 'legacy'
+        if destination.exists():
+            match = re.search(r'^# Managed by ieum-bluegreen-nginx\. active=(legacy|blue|green)$',
+                              destination.read_text(), re.MULTILINE)
+            if not match: raise RuntimeError('Unmanaged MAIN route already exists')
+            previous_color = match[1]
+        module.atomic_write(destination, module.render(previous_color))
+        module.atomic_write(site, rendered)
+        module.atomic_write(rule, 'kwung ALL=(root) NOPASSWD: ' + ', '.join(
+            str(helper) + ' ' + command for command in ('legacy', 'blue', 'green', 'configure-frontend')) + '\n')
+        os.chmod(rule, 0o440)
+        if not had_enabled: enabled.symlink_to(site)
+        subprocess.run(['/usr/sbin/visudo', '-cf', str(rule)], check=True, capture_output=True)
+        module.validate_nginx()
+        subprocess.run(['/usr/bin/systemctl', 'reload', 'nginx'], check=True, capture_output=True)
+    except Exception:
+        if not had_enabled: enabled.unlink(missing_ok=True)
+        for path, previous in saved.items():
+            if previous is None: path.unlink(missing_ok=True)
+            else:
+                content, metadata = previous
+                module.atomic_write(path, content.decode())
+                os.chown(path, metadata.st_uid, metadata.st_gid)
+                os.chmod(path, stat.S_IMODE(metadata.st_mode))
+        restored = subprocess.run(['/usr/bin/systemctl', 'reload', 'nginx'], capture_output=True)
+        if restored.returncode: raise RuntimeError('MAIN installation rollback reload failed')
+        raise
+    print('Installed independent MAIN routes; DEV site and upstream files were preserved')
+
 @contextlib.contextmanager
 def deployment_lock(owner):
     # Do not create a root-owned deployment directory that the controller cannot use.
@@ -114,7 +209,25 @@ def deployment_lock(owner):
         os.close(descriptor)
 
 
+def load_helper():
+    source = Path(__file__).resolve().parent
+    loader = SourceFileLoader('bg_helper', str(source / 'nginx-helper.py'))
+    module = module_from_spec(spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    module.configure_environment(ENVIRONMENT)
+    return module
+
+
 def install_locked(owner):
+    module = load_helper()
+    with module.nginx_lock():
+        if ENVIRONMENT == 'main':
+            install_main_locked(owner, module)
+        else:
+            install_dev_locked(owner, module)
+
+
+def install_dev_locked(owner, module):
     source = Path(__file__).resolve().parent
     helper = Path('/usr/local/sbin/ieum-bluegreen-nginx')
     site = Path('/etc/nginx/sites-available/ieum-front.conf')
@@ -137,9 +250,6 @@ def install_locked(owner):
         directory.mkdir(exist_ok=True, mode=mode)
         os.chown(directory, owner.pw_uid, owner.pw_gid)
         os.chmod(directory, mode)
-    loader = SourceFileLoader('bg_helper', str(source / 'nginx-helper.py'))
-    module = module_from_spec(spec_from_loader(loader.name, loader))
-    loader.exec_module(module)
     try:
         module.atomic_write(helper, (source / 'nginx-helper.py').read_text())
         os.chown(helper, 0, 0)
@@ -177,7 +287,15 @@ def install_locked(owner):
     print('Installed routing, independent asset archive and bounded Nginx worker shutdown')
 
 
-def main():
+def main(argv=None):
+    global ENVIRONMENT, DEPLOYMENT_HOME
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--environment', choices=('dev', 'main'), default='dev')
+    # Imported callers historically invoke main() under unittest's arguments.
+    args = parser.parse_args([] if argv is None else argv)
+    ENVIRONMENT = args.environment
+    if ENVIRONMENT == 'main':
+        DEPLOYMENT_HOME = Path('/home/kwung/deploy/bluegreen-main')
     if os.geteuid() != 0:
         raise SystemExit('Run with sudo')
     owner = pwd.getpwnam('kwung')
@@ -186,4 +304,5 @@ def main():
         install_locked(owner)
 
 if __name__ == '__main__':
-    main()
+    import sys
+    main(sys.argv[1:])

@@ -1,0 +1,60 @@
+name: ieum-main-notion-mcp
+
+services:
+  notion-mcp:
+    build:
+      context: .
+      dockerfile: notion-mcp.main.Dockerfile
+      args:
+        NOTION_MCP_VERSION: ${NOTION_MCP_VERSION}
+    image: ieum-notion-mcp:main
+    container_name: ${NOTION_MCP_CONTAINER_NAME}
+    restart: unless-stopped
+    cpus: ${SERVICE_CPUS}
+    mem_limit: ${SERVICE_MEMORY}
+    logging:
+      driver: json-file
+      options:
+        max-size: ${INFRA_LOG_MAX_SIZE}
+        max-file: ${INFRA_LOG_MAX_FILES}
+    labels:
+      ieum.bluegreen.environment: main
+      ieum.infra.service: notion-mcp
+
+    # 게이트웨이 Bearer 인증 토큰. ieum-agent가 Authorization: Bearer로 동일 값을 보낸다.
+    # (docker inspect Args 노출을 피하려 --auth-token 플래그 대신 env로 주입)
+    environment:
+      AUTH_TOKEN: ${NOTION_MCP_AUTH_TOKEN}
+      PORT: ${NOTION_MCP_PORT}
+
+    command:
+      - "--transport"
+      - "http"
+      # 기본 바인딩이 127.0.0.1이라 컨테이너 내부에서만 접근된다. 같은 네트워크의
+      # 다른 컨테이너(ieum-agent)가 닿을 수 있도록 0.0.0.0(모든 인터페이스)에 바인딩한다.
+      - "--host"
+      - "0.0.0.0"
+      - "--port"
+      - "${NOTION_MCP_PORT}"
+      - "--enable-token-passthrough"
+
+    # MAIN host access is loopback only; apps use Docker DNS on the MAIN data network.
+    ports:
+      - "${HOST_BIND_IP:-127.0.0.1}:${NOTION_MCP_HOST_PORT:-13000}:${NOTION_MCP_PORT}"
+
+    # 고정 IP를 박지 않는다. ieum-agent는 컨테이너명(Docker 내장 DNS)으로 접근하므로
+    # 고정 IP가 불필요하고, 대역 내 주소 충돌(Address already in use)도 피한다.
+    networks:
+      - data_network
+
+    healthcheck:
+      test: ["CMD", "node", "-e", "const s=require('net').connect(Number(process.env.PORT),'127.0.0.1');s.setTimeout(3000);s.on('connect',()=>{s.end();process.exit(0)});s.on('error',()=>process.exit(1));s.on('timeout',()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+networks:
+  data_network:
+    external: true
+    name: ${GREEN_NETWORK}

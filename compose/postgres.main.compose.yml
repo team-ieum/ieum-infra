@@ -1,0 +1,49 @@
+name: ieum-main-postgres
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ${POSTGRES_CONTAINER_NAME}
+    restart: unless-stopped
+    cpus: ${SERVICE_CPUS}
+    mem_limit: ${SERVICE_MEMORY}
+    logging:
+      driver: json-file
+      options:
+        max-size: ${INFRA_LOG_MAX_SIZE}
+        max-file: ${INFRA_LOG_MAX_FILES}
+    labels:
+      ieum.bluegreen.environment: main
+      ieum.infra.service: postgres
+
+    ports:
+      - "${HOST_BIND_IP}:${POSTGRES_HOST_PORT}:${POSTGRES_PORT}"
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+    volumes:
+      - ieum_postgres_data:/var/lib/postgresql/data
+
+    networks:
+      data_network:
+        ipv4_address: ${POSTGRES_IP}
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  data_network:
+    external: true
+    name: ${GREEN_NETWORK}
+
+volumes:
+  ieum_postgres_data:
+    labels:
+      ieum.bluegreen.environment: main
+      ieum.infra.service: postgres

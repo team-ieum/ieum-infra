@@ -1,0 +1,89 @@
+name: Blue Green Main Operations
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Operation
+        type: choice
+        required: true
+        options: [status, check, switch, rollback, recover]
+      color:
+        description: Environment for check or switch
+        type: choice
+        options: [blue, green]
+        default: blue
+      rollback_release:
+        description: Exact retained release ID from status (required for rollback)
+        type: string
+        default: ''
+      force:
+        description: Isolate a managed backend when drain fails (may interrupt running work)
+        type: boolean
+        default: false
+      recovery_target:
+        description: Healthy destination for recover; auto follows the journal state
+        type: choice
+        options: [auto, blue, green]
+        default: auto
+      abandon:
+        description: Recover only; isolate both backends and archive the journal for forward-fix (requires force)
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: bluegreen_main_operations
+  cancel-in-progress: false
+jobs:
+  operate:
+    if: github.ref == 'refs/heads/main' && vars.MAIN_DEPLOY_ENABLED == 'true'
+    environment: main
+    env:
+      IEUM_DEPLOY_ENVIRONMENT: main
+    runs-on:
+      group: ieum_main_server
+      labels: [self-hosted, linux, x64, ieum-infra, main, deploy]
+    timeout-minutes: 120
+    steps:
+      - name: Operate installed blue-green controller
+        env:
+          OPERATION: ${{ inputs.operation }}
+          COLOR: ${{ inputs.color }}
+          RELEASE: ${{ inputs.rollback_release }}
+          FORCE: ${{ inputs.force }}
+          RECOVERY_TARGET: ${{ inputs.recovery_target }}
+          ABANDON: ${{ inputs.abandon }}
+          CONTROLLER_SHA256: ${{ vars.MAIN_BLUEGREEN_CONTROLLER_SHA256 }}
+          HELPER_SHA256: ${{ vars.MAIN_BLUEGREEN_HELPER_SHA256 }}
+        run: |
+          set -euo pipefail
+          controller=/home/kwung/deploy/bluegreen-main/bluegreen.py
+          helper=/usr/local/sbin/ieum-main-bluegreen-nginx
+          if ! [[ "$CONTROLLER_SHA256" =~ ^[[:xdigit:]]{64}$ && "$HELPER_SHA256" =~ ^[[:xdigit:]]{64}$ ]]; then exit 1; fi
+          printf '%s  %s\n' "$CONTROLLER_SHA256" "$controller" | sha256sum -c - >/dev/null 2>&1
+          printf '%s  %s\n' "$HELPER_SHA256" "$helper" | sha256sum -c - >/dev/null 2>&1
+          if ! [[ "$FORCE" == true || "$FORCE" == false ]]; then exit 1; fi
+          if ! [[ "$ABANDON" == true || "$ABANDON" == false ]]; then exit 1; fi
+          command_args=("$controller" --lock-timeout 30 "$OPERATION")
+          case "$OPERATION" in
+            status) ;;
+            recover)
+              case "$RECOVERY_TARGET" in
+                auto) ;;
+                blue|green) command_args+=(--target "$RECOVERY_TARGET") ;;
+                *) exit 1 ;;
+              esac
+              if [[ "$ABANDON" == true ]]; then
+                if ! [[ "$FORCE" == true && "$RECOVERY_TARGET" == auto ]]; then exit 1; fi
+                command_args+=(--abandon)
+              fi ;;
+            rollback)
+              if ! [[ "$RELEASE" =~ ^[[:xdigit:]]{16}$ ]]; then exit 1; fi
+              command_args+=(--release "$RELEASE") ;;
+            switch|check) command_args+=("$COLOR") ;;
+            *) exit 1 ;;
+          esac
+          if [[ "$FORCE" == true && "$OPERATION" =~ ^(recover|rollback|switch)$ ]]; then
+            command_args+=(--force)
+          fi
+          python3 "${command_args[@]}"
