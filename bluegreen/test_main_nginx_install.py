@@ -43,6 +43,100 @@ DEV_SITE = '''server {
 }
 '''
 
+OTHER_DEV_SERVERS = '''# HTTP and TLS default/redirect policy must stay only in DEV.
+server {
+    listen 80 default_server;
+    server_name _;
+    return 444;
+}
+server {
+    listen 80;
+    server_name green.kiacms.co.kr;
+    return 301 https://green.kiacms.co.kr$request_uri;
+}
+server {
+    listen 11111 ssl default_server;
+    server_name _;
+    ssl_certificate /existing/default.pem;
+    ssl_certificate_key /existing/default-key.pem;
+    return 444;
+}
+'''
+MULTI_DEV_SITE = OTHER_DEV_SERVERS + DEV_SITE.replace(
+    'listen 11111 ssl default_server;', 'listen 11111 ssl;').replace(
+        'server_name green.kiacms.co.kr;', 'server_name green.kiacms.co.kr 192.168.0.11;')
+
+
+class MainSiteSelectionTest(unittest.TestCase):
+    def test_existing_single_server_fixture_remains_supported(self):
+        self.assertEqual(installer.select_dev_tls_site(DEV_SITE), DEV_SITE)
+        rendered = installer.render_main_site(DEV_SITE)
+        self.assertIn('server_name kiacms.co.kr;', rendered)
+        self.assertNotIn('default_server', rendered)
+        self.assertIn('access_log /var/log/nginx/ieum-main_access.log;', rendered)
+        self.assertIn('error_log /var/log/nginx/ieum-main_error.log;', rendered)
+
+    def test_four_server_live_shape_selects_only_the_named_tls_server(self):
+        selected = installer.select_dev_tls_site(MULTI_DEV_SITE)
+        self.assertEqual(selected, MULTI_DEV_SITE[len(OTHER_DEV_SERVERS):])
+        rendered = installer.render_main_site(MULTI_DEV_SITE)
+        for excluded in ('listen 80', 'return 444', 'return 301', 'default_server',
+                         '/existing/default.pem', '192.168.0.11'):
+            self.assertNotIn(excluded, rendered)
+        self.assertEqual(len(installer.nginx_directives(rendered)), 1)
+
+    def test_inline_server_name_still_installs_main_legacy_guard(self):
+        original = MULTI_DEV_SITE.replace(
+            'listen 11111 ssl;\n    server_name green.kiacms.co.kr 192.168.0.11;',
+            'listen 11111 ssl; server_name green.kiacms.co.kr 192.168.0.11;')
+        rendered = installer.render_main_site(original)
+        directives = installer.nginx_directives(rendered)[0]['children']
+        self.assertEqual([node['words'] for node in directives if node['words'][0] == 'server_name'],
+                         [['server_name', 'kiacms.co.kr']])
+        self.assertIn('add_header X-IEUM-Deployment main always;', rendered)
+        self.assertIn('if ($ieum_main_environment = legacy) { return 503; }', rendered)
+        self.assertNotIn('192.168.0.11', rendered)
+
+    def test_comments_quotes_escapes_and_variable_braces_do_not_change_block_boundaries(self):
+        policy = '''    # } server { server_name kiacms.co.kr; }
+    add_header X-Quoted "} # { ; \\"still quoted\\"";
+    add_header X-Single '} # { ;';
+    set $escaped \\}\\{;
+    set $url ${scheme}://$host;
+    if ($request_method = OPTIONS) { return 204; }
+'''
+        selected = DEV_SITE.replace('    modsecurity on;\n', policy + '    modsecurity on;\n')
+        original = '# server { unmatched comment brace\n' + OTHER_DEV_SERVERS + selected
+        self.assertEqual(installer.select_dev_tls_site(original), selected)
+        self.assertIn(policy, installer.render_main_site(original))
+
+    def test_multiple_named_tls_candidates_are_rejected(self):
+        for second in (DEV_SITE, DEV_SITE.replace('    ssl_certificate /existing/fullchain.pem;\n', ''),
+                       DEV_SITE.replace('server_name green.kiacms.co.kr;',
+                                        'server_name green.kiacms.co.kr; server_name another.host;')):
+            with self.subTest(second=second), self.assertRaisesRegex(RuntimeError, 'exactly one named'):
+                installer.render_main_site(MULTI_DEV_SITE + second)
+
+    def test_missing_named_tls_candidate_is_rejected(self):
+        for original in (OTHER_DEV_SERVERS, DEV_SITE.replace('11111', '443'),
+                         DEV_SITE.replace('green.kiacms.co.kr', 'other.kiacms.co.kr'),
+                         DEV_SITE.replace('    ssl_certificate /existing/fullchain.pem;\n', '')):
+            with self.subTest(original=original), self.assertRaisesRegex(RuntimeError, 'exactly one named'):
+                installer.render_main_site(original)
+
+    def test_exact_main_hostname_in_another_server_is_rejected(self):
+        apex = 'server { listen 80; server_name "kiacms.co.kr"; return 301 https://$host$request_uri; }\n'
+        for original in (apex + MULTI_DEV_SITE, MULTI_DEV_SITE + apex,
+                         MULTI_DEV_SITE + apex.replace('kiacms.co.kr', 'KIACMS.CO.KR')):
+            with self.subTest(original=original), self.assertRaisesRegex(RuntimeError, 'exact MAIN hostname'):
+                installer.render_main_site(original)
+
+    def test_unclosed_quotes_or_blocks_are_rejected(self):
+        for original in (DEV_SITE + 'server {', DEV_SITE + 'add_header Broken "unterminated',
+                         DEV_SITE + '}', DEV_SITE + 'listen 80'):
+            with self.subTest(original=original), self.assertRaises(RuntimeError):
+                installer.render_main_site(original)
+
 
 class MainNginxInstallationTest(unittest.TestCase):
     def setUp(self):
@@ -68,7 +162,7 @@ class MainNginxInstallationTest(unittest.TestCase):
         (self.source / 'nginx-helper.py').write_text(self.new_helper)
         self.dev_helper = self.mapped('/usr/local/sbin/ieum-bluegreen-nginx')
         protected = {
-            '/etc/nginx/sites-available/ieum-front.conf': DEV_SITE,
+            '/etc/nginx/sites-available/ieum-front.conf': MULTI_DEV_SITE,
             '/etc/nginx/conf.d/ieum-bluegreen.conf': '# DEV active=green\n',
             '/etc/nginx/nginx.conf': 'worker_shutdown_timeout 600s;\nevents {}\n',
             '/etc/sudoers.d/ieum-bluegreen': '# Existing DEV privileges\n',
@@ -194,6 +288,9 @@ class MainNginxInstallationTest(unittest.TestCase):
             self.assertIn(expected, site)
         self.assertNotIn('default_server', site)
         self.assertNotIn('green.kiacms.co.kr', site)
+        self.assertNotIn('listen 80', site)
+        self.assertNotIn('return 444', site)
+        self.assertNotIn('return 301', site)
         self.assertEqual(self.command_mock.call_args_list, [
             call(['/usr/sbin/visudo', '-cf', str(self.files['rule'])], check=True, capture_output=True),
             call(['/usr/sbin/nginx', '-t'], check=True, capture_output=True),
@@ -277,6 +374,15 @@ class MainNginxInstallationTest(unittest.TestCase):
             DEV_SITE.replace('server_name green.kiacms.co.kr;',
                              'server_name green.kiacms.co.kr kiacms.co.kr;'))
         self.assert_rejected_before_mutation('exact MAIN hostname')
+
+    def test_other_server_owning_exact_main_hostname_is_rejected_before_any_mutation(self):
+        self.mapped('/etc/nginx/sites-available/ieum-front.conf').write_text(
+            MULTI_DEV_SITE + 'server { listen 80; server_name kiacms.co.kr; return 444; }\n')
+        self.assert_rejected_before_mutation('exact MAIN hostname')
+
+    def test_ambiguous_dev_tls_servers_are_rejected_before_any_mutation(self):
+        self.mapped('/etc/nginx/sites-available/ieum-front.conf').write_text(MULTI_DEV_SITE + DEV_SITE)
+        self.assert_rejected_before_mutation('exactly one named')
 
     def test_activation_symlink_to_another_site_is_rejected_before_any_mutation(self):
         self.files['enabled'].symlink_to(self.mapped('/etc/nginx/sites-available/ieum-front.conf'))

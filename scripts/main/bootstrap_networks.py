@@ -142,9 +142,17 @@ def inspect_networks():
     if not isinstance(result, list) or len(result) != len(identities) \
             or any(not isinstance(item, dict) or not isinstance(item.get('Name'), str)
                    or not isinstance(item.get('Driver'), str) or not isinstance(item.get('IPAM'), dict)
-                   or not isinstance(item['IPAM'].get('Config'), list) for item in result) \
+                   for item in result) \
             or {item.get('Id') for item in result} != set(identities):
         raise PreparationError('docker_network_inventory_unavailable')
+    for item in result:
+        configs = item['IPAM'].get('Config')
+        # Docker's built-in host/none networks do not allocate subnets and may
+        # report null (or omit Config). Normalize only those exact identities.
+        if configs is None and (item['Name'], item['Driver']) in (('host', 'host'), ('none', 'null')):
+            item['IPAM']['Config'] = []
+        elif not isinstance(configs, list) or any(not isinstance(config, dict) for config in configs):
+            raise PreparationError('docker_network_inventory_unavailable')
     return result
 
 

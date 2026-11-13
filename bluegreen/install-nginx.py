@@ -85,29 +85,115 @@ def render_main(original):
         return original
     return 'worker_shutdown_timeout 600s;\n' + original
 
+def nginx_directives(original):
+    """Read directive boundaries without treating quoted/comment braces as blocks."""
+    tokens = []
+    index = 0
+    while index < len(original):
+        if original[index].isspace():
+            index += 1
+            continue
+        if original[index] == '#':
+            newline = original.find('\n', index)
+            index = len(original) if newline < 0 else newline + 1
+            continue
+        start = index
+        if original[index] in '{};':
+            tokens.append((original[index], original[index], start, index + 1))
+            index += 1
+            continue
+        value, quote = '', None
+        while index < len(original):
+            char = original[index]
+            if char == '\\':
+                if index + 1 == len(original):
+                    raise RuntimeError('Incomplete escape in Nginx site')
+                value += original[index + 1]
+                index += 2
+            elif quote:
+                if char == quote:
+                    quote = None
+                else:
+                    value += char
+                index += 1
+            elif char in ('"', "'"):
+                quote = char
+                index += 1
+            elif original.startswith('${', index):
+                end = original.find('}', index + 2)
+                if end < 0:
+                    raise RuntimeError('Incomplete variable in Nginx site')
+                value += original[index:end + 1]
+                index = end + 1
+            elif char.isspace() or char in '{};#':
+                break
+            else:
+                value += char
+                index += 1
+        if quote:
+            raise RuntimeError('Unclosed quote in Nginx site')
+        tokens.append(('word', value, start, index))
+
+    root = {'children': []}
+    stack, words, start = [root], [], None
+    for kind, value, begin, end in tokens:
+        if kind == 'word':
+            if not words:
+                start = begin
+            words.append(value)
+        elif kind in (';', '{'):
+            if not words:
+                raise RuntimeError('Unexpected directive boundary in Nginx site')
+            node = {'words': words, 'start': start, 'end': end,
+                    'children': [] if kind == '{' else None}
+            stack[-1]['children'].append(node)
+            if kind == '{':
+                stack.append(node)
+            words = []
+        else:
+            if words or len(stack) == 1:
+                raise RuntimeError('Unexpected closing brace in Nginx site')
+            stack.pop()['end'] = end
+    if words or len(stack) != 1:
+        raise RuntimeError('Incomplete directive or block in Nginx site')
+    return root['children']
+
+def select_dev_tls_site(original):
+    """Select the named DEV TLS server, leaving every other server out of MAIN."""
+    servers = [node for node in nginx_directives(original)
+               if node['words'] == ['server'] and node['children'] is not None]
+    matches = []
+    for server in servers:
+        directives = [node['words'] for node in server['children'] if node['children'] is None]
+        names = [words[1:] for words in directives if words[0] == 'server_name']
+        if any(name.lower() == 'kiacms.co.kr' for group in names for name in group):
+            raise RuntimeError('DEV site owns the exact MAIN hostname; review its server_name while preserving green.kiacms.co.kr before installing MAIN')
+        tls = any(words[0] == 'listen' and len(words) > 2 and 'ssl' in words[2:]
+                  and (words[1] == '11111' or words[1].endswith(':11111')) for words in directives)
+        certificate = any(words[0] == 'ssl_certificate' and len(words) == 2 for words in directives)
+        if any(name.lower() == 'green.kiacms.co.kr' for group in names for name in group) and tls:
+            matches.append((server, names, certificate))
+    if len(matches) != 1 or len(matches[0][1]) != 1 or not matches[0][2]:
+        raise RuntimeError('MAIN installation requires exactly one named green.kiacms.co.kr TLS server on port 11111')
+    server = matches[0][0]
+    return original[server['start']:server['end']] + '\n'
+
 def render_main_site(original):
     """Derive MAIN from the reviewed TLS/WAF policy without rewriting the DEV site."""
-    if len(re.findall(r'^\s*server\s*\{', original, re.MULTILINE)) != 1 or \
-            len(re.findall(r'^\s*server_name\s+', original, re.MULTILINE)) != 1 or \
-            not re.search(r'^\s*listen\s+11111\s+[^;]*ssl', original, re.MULTILINE) or \
-            'ssl_certificate' not in original:
-        raise RuntimeError('MAIN installation requires one reviewed TLS server on port 11111')
-    hostnames = re.search(r'^\s*server_name\s+([^;]+);', original, re.MULTILINE)[1].split()
-    if 'kiacms.co.kr' in hostnames:
-        raise RuntimeError('DEV site owns the exact MAIN hostname; review its server_name while preserving green.kiacms.co.kr before installing MAIN')
-    rendered = render_site(original)
-    rendered = re.sub(r'(^\s*server_name\s+)[^;]+;', r'\g<1>kiacms.co.kr;', rendered, flags=re.MULTILINE)
+    rendered = render_site(select_dev_tls_site(original))
+    name_directive = next(node for node in nginx_directives(rendered)[0]['children']
+                          if node['children'] is None and node['words'][0] == 'server_name')
+    rendered = (rendered[:name_directive['start']] + 'server_name kiacms.co.kr;\n'
+        '    add_header X-IEUM-Deployment main always;\n'
+        '    if ($ieum_main_environment = legacy) { return 503; }' + rendered[name_directive['end']:])
     rendered = re.sub(r'(^\s*listen\s+[^;]*)\bdefault_server\b', r'\1', rendered, flags=re.MULTILINE)
     rendered = rendered.replace('green.kiacms.co.kr', 'kiacms.co.kr')
     rendered = rendered.replace('/var/lib/ieum-bluegreen', '/var/lib/ieum-main-bluegreen')
     for symbol in ('environment', 'connection_upgrade', 'frontend', 'backend', 'agent', 'archived_assets'):
         rendered = re.sub(r'\bieum_' + symbol + r'\b', 'ieum_main_' + symbol, rendered)
     for directive, filename in [('access_log', 'ieum-main_access.log'), ('error_log', 'ieum-main_error.log')]:
-        rendered = re.sub(r'(^\s*' + directive + r'\s+)\S+',
+        rendered = re.sub(r'(^\s*' + directive + r'\s+)[^\s;]+',
                           r'\g<1>/var/log/nginx/' + filename, rendered, flags=re.MULTILINE)
-    rendered = rendered.replace('server_name kiacms.co.kr;', 'server_name kiacms.co.kr;\n'
-        '    add_header X-IEUM-Deployment main always;\n'
-        '    if ($ieum_main_environment = legacy) { return 503; }')
     if 'http://ieum_backend' in rendered or 'http://ieum_frontend' in rendered:
         raise RuntimeError('MAIN site still references DEV upstreams')
     return '# Managed MAIN site; derived from the reviewed DEV TLS/WAF policy.\n' + rendered

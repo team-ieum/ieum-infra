@@ -129,6 +129,32 @@ class InventoryTests(unittest.TestCase):
         with patch.object(prep, 'run', return_value='[]'), self.assertRaises(prep.PreparationError):
             prep.inspect_routes()
 
+    def test_builtin_host_and_none_without_ipam_subnets_allow_plan_validation(self):
+        for ipam in ({'Config': None}, {}):
+            networks = [bridge(),
+                        {'Id': 'b' * 64, 'Name': 'host', 'Driver': 'host', 'IPAM': copy.deepcopy(ipam)},
+                        {'Id': 'c' * 64, 'Name': 'none', 'Driver': 'null', 'IPAM': copy.deepcopy(ipam)}]
+            identities = '\n'.join(network['Id'] for network in networks)
+            with self.subTest(ipam=ipam), patch.object(prep, 'run', side_effect=[identities, json.dumps(networks)]):
+                inspected = prep.inspect_networks()
+            self.assertEqual([network['IPAM']['Config'] for network in inspected[1:]], [[], []])
+            self.assertEqual(prep.validate_inventory(self.wanted, inspected, routes()), {})
+            with self.assertRaises(prep.PreparationError):
+                prep.validate_inventory(self.wanted, inspected, routes() + [{'dst': '10.40.0.0/16', 'dev': 'eth0'}])
+
+    def test_missing_or_malformed_ipam_is_rejected_outside_exact_builtin_exception(self):
+        cases = [('bridge', 'bridge', ipam) for ipam in ({}, {'Config': None}, {'Config': {}}, {'Config': [None]})]
+        cases += [(name, driver, {'Config': None}) for name, driver in
+                  (('custom', 'host'), ('custom', 'null'), ('host', 'bridge'), ('none', 'bridge'),
+                   ('ieum_main_net_blue', 'bridge'))]
+        cases += [('host', 'host', ipam) for ipam in (None, {'Config': {}}, {'Config': ''}, {'Config': [None]})]
+        for name, driver, ipam in cases:
+            network = {'Id': 'a' * 64, 'Name': name, 'Driver': driver, 'IPAM': ipam}
+            with self.subTest(name=name, driver=driver, ipam=ipam), \
+                    patch.object(prep, 'run', side_effect=['a' * 64, json.dumps([network])]), \
+                    self.assertRaises(prep.PreparationError):
+                prep.inspect_networks()
+
 
 class PreparationTests(unittest.TestCase):
     def setUp(self):
