@@ -44,7 +44,13 @@ jobs:
 
       - name: Validate or update isolated MAIN service
         env:
-          IEUM_INFRA_SECRETS_JSON: ${{ toJSON(secrets) }}
+          MAIN_COM_DATA_DOCKER_NETWORK: ${{ secrets.MAIN_COM_DATA_DOCKER_NETWORK }}
+          MAIN_COM_DATA_DOCKER_NETWORK_SUBNET: ${{ secrets.MAIN_COM_DATA_DOCKER_NETWORK_SUBNET }}
+          MAIN_COM_HOST_BIND_IP: ${{ secrets.MAIN_COM_HOST_BIND_IP }}
+          MAIN_COM_REDIS_ENV_FILE: ${{ secrets.MAIN_COM_REDIS_ENV_FILE }}
+          MAIN_COM_REDIS_CONTAINER_NAME: ${{ secrets.MAIN_COM_REDIS_CONTAINER_NAME }}
+          MAIN_COM_REDIS_IP: ${{ secrets.MAIN_COM_REDIS_IP }}
+          MAIN_COM_REDIS_HOST_PORT: ${{ secrets.MAIN_COM_REDIS_HOST_PORT }}
           IEUM_INFRA_LIMITS_JSON: ${{ toJSON(vars) }}
           MAIN_DEPLOY_ENABLED: ${{ vars.MAIN_DEPLOY_ENABLED }}
           MAIN_BOOTSTRAP_ENABLED: ${{ vars.MAIN_BOOTSTRAP_ENABLED }}

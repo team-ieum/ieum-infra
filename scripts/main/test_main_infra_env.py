@@ -6,8 +6,10 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -17,6 +19,8 @@ spec = importlib.util.spec_from_file_location('main_infra_under_test', Path(__fi
 infra = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(infra)
 SECRET = 'synthetic-main-private-value'
+OPTIONAL_INPUTS = {service: ('HOST_BIND_IP',) + tuple(infra.OPTIONALS.get(service, {}))
+                   for service in infra.shared.SCHEMAS}
 
 
 def limits():
@@ -181,13 +185,71 @@ class SettingsTests(unittest.TestCase):
         def observe(payload, service, **kwargs):
             self.assertNotIn(infra.shared.TRANSPORT, os.environ)
             self.assertNotIn(infra.RESOURCE_TRANSPORT, os.environ)
+            self.assertTrue(all(name not in os.environ for name in infra.explicit_secret_names(service)))
+            self.assertEqual(json.loads(payload), {
+                name: value for name, value in secrets().items()
+                if name in infra.explicit_secret_names(service)})
             self.assertEqual(kwargs['operation'], 'bootstrap')
             return 0
-        with patch.dict(os.environ, {infra.shared.TRANSPORT: json.dumps(secrets()),
+        with patch.dict(os.environ, {**secrets(), infra.shared.TRANSPORT: 'unused-invalid-json',
                                     infra.RESOURCE_TRANSPORT: json.dumps(limits()), 'MAIN_DEPLOY_ENABLED': 'true'}), \
                 patch.object(infra.shared, 'main_profile_module', return_value=infra), \
                 patch.object(infra, 'run_operation', side_effect=observe):
             self.assertEqual(infra.shared.main(['--profile', 'main', '--service', 'postgres', '--bootstrap']), 0)
+
+    def test_explicit_inputs_preserve_settings_without_other_service_credentials(self):
+        for service in infra.shared.SCHEMAS:
+            environment = {**secrets(), 'DEV_COM_POSTGRES_PASSWORD': 'not-selected',
+                           'MAIN_COM_FUTURE_OPTION': 'not-selected', 'GITHUB_TOKEN': 'not-selected'}
+            # Missing GitHub Secrets arrive as empty strings. Existing optional defaults stay intact.
+            environment.update({infra.PREFIX + key: '' for key in OPTIONAL_INPUTS[service]})
+            payload = infra.consume_explicit_secrets(environment, service)
+            selected = infra.build_settings(payload, service, json.dumps(limits()))
+            self.assertEqual(selected, settings(service))
+            self.assertNotIn('not-selected', payload)
+            self.assertTrue(all(name not in environment for name in infra.explicit_secret_names(service)))
+            other_credentials = {'POSTGRES_PASSWORD', 'MONGO_INITDB_ROOT_PASSWORD', 'NOTION_MCP_AUTH_TOKEN'}
+            for key in other_credentials - set(infra.shared.SCHEMAS[service]):
+                self.assertNotIn(infra.PREFIX + key, json.loads(payload))
+
+    def test_main_cli_ignores_full_json_transport_and_never_falls_back(self):
+        for explicit in ({}, {infra.PREFIX + 'POSTGRES_PASSWORD': ''}):
+            out, err = io.StringIO(), io.StringIO()
+            with patch.dict(os.environ, {**explicit, infra.shared.TRANSPORT: json.dumps(secrets()),
+                                        infra.RESOURCE_TRANSPORT: json.dumps(limits())}, clear=True), \
+                    patch.object(infra.shared, 'main_profile_module', return_value=infra), \
+                    patch.object(infra, 'deploy') as mutate, \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = infra.shared.main(['--profile', 'main', '--service', 'postgres'])
+            self.assertEqual(code, 1)
+            mutate.assert_not_called()
+            self.assertIn('missing_required_configuration', err.getvalue())
+            self.assertNotIn(SECRET, out.getvalue() + err.getvalue())
+
+    def test_explicit_transport_preserves_literal_password_and_rejects_record_injection(self):
+        literal = '  서울 $VAR ${OTHER} $(touch ignored) `echo x` " \' # = \\  '
+        for value in (literal, literal + '\nINJECTED=yes'):
+            environment = {**secrets(), infra.PREFIX + 'POSTGRES_PASSWORD': value}
+            payload = infra.consume_explicit_secrets(environment, 'postgres')
+            if '\n' in value:
+                with self.assertRaises(infra.ConfigurationError):
+                    infra.build_settings(payload, 'postgres', json.dumps(limits()))
+            else:
+                selected = infra.build_settings(payload, 'postgres', json.dumps(limits()))
+                self.assertEqual(selected['values']['POSTGRES_PASSWORD'], literal)
+
+    def test_real_main_check_cli_accepts_only_explicit_inputs_and_sanitizes_failures(self):
+        common = {key: os.environ[key] for key in ('PATH', 'HOME', 'LANG', 'LD_LIBRARY_PATH')
+                  if key in os.environ}
+        for valid in (True, False):
+            environment = {**common, **secrets(), infra.RESOURCE_TRANSPORT: json.dumps(limits())}
+            if not valid:
+                environment[infra.PREFIX + 'POSTGRES_PASSWORD'] = SECRET + '\nRECORD=value'
+            result = subprocess.run([sys.executable, str(infra.ROOT / 'scripts/dev/infra_env.py'),
+                                     '--profile', 'main', '--service', 'postgres'],
+                                    env=environment, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0 if valid else 1)
+            self.assertNotIn(SECRET, result.stdout + result.stderr)
 
     def test_public_profile_dispatch_and_separate_bootstrap_deploy_gates(self):
         actual = infra.shared.build_settings(json.dumps(secrets()), 'postgres', profile='main',
@@ -314,7 +376,13 @@ class WorkflowTests(unittest.TestCase):
             self.assertIn('--profile main --service ' + service, source)
             self.assertIn('options: [check, deploy, bootstrap]', source)
             self.assertIn('infra_main_shared_services', source)
-            self.assertIn('${{ toJSON(secrets) }}', source)
+            self.assertNotIn('toJSON(secrets)', source)
+            self.assertNotIn('IEUM_INFRA_SECRETS_JSON', source)
+            selected = re.findall(r'^          (MAIN_COM_[A-Z0-9_]+): \$\{\{ secrets\.([A-Z0-9_]+) \}\}$',
+                                  source, re.MULTILINE)
+            self.assertEqual({name for name, _ in selected}, set(infra.explicit_secret_names(service)))
+            self.assertEqual(len(selected), len(infra.explicit_secret_names(service)))
+            self.assertTrue(all(name == secret for name, secret in selected))
             self.assertIn('${{ toJSON(vars) }}', source)
             self.assertNotIn('AWS_', source)
             self.assertNotIn('docker rm', source)

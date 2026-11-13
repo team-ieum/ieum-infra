@@ -33,6 +33,20 @@ OPTIONALS = {'redis': {'REDIS_HOST_PORT': '16379'},
              'notion-mcp': {'NOTION_MCP_HOST_PORT': '13000'}}
 
 
+def explicit_secret_names(service):
+    """해당 MAIN 서비스의 workflow가 명시해서 전달할 설정 이름을 반환한다."""
+    if service not in shared.SCHEMAS:
+        raise ConfigurationError('unknown_service')
+    return tuple(PREFIX + name for name in
+                 shared.COMMON + shared.SCHEMAS[service] + tuple(OPTIONALS.get(service, {})))
+
+
+def consume_explicit_secrets(environment, service):
+    """명시된 입력만 기존 검증 형식으로 옮기고 하위 프로세스의 환경에서 제거한다."""
+    return json.dumps({name: environment.pop(name) for name in explicit_secret_names(service)
+                       if name in environment})
+
+
 def parse_object(payload):
     if not isinstance(payload, str) or not payload:
         raise ConfigurationError('missing_configuration')

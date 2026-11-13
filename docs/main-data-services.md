@@ -5,7 +5,7 @@ MAIN은 `kiacms.co.kr`, DEV는 기존 `green.kiacms.co.kr`을 사용한다. 같�
 ## 구현된 경계
 
 - 기본 CLI는 기존 DEV 동작이다. MAIN은 `scripts/dev/infra_env.py --profile main`을 명시해야 한다.
-- MAIN helper는 `MAIN_COM_` Secrets만 읽으며 DEV/AWS/접두사 없는 설정으로 누락값을 보충하지 않는다.
+- MAIN workflow는 해당 서비스에 필요한 `MAIN_COM_` Secrets를 단계의 `env`에 개별 지정한다. helper는 그 명시적 입력만 읽으며 전체 Secrets JSON이나 DEV/AWS/접두사 없는 설정으로 누락값을 보충하지 않는다.
 - 새 `compose/*.main.compose.yml`은 `ieum-main-{service}` 프로젝트·컨테이너 이름과 MAIN 환경 라벨을 사용한다. 기존 DEV `*.green.compose.yml`과 DEV 프로젝트·볼륨 이름은 유지한다.
 - MAIN 데이터망은 외부 Docker network `ieum_main_net_data`이고, `ieum.bluegreen.environment=main` 라벨과 설정한 subnet이 일치해야 한다. helper는 네트워크를 생성·수정하지 않는다.
 - DB·Redis·Phoenix·MCP 호스트 포트는 `127.0.0.1`에만 바인딩한다. 인터넷·LAN 전체 바인딩은 거부한다. 앱은 MAIN 데이터망의 Docker DNS와 내부 서비스 포트로 접속한다.
@@ -40,6 +40,8 @@ python3 scripts/main/bootstrap_networks.py \
 ## Repository Secrets
 
 모든 실제 값은 비공개로 등록한다. 아래 목록은 이름 형식이며 비밀번호·토큰 값은 포함하지 않는다.
+
+각 workflow에는 공통 네트워크·바인딩 설정과 해당 서비스의 항목만 전달한다. 예를 들어 Redis workflow는 PostgreSQL/Mongo 비밀번호나 Notion MCP 토큰을 받지 않는다. 기존 Secret 이름과 `.env` 경로는 유지한다. 새 Secret을 등록하는 것만으로 MAIN에 자동 반영되지는 않는다. 항목을 추가할 때는 해당 `*-main-deploy.yml`의 `env` 매핑과 helper의 서비스 스키마·검증·문서를 함께 갱신한다. DEV의 기존 자동 수집 방식은 유지한다.
 
 ```text
 MAIN_COM_DATA_DOCKER_NETWORK
@@ -117,7 +119,7 @@ CPU는 양수 숫자, 메모리와 로그 크기는 양수와 `k/m/g` 단위, �
 
 ## 검증·bootstrap·업데이트
 
-아래 명령은 실행 예시다. Secrets 전체 JSON을 shell argv에 넣지 않고 `IEUM_INFRA_SECRETS_JSON`, Variables JSON을 `IEUM_INFRA_LIMITS_JSON`으로 해당 단계에만 제공한다. CLI는 다른 Docker 하위 프로세스를 실행하기 전에 이 전달 변수를 환경에서 제거한다.
+아래 명령은 실행 예시다. workflow에 개별 지정한 `MAIN_COM_*` 값을 해당 단계의 환경변수로 제공하며 shell argv에는 비밀값을 넣지 않는다. Variables JSON은 기존 `IEUM_INFRA_LIMITS_JSON`으로 전달한다. CLI는 선택한 Secrets와 Variables 전달값을 환경에서 제거한 뒤 기존 검증·권한 `0600` 파일 생성·보존 업데이트 절차를 실행한다. Docker 하위 프로세스에는 허용된 실행 환경만 전달한다. MAIN CLI는 기존 `IEUM_INFRA_SECRETS_JSON`을 입력으로 사용하지 않으므로 직접 호출할 때도 해당 서비스의 `MAIN_COM_*` 환경변수를 지정해야 한다.
 
 ```bash
 # 설정 검증만 수행; Docker·서버 파일 변경 없음

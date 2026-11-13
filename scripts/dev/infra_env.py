@@ -313,8 +313,9 @@ def main(argv=None):
     arguments = parser.parse_args(argv)
     payload = os.environ.pop(TRANSPORT, None)
     if arguments.profile == 'main':
-        return main_profile_module().run_operation(
-            payload, arguments.service,
+        main_profile = main_profile_module()
+        return main_profile.run_operation(
+            main_profile.consume_explicit_secrets(os.environ, arguments.service), arguments.service,
             limits_payload=os.environ.pop('IEUM_INFRA_LIMITS_JSON', None),
             enabled=os.environ.pop('MAIN_DEPLOY_ENABLED', None),
             bootstrap_enabled=os.environ.pop('MAIN_BOOTSTRAP_ENABLED', None),
