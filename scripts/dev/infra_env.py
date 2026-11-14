@@ -10,6 +10,7 @@ import argparse
 import contextlib
 import fcntl
 import ipaddress
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -67,7 +68,19 @@ def invalid_constant(_value):
     raise ConfigurationError('invalid_json')
 
 
-def build_settings(payload, service):
+def main_profile_module():
+    path = ROOT / 'scripts' / 'main' / 'infra_env.py'
+    spec = importlib.util.spec_from_file_location('ieum_main_infra', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def build_settings(payload, service, profile='dev', limits_payload=None):
+    if profile == 'main':
+        return main_profile_module().build_settings(payload, service, limits_payload)
+    if profile != 'dev':
+        raise ConfigurationError('unknown_profile')
     if service not in SCHEMAS:
         raise ConfigurationError('unknown_service')
     if not isinstance(payload, str) or not payload:
@@ -204,8 +217,8 @@ def validate_live(settings):
 
 
 @contextlib.contextmanager
-def deployment_lock():
-    descriptor = os.open(LOCK_FILE, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+def deployment_lock(path=None):
+    descriptor = os.open(LOCK_FILE if path is None else path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(descriptor, 'r+') as lock:
         metadata = os.fstat(lock.fileno())
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid() or metadata.st_mode & 0o022:
@@ -222,8 +235,8 @@ def deployment_lock():
         yield
 
 
-def existing_environment(path):
-    metadata = ENV_HOME.lstat()
+def existing_environment(path, directory=None):
+    metadata = (ENV_HOME if directory is None else directory).lstat()
     if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid() or stat.S_IMODE(metadata.st_mode) != 0o700:
         raise ConfigurationError('private_env_directory_required')
     try:
@@ -240,10 +253,10 @@ def existing_environment(path):
         return content
 
 
-def atomic_environment(path, content):
+def atomic_environment(path, content, directory=None):
     temporary = None
     try:
-        with tempfile.NamedTemporaryFile(dir=ENV_HOME, prefix='.infra-env-', delete=False) as output:
+        with tempfile.NamedTemporaryFile(dir=ENV_HOME if directory is None else directory, prefix='.infra-env-', delete=False) as output:
             temporary = Path(output.name)
             os.fchmod(output.fileno(), 0o600)
             output.write(content)
@@ -292,10 +305,23 @@ def deploy(settings):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--profile', choices=('dev', 'main'), default='dev')
     parser.add_argument('--service', choices=SCHEMAS, required=True)
-    parser.add_argument('--deploy', action='store_true')
+    operation = parser.add_mutually_exclusive_group()
+    operation.add_argument('--deploy', action='store_true')
+    operation.add_argument('--bootstrap', action='store_true')
     arguments = parser.parse_args(argv)
     payload = os.environ.pop(TRANSPORT, None)
+    if arguments.profile == 'main':
+        main_profile = main_profile_module()
+        return main_profile.run_operation(
+            main_profile.consume_explicit_secrets(os.environ, arguments.service), arguments.service,
+            limits_payload=os.environ.pop('IEUM_INFRA_LIMITS_JSON', None),
+            enabled=os.environ.pop('MAIN_DEPLOY_ENABLED', None),
+            bootstrap_enabled=os.environ.pop('MAIN_BOOTSTRAP_ENABLED', None),
+            operation='bootstrap' if arguments.bootstrap else 'deploy' if arguments.deploy else 'check')
+    if arguments.bootstrap:
+        parser.error('--bootstrap is only available for the explicit main profile')
     try:
         settings = build_settings(payload, arguments.service)
         if arguments.deploy:

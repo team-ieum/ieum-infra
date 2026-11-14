@@ -1,0 +1,73 @@
+name: Deploy MAIN Shared postgres
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Update owned MAIN service, check configuration, or explicitly bootstrap a fresh service
+        type: choice
+        required: true
+        default: check
+        options: [check, deploy, bootstrap]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infra_main_shared_services
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.ref == 'refs/heads/main' && (
+      inputs.operation == 'check' ||
+      (inputs.operation == 'bootstrap' && vars.MAIN_BOOTSTRAP_ENABLED == 'true') ||
+      (inputs.operation == 'deploy' && vars.MAIN_DEPLOY_ENABLED == 'true'))
+    environment: main
+    runs-on:
+      group: ieum_main_server
+      labels: [self-hosted, linux, x64, ieum-infra, main, deploy]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Test infrastructure configuration
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s scripts/dev -p 'test_*.py'
+          python3 -m unittest discover -s scripts/main -p 'test_*.py'
+
+      - name: Validate or update isolated MAIN service
+        env:
+          MAIN_COM_DATA_DOCKER_NETWORK: ${{ secrets.MAIN_COM_DATA_DOCKER_NETWORK }}
+          MAIN_COM_DATA_DOCKER_NETWORK_SUBNET: ${{ secrets.MAIN_COM_DATA_DOCKER_NETWORK_SUBNET }}
+          MAIN_COM_HOST_BIND_IP: ${{ secrets.MAIN_COM_HOST_BIND_IP }}
+          MAIN_COM_POSTGRES_ENV_FILE: ${{ secrets.MAIN_COM_POSTGRES_ENV_FILE }}
+          MAIN_COM_POSTGRES_CONTAINER_NAME: ${{ secrets.MAIN_COM_POSTGRES_CONTAINER_NAME }}
+          MAIN_COM_POSTGRES_IP: ${{ secrets.MAIN_COM_POSTGRES_IP }}
+          MAIN_COM_POSTGRES_PORT: ${{ secrets.MAIN_COM_POSTGRES_PORT }}
+          MAIN_COM_POSTGRES_HOST_PORT: ${{ secrets.MAIN_COM_POSTGRES_HOST_PORT }}
+          MAIN_COM_POSTGRES_DB: ${{ secrets.MAIN_COM_POSTGRES_DB }}
+          MAIN_COM_POSTGRES_USER: ${{ secrets.MAIN_COM_POSTGRES_USER }}
+          MAIN_COM_POSTGRES_PASSWORD: ${{ secrets.MAIN_COM_POSTGRES_PASSWORD }}
+          IEUM_INFRA_LIMITS_JSON: ${{ toJSON(vars) }}
+          MAIN_DEPLOY_ENABLED: ${{ vars.MAIN_DEPLOY_ENABLED }}
+          MAIN_BOOTSTRAP_ENABLED: ${{ vars.MAIN_BOOTSTRAP_ENABLED }}
+          OPERATION: ${{ inputs.operation }}
+        run: |
+          set +x
+          set -euo pipefail
+          umask 077
+          args=(--profile main --service postgres)
+          case "$OPERATION" in
+            check) ;;
+            deploy) args+=(--deploy) ;;
+            bootstrap) args+=(--bootstrap) ;;
+            *) exit 1 ;;
+          esac
+          python3 scripts/dev/infra_env.py "${args[@]}"

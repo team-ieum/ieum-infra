@@ -1,0 +1,32 @@
+{
+  "version": 2,
+  "data": {
+    "network": "ieum_main_net_data",
+    "subnet": "10.60.10.0/24",
+    "stores": {
+      "postgres": "ieum-main-postgres",
+      "redis": "ieum-main-redis",
+      "mongo": "ieum-main-mongo"
+    }
+  },
+  "blue": {
+    "network": "ieum_main_net_blue",
+    "subnet": "10.40.10.0/24",
+    "containerName": "ieum-main-blue-frontend",
+    "ip": "10.40.10.20",
+    "backendIp": "10.40.10.21",
+    "agentIp": "10.40.10.24",
+    "envDir": "/home/kwung/deploy/bluegreen-main/runtime/blue",
+    "envFile": "/home/kwung/deploy/bluegreen-main/runtime/blue/frontend.env"
+  },
+  "green": {
+    "network": "ieum_main_net_green",
+    "subnet": "10.50.10.0/24",
+    "containerName": "ieum-main-green-frontend",
+    "ip": "10.50.10.20",
+    "backendIp": "10.50.10.21",
+    "agentIp": "10.50.10.24",
+    "envDir": "/home/kwung/deploy/bluegreen-main/runtime/green",
+    "envFile": "/home/kwung/deploy/bluegreen-main/runtime/green/frontend.env"
+  }
+}

@@ -57,6 +57,92 @@ LEGACY_PROBE_FAILURE_CODES = frozenset({'probe_timeout', 'probe_transport_failur
 BACKEND_TIME_ZONES = frozenset(available_timezones()) - {'localtime'}
 LEGACY_ZONE_HELPER_SHA256 = 'f5cb8a675a43993b9fd16a503a64ecc04287fd3fef1b9d0baaf70f4c76f04341'
 
+ENVIRONMENT = os.environ.get('IEUM_DEPLOY_ENVIRONMENT', 'dev')
+if ENVIRONMENT not in {'dev', 'main'}:
+    raise RuntimeError('Expected deployment environment dev or main')
+CONTAINER_PREFIX = 'ieum-main' if ENVIRONMENT == 'main' else 'ieum'
+INGRESS_HOST = 'kiacms.co.kr' if ENVIRONMENT == 'main' else 'green.kiacms.co.kr'
+if ENVIRONMENT == 'main':
+    INSTALLED_HOME = Path('/home/kwung/deploy/bluegreen-main')
+    HOME = Path(os.environ.get('IEUM_BLUEGREEN_HOME', str(INSTALLED_HOME)))
+    LEGACY = {a: 'ieum-main-offline-' + a for a in APPS}
+    FRONTEND_POLICY = Path('/etc/nginx/ieum-main-frontend-deployment.json')
+    NGINX_HELPER = '/usr/local/sbin/ieum-main-bluegreen-nginx'
+    ROUTE_CONFIG = Path('/etc/nginx/conf.d/ieum-main-bluegreen.conf')
+    ASSETS = Path('/var/lib/ieum-main-bluegreen/assets')
+
+def owns_environment(labels):
+    value = labels.get('ieum.bluegreen.environment')
+    # Existing DEV containers predate this label; MAIN never adopts them.
+    return value == 'main' if ENVIRONMENT == 'main' else value in (None, 'dev')
+
+def application_name(color, app):
+    return f'{CONTAINER_PREFIX}-{color}-{app}'
+
+def main_resource_options(app):
+    """Explicit reviewed caps are required before MAIN can start containers."""
+    if ENVIRONMENT != 'main':
+        return []
+    values = json.loads(read_env(HOME / 'control/resource-limits.env')['LIMITS_JSON'])
+    if set(values) != set(APPS):
+        raise RuntimeError('MAIN resource limits must cover all three applications')
+    limit = values[app]
+    if not isinstance(limit, dict) or set(limit) != {'cpus', 'memoryMb', 'pids'} or \
+            type(limit['cpus']) not in (int, float) or not math.isfinite(limit['cpus']) or not 0 < limit['cpus'] <= 64 or \
+            type(limit['memoryMb']) is not int or not 64 <= limit['memoryMb'] <= 262144 or \
+            type(limit['pids']) is not int or not 64 <= limit['pids'] <= 16384:
+        raise RuntimeError('Invalid reviewed MAIN resource limits')
+    return ['--cpus', str(limit['cpus']), '--memory', str(limit['memoryMb']) + 'm',
+            '--memory-swap', str(limit['memoryMb']) + 'm', '--pids-limit', str(limit['pids'])]
+
+def private_main_directory(path):
+    if ENVIRONMENT != 'main' or path != HOME and HOME not in path.parents:
+        raise RuntimeError('MAIN private directory is outside its deployment home')
+    current = HOME
+    for part in ('', *path.relative_to(HOME).parts):
+        if part: current /= part
+        current.mkdir(mode=0o700, exist_ok=True)
+        info = current.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise RuntimeError('MAIN deployment directories must be private and owned by the deployment account')
+
+def stage_bootstrap(app, image, env_file):
+    """Stage GitHub-generated private inputs without creating or switching an app."""
+    if ENVIRONMENT != 'main': raise RuntimeError('Fresh bootstrap staging is MAIN-only')
+    if (HOME / 'state.json').exists():
+        data = state()
+        if data['active'] != 'legacy' or data.get('slots'):
+            raise RuntimeError('MAIN bootstrap staging is unavailable after preparation')
+    values = read_env(env_file)
+    info = json.loads(docker('image', 'inspect', image))[0]
+    image_id = info['Id']
+    if not re.fullmatch(r'sha256:[a-f0-9]{64}', image_id):
+        raise RuntimeError('Bootstrap requires an immutable image ID')
+    directory = HOME / 'bootstrap'
+    private_main_directory(directory)
+    text = ''.join(key + '=' + value + '\n' for key, value in sorted(values.items()))
+    atomic(directory / (app + '.env'), text)
+    atomic(directory / (app + '.json'), json.dumps({'service': app, 'image': image_id,
+        'environment': 'main', 'envSha256': hashlib.sha256(text.encode()).hexdigest()}))
+    print('Staged MAIN bootstrap inputs:', app)
+
+def prepare_bootstrap(color, cutoff, zone):
+    if ENVIRONMENT != 'main': raise RuntimeError('Fresh bootstrap preparation is MAIN-only')
+    data = state()
+    if data['active'] != 'legacy' or not data.get('freshBootstrap'):
+        raise RuntimeError('MAIN has already been activated')
+    images, files = {}, {}
+    for app in APPS:
+        file = HOME / 'bootstrap' / (app + '.env')
+        read_env(file)
+        metadata = json.loads((HOME / 'bootstrap' / (app + '.json')).read_text())
+        if metadata.get('service') != app or metadata.get('environment') != 'main' or \
+                metadata.get('envSha256') != hashlib.sha256(file.read_bytes()).hexdigest() or \
+                not re.fullmatch(r'sha256:[a-f0-9]{64}', metadata.get('image', '')):
+            raise RuntimeError('MAIN bootstrap input identity changed; stage it again')
+        images[app], files[app] = metadata['image'], str(file)
+    prepare(color, images, files, replace_env=True, recovery_not_before=cutoff, backend_zone=zone)
+
 def default_lock_timeout(command):
     return DEFAULT_DEPLOY_LOCK_TIMEOUT if command == 'deploy' else DEFAULT_OPERATION_LOCK_TIMEOUT
 
@@ -272,7 +358,7 @@ def exists(name):
 def name(color, app):
     if FRONTEND_SETTINGS is not None and color in IPS and app == 'frontend':
         return FRONTEND_SETTINGS[color]['containerName']
-    return LEGACY[app] if color == 'legacy' else f'ieum-{color}-{app}'
+    return LEGACY[app] if color == 'legacy' else application_name(color, app)
 
 def frontend_settings_text(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':')) + '\n'
@@ -283,7 +369,7 @@ def load_frontend_settings(candidate=None):
     pin = HOME / 'control/frontend-deployment-sha256'
     configured = os.path.lexists(FRONTEND_POLICY)
     if not configured:
-        if candidate is not None or pin.exists():
+        if candidate is not None or pin.exists() or ENVIRONMENT == 'main':
             raise RuntimeError('Configure frontend deployment settings before bootstrap; no hardcoded fallback is allowed')
         return
     value = json.loads(run('python3', NGINX_HELPER, 'read-frontend'))
@@ -317,7 +403,7 @@ def configure_frontend_settings(candidate):
             raise RuntimeError('Configure frontend deployment settings before any managed slots are created')
     if route_color() != 'legacy':
         raise RuntimeError('Configure frontend deployment settings while Legacy is active')
-    targets = {f'ieum-{color}-{app}' for color in IPS for app in APPS} | \
+    targets = {application_name(color, app) for color in IPS for app in APPS} | \
         {value[color]['containerName'] for color in IPS}
     containers = set(docker('ps', '--all', '--no-trunc', '--format', '{{.Names}}').replace(',', '\n').splitlines())
     if containers & targets:
@@ -428,10 +514,12 @@ def split_networks():
 
 def app_network(color):
     if split_networks(): return FRONTEND_SETTINGS[color]['network']
+    if ENVIRONMENT == 'main': raise RuntimeError('MAIN requires its pinned network topology')
     return FRONTEND_SETTINGS['network'] if FRONTEND_SETTINGS else 'ieum_net_green'
 
 def data_store_name(store):
     if split_networks(): return FRONTEND_SETTINGS['data']['stores'][store]
+    if ENVIRONMENT == 'main': raise RuntimeError('MAIN requires its pinned datastore topology')
     return {'postgres': 'ieum-postgres', 'redis': 'ieum-redis', 'mongo': 'ieum-mongo'}[store]
 
 def validate_split_networks(settings, colors=('blue', 'green'), replaceable=frozenset(), require_data_only=False):
@@ -447,6 +535,8 @@ def validate_split_networks(settings, colors=('blue', 'green'), replaceable=froz
             if not isinstance(values, list) or len(values) != 1:
                 raise ValueError()
             network = values[0]
+            if ENVIRONMENT == 'main' and (network.get('Labels') or {}).get('ieum.bluegreen.environment') != 'main':
+                raise ValueError()
             if network.get('Name') != definition['network'] or network.get('Driver') != 'bridge' or \
                     [item.get('Subnet') for item in network['IPAM']['Config'] if ':' not in item.get('Subnet', '')] != [definition['subnet']]:
                 raise ValueError()
@@ -476,6 +566,8 @@ def validate_split_networks(settings, colors=('blue', 'green'), replaceable=froz
         stores = {}
         for store, container_name in settings['data']['stores'].items():
             info = inspect(container_name)
+            if ENVIRONMENT == 'main' and (info['Config'].get('Labels') or {}).get('ieum.bluegreen.environment') != 'main':
+                raise ValueError()
             cid = info['Id']; attached = info['NetworkSettings']['Networks']
             if not re.fullmatch(r'[a-f0-9]{64}', cid) or info['Name'] != '/' + container_name or info['State']['Status'] != 'running' or \
                     cid not in data_endpoints or data_endpoints[cid]['Name'] != container_name or data_name not in attached:
@@ -509,6 +601,21 @@ def validate_data_environment(environments, stores):
             host = endpoint(environments[app].get(key), store)
             if host.lower() not in {stores[store]['name'].lower(), stores[store]['ip']}:
                 raise ValueError()
+        if ENVIRONMENT == 'main':
+            backend, agent = environments['backend'], environments['agent']
+            token = backend.get('AGENT_INTERNAL_TOKEN', '')
+            agent_token = agent.get('AGENT_INTERNAL_TOKEN', '')
+            if not token or token != token.strip() or agent_token != agent_token.strip() or \
+                    not secrets.compare_digest(token, agent_token) or \
+                    environments['frontend'].get('VITE_API_URL') != 'https://kiacms.co.kr' or \
+                    backend.get('CORS_ALLOWED_ORIGINS') != 'https://kiacms.co.kr' or \
+                    backend.get('SPRING_PROFILES_ACTIVE') != 'main':
+                raise ValueError()
+            for key, hostname in [('OTEL_EXPORTER_OTLP_ENDPOINT', 'ieum-main-phoenix'),
+                                  ('NOTION_MCP_URL', 'ieum-main-notion-mcp')]:
+                value = agent.get(key, '')
+                if value and urllib.parse.urlsplit(value).hostname != hostname:
+                    raise ValueError()
     except (AttributeError, KeyError, TypeError, ValueError):
         raise RuntimeError('Application datastore settings must target the shared data-network containers; values were not logged') from None
 
@@ -518,6 +625,8 @@ def validate_slot_networks(color):
     environments = {}
     for app in APPS:
         info = inspect(name(color, app)); attached = info['NetworkSettings']['Networks']
+        if ENVIRONMENT == 'main' and not owns_environment(info['Config'].get('Labels') or {}):
+            raise RuntimeError('MAIN container ownership does not match its environment')
         expected = {primary} if app == 'frontend' else {primary, data}
         if set(attached) != expected or attached[primary]['IPAddress'] != IPS[color][app] or attached[primary].get('GwPriority') != 0 or \
                 (app != 'frontend' and attached[data].get('GwPriority') != -1):
@@ -546,6 +655,8 @@ def atomic(path, value, mode=0o600):
 
 def state():
     data = json.loads((HOME / 'state.json').read_text())
+    if data.get('deploymentEnvironment', 'dev') != ENVIRONMENT:
+        raise RuntimeError('Saved deployment state belongs to another environment')
     # Read the original format, but give rollback an explicit release identity.
     for color, slot in list(data.get('slots', {}).items()):
         if 'images' not in slot:
@@ -560,6 +671,7 @@ def release_id(images):
     return hashlib.sha256(json.dumps(images, sort_keys=True).encode()).hexdigest()[:16]
 
 def save(data):
+    if ENVIRONMENT == 'main': data['deploymentEnvironment'] = 'main'
     atomic(HOME / 'state.json', json.dumps(data, indent=2) + '\n')
 
 def record(action, **details):
@@ -604,7 +716,7 @@ def backend_identity(color):
     info = inspect(name(color, 'backend'))
     labels = info['Config'].get('Labels', {}) or {}
     expected_image = state().get('slots', {}).get(color, {}).get('images', {}).get('backend')
-    if labels.get('ieum.bluegreen.managed') != 'true' or \
+    if not owns_environment(labels) or labels.get('ieum.bluegreen.managed') != 'true' or \
             labels.get('ieum.bluegreen.color') != color or info['Image'] != expected_image:
         raise RuntimeError('Backend identity does not match its managed release')
     if not re.fullmatch(r'[a-f0-9]{64}', info.get('Id', '')):
@@ -648,6 +760,7 @@ def transaction_images(transaction, color):
     return slot_images(color)
 
 def write_transaction(transaction):
+    if ENVIRONMENT == 'main': transaction['deploymentEnvironment'] = 'main'
     atomic(HOME / 'transaction.json', json.dumps(transaction))
 
 def quarantine_backend(transaction, color):
@@ -670,7 +783,7 @@ def quarantine_backend(transaction, color):
         info = inspect(expected['name'])
         labels = info['Config'].get('Labels', {}) or {}
         if info.get('Id') != expected['id'] or info['Image'] != expected['image'] or \
-                labels.get('ieum.bluegreen.managed') != 'true' or \
+                not owns_environment(labels) or labels.get('ieum.bluegreen.managed') != 'true' or \
                 labels.get('ieum.bluegreen.color') != color:
             raise RuntimeError('Backend container changed; refusing to stop a replacement')
         return info
@@ -872,6 +985,7 @@ def invalidate_slot(color, status='preparing'):
 
 def archive_frontend(color):
     """Keep immutable assets independently of either reusable application slot."""
+    if ENVIRONMENT == 'main' and color == 'legacy': return
     if not exists(name(color, 'frontend')):
         return
     ASSETS.mkdir(parents=True, exist_ok=True, mode=0o755)
@@ -947,7 +1061,24 @@ def check(color, timeout=120):
 
 def init():
     if (HOME / 'state.json').exists():
+        state()
         print('Already initialized'); return
+    if ENVIRONMENT == 'main':
+        if not split_networks() or route_color() != 'legacy':
+            raise RuntimeError('Initialize MAIN only with a pinned topology and offline MAIN ingress')
+        for color in IPS:
+            for app in APPS:
+                if exists(name(color, app)):
+                    raise RuntimeError('MAIN initialization requires unused application slots')
+        validate_split_networks(FRONTEND_SETTINGS, require_data_only=True)
+        for app in APPS: main_resource_options(app)
+        atomic(HOME / 'control/active', 'legacy\n', 0o644)
+        atomic(HOME / 'control/phase', 'ready\n', 0o644)
+        atomic(HOME / 'control/token', secrets.token_urlsafe(48) + '\n')
+        save({'version': 2, 'active': 'legacy', 'previous': None, 'slots': {}, 'freshBootstrap': True})
+        record('initialized_main_offline', active='legacy')
+        print('Initialized MAIN offline; explicit images and env files are required for first preparation')
+        return
     snapshots = {}
     for app in APPS:
         info = inspect(LEGACY[app])
@@ -1010,8 +1141,10 @@ def remove_inactive(color, force=False):
     # Validate all ownership labels before touching any application or release metadata.
     for app in APPS:
         container = name(color, app)
-        if exists(container) and inspect(container)['Config'].get('Labels', {}).get('ieum.bluegreen.managed') != 'true':
-            raise RuntimeError('Refusing to remove unmanaged container: ' + container)
+        if exists(container):
+            labels = inspect(container)['Config'].get('Labels') or {}
+            if labels.get('ieum.bluegreen.managed') != 'true' or not owns_environment(labels):
+                raise RuntimeError('Refusing to remove unmanaged or foreign container: ' + container)
     replacement_transaction = None
     try:
         drain(color)
@@ -1157,7 +1290,7 @@ def cleanup_candidate_containers(color, created, unidentified=None):
             labels = info['Config'].get('Labels', {}) or {}
             if info.get('Id') != item['id'] or info.get('Image') != item['image'] or \
                     info.get('Name') != '/' + item['name'] or \
-                    labels.get('ieum.bluegreen.managed') != 'true' or \
+                    not owns_environment(labels) or labels.get('ieum.bluegreen.managed') != 'true' or \
                     labels.get('ieum.bluegreen.color') != color:
                 raise RuntimeError('identity_changed')
             # A failed stop must not leave a fresh candidate restarting unattended.
@@ -1216,9 +1349,9 @@ def stale_slot_identity(color, app, identity):
         if not isinstance(result, list) or len(result) != 1: raise ValueError()
         info = result[0]
         labels = info['Config'].get('Labels', {}) or {}
-        container_name = f'ieum-{color}-{app}'
+        container_name = application_name(color, app)
         if info['Id'] != identity or info['Name'] != '/' + container_name or \
-                labels.get('ieum.bluegreen.managed') != 'true' or labels.get('ieum.bluegreen.color') != color or \
+                not owns_environment(labels) or labels.get('ieum.bluegreen.managed') != 'true' or labels.get('ieum.bluegreen.color') != color or \
                 info['State']['Running'] is not False or info['State']['Status'] not in ('exited', 'created') or \
                 info['HostConfig']['RestartPolicy']['Name'] != 'no' or \
                 not re.fullmatch(r'sha256:[a-f0-9]{64}', info['Image']):
@@ -1259,14 +1392,16 @@ def stale_slot_plan():
     for color in sorted(IPS):
         for app in sorted(APPS):
             matching = stale_slot_ids(stale_slot_command('ps', '--all', '--no-trunc', '--filter',
-                'name=^/' + f'ieum-{color}-{app}' + '$', '--format', '{{.ID}}'))
+                'name=^/' + application_name(color, app) + '$', '--format', '{{.ID}}'))
             if len(matching) > 1 or identities & matching:
                 raise RuntimeError('inventory_unverified')
             for identity in matching:
                 containers.append(stale_slot_identity(color, app, identity))
             identities.update(matching)
+    environment_filter = ['--filter', 'label=ieum.bluegreen.environment=main'] if ENVIRONMENT == 'main' else \
+        ['--filter', 'label!=ieum.bluegreen.environment=main']
     managed = stale_slot_ids(stale_slot_command('ps', '--all', '--no-trunc', '--filter',
-        'label=ieum.bluegreen.managed=true', '--format', '{{.ID}}'))
+        'label=ieum.bluegreen.managed=true', *environment_filter, '--format', '{{.ID}}'))
     if managed != identities:
         raise RuntimeError('inventory_unverified')
     return {'schemaVersion': 1, 'containers': containers, 'stateSlots': slots}
@@ -1354,10 +1489,16 @@ def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_no
         raise RuntimeError('Environment changes require an explicit image deployment of the same service')
     if replace_env and not env_overrides:
         raise RuntimeError('--replace-env requires --env-file')
+    fresh_main = ENVIRONMENT == 'main' and data['active'] == 'legacy'
+    if fresh_main and (not data.get('freshBootstrap') or not replace_env or
+            set(overrides) != set(APPS) or set(env_overrides) != set(APPS)):
+        raise RuntimeError('First MAIN preparation requires all three explicit images and private env files with --replace-env')
+    resource_options = {app: main_resource_options(app) for app in APPS}
     stores = validate_frontend_network(colors=(color,), replaceable={name(color, app) for app in APPS})
     verify_frontend_runtime_path(color)
-    snapshots = capture_legacy_snapshot() if data['active'] == 'legacy' else {
-        app: {'image': inspect(name(data['active'], app))['Image']} for app in APPS}
+    snapshots = {app: {'image': overrides[app]} for app in APPS} if fresh_main else \
+        capture_legacy_snapshot() if data['active'] == 'legacy' else {
+            app: {'image': inspect(name(data['active'], app))['Image']} for app in APPS}
     images = {app: json.loads(docker('image', 'inspect', overrides.get(app, snapshots[app]['image'])))[0]
               for app in APPS}
     if images['backend']['Config'].get('Labels', {}).get('ieum.bluegreen.capable') != 'true':
@@ -1377,7 +1518,7 @@ def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_no
     if backend_zone and configured_zone and normalized_backend_zone(backend_zone) != normalized_backend_zone(configured_zone):
         raise RuntimeError('CLI and backend environment specify different expected time zones')
     expected_zone = backend_time_zone(backend_zone or configured_zone, persist=False)
-    if data['active'] == 'legacy':
+    if data['active'] == 'legacy' and not fresh_main:
         try:
             proof = validate_legacy_time_zone(snapshots['backend'], expected_zone, legacy_zone_confirmation,
                 confirmation_evidence=legacy_zone_evidence,
@@ -1427,6 +1568,7 @@ def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_no
                     '--label', 'ieum.bluegreen.managed=true', '--label', 'ieum.bluegreen.color=' + color,
                     '--log-opt', 'max-size=10m', '--log-opt', 'max-file=5',
                     '--stop-timeout', str(STOP_TIMEOUT), '--env-file', str(envfile)]
+            args += ['--label', 'ieum.bluegreen.environment=' + ENVIRONMENT] + resource_options[app]
             if app == 'backend': args += ['--mount', f'type=bind,src={HOME}/control,dst=/deployment,readonly']
             pending_creation = {'name': name(color, app), 'image': images[app]['Id']}
             container_id = docker(*args, images[app]['Id'])
@@ -1440,7 +1582,7 @@ def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_no
         details = check(color)
         if not details.get('draining') or not details.get('schedulerStandby'):
             raise RuntimeError('Candidate background workers started before activation')
-        if data['active'] == 'legacy':
+        if data['active'] == 'legacy' and not fresh_main:
             verify_legacy_snapshot(snapshots)
         data['slots'][color]['status'] = 'candidate'
         save(data)
@@ -1458,30 +1600,40 @@ def prepare(color, overrides, env_overrides=None, replace_env=False, recovery_no
         raise
 
 def route(color):
-    run('sudo', '-n', '/usr/local/sbin/ieum-bluegreen-nginx', color)
+    run('sudo', '-n', NGINX_HELPER, color)
 
 def verify_ingress(color, timeout=15):
+    def environment_matches(headers):
+        def values_for(name):
+            return [value.strip() for line in headers.splitlines()
+                    for key, separator, value in (line.partition(':'),)
+                    if separator and key.strip().lower() == name]
+        return values_for('x-ieum-environment') == [color] and \
+            (ENVIRONMENT != 'main' or values_for('x-ieum-deployment') == ['main'])
+
+    if ENVIRONMENT == 'main' and color == 'legacy':
+        result = subprocess.run(['curl', '--silent', '--show-error', '--max-time', '5',
+            '--resolve', INGRESS_HOST + ':11111:127.0.0.1', '-D', '-', '-o', '/dev/null',
+            'https://' + INGRESS_HOST + ':11111/'], capture_output=True, text=True)
+        if result.returncode == 0 and re.search(r'^HTTP/\S+\s+503(?:\s|$)', result.stdout, re.MULTILINE) and \
+                environment_matches(result.stdout):
+            return
+        raise RuntimeError('MAIN offline ingress verification failed')
     agent_env = dict(item.split('=', 1) for item in inspect(name(color, 'agent'))['Config'].get('Env', [])
                      if '=' in item)
     protected_agent_docs = bool(agent_env.get('AGENT_INTERNAL_TOKEN', '').strip())
 
-    def environment_matches(headers):
-        values = [value.strip() for line in headers.splitlines()
-                  for key, separator, value in (line.partition(':'),)
-                  if separator and key.strip().lower() == 'x-ieum-environment']
-        return values == [color]
-
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         result = subprocess.run(['curl', '--fail', '--silent', '--show-error', '--max-time', '5',
-            '--resolve', 'green.kiacms.co.kr:11111:127.0.0.1', '-D', '-', '-o', '/dev/null',
-            'https://green.kiacms.co.kr:11111/'], capture_output=True, text=True)
+            '--resolve', INGRESS_HOST + ':11111:127.0.0.1', '-D', '-', '-o', '/dev/null',
+            'https://' + INGRESS_HOST + ':11111/'], capture_output=True, text=True)
         if result.returncode == 0 and environment_matches(result.stdout):
             try:
                 for path in ('/v3/api-docs', '/openapi.json'):
                     probe = subprocess.run(['curl', '--fail', '--silent', '--show-error', '--max-time', '5',
-                        '--resolve', 'green.kiacms.co.kr:11111:127.0.0.1', '-D', '-', '-o', '/dev/null',
-                        'https://green.kiacms.co.kr:11111' + path], capture_output=True, text=True)
+                        '--resolve', INGRESS_HOST + ':11111:127.0.0.1', '-D', '-', '-o', '/dev/null',
+                        'https://' + INGRESS_HOST + ':11111' + path], capture_output=True, text=True)
                     # Agent requires its internal token on every path except /health.
                     # Check that protection without sending a credential through ingress.
                     if path == '/openapi.json' and protected_agent_docs:
@@ -1658,6 +1810,8 @@ def recover(force=False, target=None, abandon=False):
     if not transaction_path.exists():
         print('No unfinished transaction'); return
     transaction = json.loads(transaction_path.read_text())
+    if transaction.get('deploymentEnvironment', 'dev') != ENVIRONMENT:
+        raise RuntimeError('Recovery journal belongs to another environment')
     if abandon:
         if target is not None:
             raise RuntimeError('--target and --abandon cannot be combined')
@@ -1704,6 +1858,12 @@ def pg(sql):
 def finish_bootstrap():
     data = state()
     if data['active'] == 'legacy': raise RuntimeError('Switch to a healthy enhanced environment first')
+    if ENVIRONMENT == 'main':
+        check(data['active'])
+        validate_split_networks(FRONTEND_SETTINGS, colors=(), require_data_only=True)
+        docker('exec', data_store_name('redis'), 'redis-cli', 'SET', 'ieum:deployment:mode', 'distributed-v1')
+        print('MAIN is active with independent data services; no Legacy migration is required')
+        return
     if (HOME / 'control/phase').read_text().strip() == 'ready':
         if split_networks(): validate_split_networks(FRONTEND_SETTINGS, colors=(), require_data_only=True)
         print('Already migrated'); return
@@ -1770,6 +1930,15 @@ def main():
                         help='Maximum seconds to wait for the deployment lock (0..14400; deploy default 14400, other commands 600)')
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('init'); sub.add_parser('status'); sub.add_parser('finish-bootstrap')
+    p = sub.add_parser('stage-bootstrap', help='MAIN only: stage verified images and private env snapshots without deploying')
+    p.add_argument('--service', choices=APPS, required=True)
+    p.add_argument('--image', required=True)
+    p.add_argument('--env-file', required=True)
+    p.add_argument('--frontend-deployment-file')
+    p = sub.add_parser('bootstrap-prepare', help='MAIN only: prepare all three staged apps without activating them')
+    p.add_argument('color', choices=tuple(IPS))
+    p.add_argument('--pending-recovery-not-before', required=True)
+    p.add_argument('--backend-time-zone', required=True)
     p = sub.add_parser('retire-stale-slots', help='Plan or confirm removal of stopped pre-pin Blue/Green slots')
     p.add_argument('--confirm-plan', type=legacy_confirmation_evidence, metavar='SHA256')
     p = sub.add_parser('configure-frontend', help='Pin approved frontend deployment Secrets before bootstrap')
@@ -1818,6 +1987,12 @@ def main():
                    help='Conservative CI cancellation deadline; keep 9000 seconds after lock acquisition')
     p.add_argument('--force', action='store_true')
     args = parser.parse_args()
+    if ENVIRONMENT == 'main' and HOME != INSTALLED_HOME or \
+            ENVIRONMENT == 'dev' and HOME == Path('/home/kwung/deploy/bluegreen-main') or \
+            Path(__file__).resolve().parent == Path('/home/kwung/deploy/bluegreen-main') and ENVIRONMENT != 'main':
+        raise RuntimeError('Deployment environment and installed directory disagree')
+    if ENVIRONMENT == 'main' and args.command in ('legacy-zone-evidence', 'retire-stale-slots'):
+        raise RuntimeError('Legacy migration operations are unavailable for MAIN')
     if args.command in ('legacy-zone-evidence', 'status'):
         load_frontend_settings()
     if args.command == 'legacy-zone-evidence':
@@ -1834,16 +2009,19 @@ def main():
         if args.command == 'configure-frontend':
             configure_frontend_settings(args.settings_file)
             return
-        if args.command == 'deploy' and args.service != 'frontend' and args.frontend_deployment_file:
+        if args.command in ('deploy', 'stage-bootstrap') and args.service != 'frontend' and args.frontend_deployment_file:
             raise RuntimeError('Frontend deployment settings can only be supplied by a frontend deployment')
-        if args.command == 'deploy' and args.service == 'frontend' and not args.frontend_deployment_file:
+        if args.command in ('deploy', 'stage-bootstrap') and args.service == 'frontend' and not args.frontend_deployment_file:
             raise RuntimeError('Frontend deployment requires explicit deployment Secrets')
-        settings = load_frontend_settings(args.frontend_deployment_file if args.command == 'deploy' else None)
-        if args.command in ('prepare', 'deploy') and (settings is None or settings.get('version') != 2):
+        settings = load_frontend_settings(args.frontend_deployment_file if args.command in ('deploy', 'stage-bootstrap') else None)
+        if args.command in ('prepare', 'deploy', 'stage-bootstrap', 'bootstrap-prepare') and (settings is None or settings.get('version') != 2):
             raise RuntimeError('Configure frontend deployment Secrets before preparing or deploying any service')
         if args.command == 'recover':
             recover(force=args.force, target=args.target, abandon=args.abandon)
         elif args.command == 'init': init()
+        elif args.command == 'stage-bootstrap': stage_bootstrap(args.service, args.image, args.env_file)
+        elif args.command == 'bootstrap-prepare':
+            prepare_bootstrap(args.color, args.pending_recovery_not_before, args.backend_time_zone)
         elif args.command == 'prepare':
             prepare(args.color, {a: getattr(args, a + '_image') for a in APPS if getattr(args, a + '_image')},
                 {a: getattr(args, a + '_env_file') for a in APPS if getattr(args, a + '_env_file')},
