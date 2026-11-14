@@ -68,6 +68,20 @@ def invalid_constant(_value):
     raise ConfigurationError('invalid_json')
 
 
+def explicit_secret_names(service):
+    """Return only the DEV inputs declared by the selected service workflow."""
+    if service not in SCHEMAS:
+        raise ConfigurationError('unknown_service')
+    return tuple(PREFIX + name for name in
+                 COMMON + SCHEMAS[service] + tuple(OPTIONALS.get(service, {})))
+
+
+def consume_explicit_secrets(environment, service):
+    """Retain literal values for validation and remove consumed inputs."""
+    return json.dumps({name: environment.pop(name) for name in explicit_secret_names(service)
+                       if name in environment})
+
+
 def main_profile_module():
     path = ROOT / 'scripts' / 'main' / 'infra_env.py'
     spec = importlib.util.spec_from_file_location('ieum_main_infra', path)
@@ -311,7 +325,8 @@ def main(argv=None):
     operation.add_argument('--deploy', action='store_true')
     operation.add_argument('--bootstrap', action='store_true')
     arguments = parser.parse_args(argv)
-    payload = os.environ.pop(TRANSPORT, None)
+    # Discard the old whole-Secrets transport; it must never supply missing inputs.
+    os.environ.pop(TRANSPORT, None)
     if arguments.profile == 'main':
         main_profile = main_profile_module()
         return main_profile.run_operation(
@@ -323,7 +338,7 @@ def main(argv=None):
     if arguments.bootstrap:
         parser.error('--bootstrap is only available for the explicit main profile')
     try:
-        settings = build_settings(payload, arguments.service)
+        settings = build_settings(consume_explicit_secrets(os.environ, arguments.service), arguments.service)
         if arguments.deploy:
             deploy(settings)
         print('DEV infrastructure configuration accepted: ' + arguments.service)

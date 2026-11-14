@@ -28,7 +28,9 @@
 - [Backend DEV Secrets](https://github.com/team-ieum/ieum-backend/blob/dev/docs/operations/bluegreen-secrets.md)
 - [Agent DEV Secrets](https://github.com/team-ieum/ieum-agent/blob/dev/docs/operations/bluegreen-secrets.md)
 
-DEV는 `DEV_COM_` 공통값과 프론트의 `DEV_BLUE_`·`DEV_GREEN_` 연결 설정을 수집한다. 기존 별칭은 각 수집기의 매핑을 따른다. 앱 설정은 매 배포 시 생성하며 `--replace-env`로 공급한 앱은 이전 설정에 누적하지 않고 전체 교체한다. 빠진 값은 이전 파일에서 복구하지 않으므로 기본값이나 시작 실패 여부를 확인해야 한다.
+DEV는 필요한 Secrets를 워크플로우 `env`에 명시해서 전달한다. `DEV_COM_` 공통값과 프론트의 `DEV_BLUE_`·`DEV_GREEN_` 연결 설정, 기존 별칭은 유지한다. 새 항목은 Secrets 등록만으로 반영되지 않으며 해당 워크플로우 입력과 수집기 허용 목록·검증을 함께 갱신해야 한다. 앱 설정은 매 배포 시 생성하며 `--replace-env`로 공급한 앱은 이전 설정에 누적하지 않고 전체 교체한다. 빠진 값은 이전 파일에서 복구하지 않으므로 기본값이나 시작 실패 여부를 확인해야 한다.
+
+인프라의 DEV 데이터 서비스 워크플로우도 공통 네트워크·바인드 설정과 해당 서비스의 `DEV_COM_` 항목만 전달한다. 목록과 변경 절차는 [DEV 공용 인프라 Secrets](dev-infra-secrets.md)를 따른다. 기존 설정 파일 경로와 볼륨 보존 검증은 유지하며, 예전 전체 Secrets JSON으로 빠진 입력을 대체하지 않는다.
 
 Backend·Agent의 색상별 스냅샷은 `runtime/<색상>/{backend,agent}.env`, 프론트는 등록한 같은 색상 runtime 하위 경로에 저장한다. 디렉터리는 배포 계정 소유 `0700`, 비공개 파일은 `0600`이어야 한다. 비밀값을 로그·Git·이미지 artifact에 넣지 않는다. 롤백은 현재 Secrets가 아니라 보존된 릴리스의 이미지와 설정을 사용한다.
 

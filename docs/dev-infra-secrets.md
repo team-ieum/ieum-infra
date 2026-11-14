@@ -1,7 +1,7 @@
 # DEV 공용 인프라의 DEV_COM_ Secrets
 
-2026-11-02 로컬 브랜치 기준이다. GitHub 등록·서버 적용·커밋·push를 수행하지 않았다.
 PostgreSQL·Redis·MongoDB·Phoenix·Notion MCP는 한 세트를 공유하며 색상별로 복제하지 않는다.
+DEV도 MAIN처럼 필요한 Secrets 이름을 명시한다. 이전의 전체 Secrets JSON 전달 방식은 사용하지 않는다.
 
 ## Secrets와 등록 파일
 
@@ -41,12 +41,33 @@ workflow_dispatch만 허용하며 push로 서비스가 자동 재배포되지 �
 controller의 기존 `/home/kwung/deploy/bluegreen/deploy.lock`을 공유해 앱 배포와 겹치지 않는다.
 설치된 기존 잠금 파일이 없으면 중단하고 임의로 새 잠금 파일을 만들지 않는다.
 
-마지막 배포 단계에서만 `IEUM_INFRA_SECRETS_JSON: ${{ toJSON(secrets) }}`를 전달한다.
-`scripts/dev/infra_env.py`가 DEV_COM_ 중 해당 서비스와 공통 설정만 골라 검증한다.
+마지막 배포 단계의 `env`에 공통 설정과 해당 서비스의 `DEV_COM_` Secrets 이름을 각각 명시한다.
+`scripts/dev/infra_env.py`도 같은 허용 목록으로 입력을 골라 검증한다.
 접두사 없는 기존 항목·DEV_·DEV_BLUE_·DEV_GREEN_·AWS_·다른 서비스의 자격 증명을
 선택한 Compose 환경에 섞거나 누락값 fallback으로 사용하지 않는다.
-전체 JSON은 읽은 직후 환경에서 제거하고 Docker 프로세스에 상속하지 않는다.
+예전 전체 Secrets JSON은 입력으로 읽지 않는다. 명시 입력은 수집 후 환경에서 제거하며
+Docker 프로세스에는 Secrets 환경변수를 상속하지 않는다.
 runner의 ambient Compose 설정과 DB 값을 받지 않고 선택한 파일을 사용한다.
+
+### 변수 추가·변경 절차
+
+1. 기존에 지원하는 변수의 **값만 변경**하면 Secrets만 갱신한다. 새 이름을 추가할 때는 아래 코드 수정도 필요하다.
+2. `scripts/dev/infra_env.py`의 `COMMON`(공통), `SCHEMAS`(서비스 필수값), `OPTIONALS`(선택값·기본값)에
+   용도에 맞게 추가하고 필요한 검증과 Compose의 사용 지점도 맞춘다.
+3. 해당 DEV workflow의 배포 단계 `env`에 같은 이름을 명시하고, `team-ieum/ieum-infra` Secrets에 등록한다.
+   예를 들어 Redis의 기존 선택값은 다음과 같이 연결되어 있다.
+
+   ```yaml
+   env:
+     DEV_COM_REDIS_HOST_PORT: ${{ secrets.DEV_COM_REDIS_HOST_PORT }}
+   ```
+
+4. 아래 DEV·MAIN 로컬 검증을 통과한 코드를 반영한 뒤 해당 서비스의 새 수동 배포를 실행한다.
+   Secrets 수정만으로 실행 중인 컨테이너나 서버 `.env`가 즉시 바뀌지는 않는다.
+
+`COMMON`·`SCHEMAS`는 MAIN도 공유하므로 변경하면 해당 MAIN workflow의 명시 입력과 검증도 함께 맞춘다.
+`OPTIONALS`는 DEV·MAIN 파일에 각각 정의되어 있으므로 각 환경의 기본값을 유지한다.
+Secrets에 이름만 추가한 미지원 항목은 `.env`에 들어가지 않는다.
 
 | GitHub Secret | Compose 환경 이름 |
 |---|---|
@@ -103,6 +124,7 @@ SIGKILL·호스트 장애 때 파일 복구도 보장되지 않는다. 실패 �
 
 ```bash
 python3 -m unittest discover -s scripts/dev -p 'test_*.py'
+python3 -m unittest discover -s scripts/main -p 'test_*.py'
 python3 .local-docs/register-infra-dev-secrets.py --check
 # 값을 모두 채우고 대상 레포를 확인한 후에만 등록:
 python3 .local-docs/register-infra-dev-secrets.py --apply
