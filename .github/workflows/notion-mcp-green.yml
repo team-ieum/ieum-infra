@@ -30,7 +30,14 @@ jobs:
 
       - name: Deploy existing shared Notion MCP from DEV_COM Secrets
         env:
-          IEUM_INFRA_SECRETS_JSON: ${{ toJSON(secrets) }}
+          DEV_COM_DATA_DOCKER_NETWORK: ${{ secrets.DEV_COM_DATA_DOCKER_NETWORK }}
+          DEV_COM_DATA_DOCKER_NETWORK_SUBNET: ${{ secrets.DEV_COM_DATA_DOCKER_NETWORK_SUBNET }}
+          DEV_COM_HOST_BIND_IP: ${{ secrets.DEV_COM_HOST_BIND_IP }}
+          DEV_COM_NOTION_MCP_ENV_FILE: ${{ secrets.DEV_COM_NOTION_MCP_ENV_FILE }}
+          DEV_COM_NOTION_MCP_CONTAINER_NAME: ${{ secrets.DEV_COM_NOTION_MCP_CONTAINER_NAME }}
+          DEV_COM_NOTION_MCP_PORT: ${{ secrets.DEV_COM_NOTION_MCP_PORT }}
+          DEV_COM_NOTION_MCP_AUTH_TOKEN: ${{ secrets.DEV_COM_NOTION_MCP_AUTH_TOKEN }}
+          DEV_COM_NOTION_MCP_HOST_PORT: ${{ secrets.DEV_COM_NOTION_MCP_HOST_PORT }}
         run: |
           set +x
           set -euo pipefail

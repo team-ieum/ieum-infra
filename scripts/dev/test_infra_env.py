@@ -6,9 +6,11 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -152,21 +154,72 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings(changes={'DEV_COM_POSTGRES_PASSWORD': value})['values']['POSTGRES_PASSWORD'], value)
 
     def test_subprocess_environment_omits_json_secrets_and_ambient_compose_overrides(self):
-        with patch.dict(os.environ, {infra.TRANSPORT: SECRET, 'POSTGRES_PASSWORD': SECRET,
+        with patch.dict(os.environ, {**secrets(), infra.TRANSPORT: SECRET, 'POSTGRES_PASSWORD': SECRET,
                                     'COMPOSE_FILE': SECRET, 'COMPOSE_PROJECT_NAME': SECRET}):
             actual = infra.command_environment()
-        for key in (infra.TRANSPORT, 'POSTGRES_PASSWORD', 'COMPOSE_FILE', 'COMPOSE_PROJECT_NAME'):
+        for key in (*secrets(), infra.TRANSPORT, 'POSTGRES_PASSWORD', 'COMPOSE_FILE', 'COMPOSE_PROJECT_NAME'):
             self.assertNotIn(key, actual)
         self.assertEqual(actual['COMPOSE_DISABLE_ENV_FILE'], '1')
 
-    def test_main_unsets_whole_secrets_transport_before_deployment(self):
+    def test_cli_consumes_explicit_inputs_and_discards_old_json_before_deployment(self):
         def observe(_settings):
             self.assertNotIn(infra.TRANSPORT, os.environ)
+            self.assertTrue(all(name not in os.environ for name in infra.explicit_secret_names('postgres')))
+            self.assertEqual(_settings, settings())
         output = io.StringIO()
-        with patch.dict(os.environ, {infra.TRANSPORT: json.dumps(secrets())}), \
+        with patch.dict(os.environ, {**secrets(), infra.TRANSPORT: 'invalid-ignored-json'}, clear=True), \
                 patch.object(infra, 'deploy', side_effect=observe), contextlib.redirect_stdout(output):
             self.assertEqual(infra.main(['--service', 'postgres', '--deploy']), 0)
         self.assertNotIn(SECRET, output.getvalue())
+
+    def test_explicit_inputs_scope_each_service_and_preserve_optional_defaults(self):
+        for service in infra.SCHEMAS:
+            environment = {**secrets(), 'MAIN_COM_POSTGRES_PASSWORD': 'not-selected',
+                           'AWS_POSTGRES_PASSWORD': 'not-selected', 'GITHUB_TOKEN': 'not-selected',
+                           'DEV_COM_NEW_OPTION': 'not-selected'}
+            environment.update({infra.PREFIX + key: '' for key in infra.OPTIONALS.get(service, {})})
+            payload = infra.consume_explicit_secrets(environment, service)
+            self.assertEqual(infra.build_settings(payload, service), settings(service))
+            self.assertNotIn('not-selected', payload)
+            self.assertTrue(all(name not in environment for name in infra.explicit_secret_names(service)))
+            self.assertEqual(set(json.loads(payload)), set(infra.explicit_secret_names(service)))
+
+    def test_cli_never_falls_back_to_whole_json_or_other_prefixes(self):
+        for explicit in ({}, {'DEV_COM_POSTGRES_PASSWORD': ''}):
+            other_prefixes = {prefix + key.removeprefix(infra.PREFIX): value
+                              for prefix in ('MAIN_COM_', 'AWS_', '') for key, value in secrets().items()}
+            out, err = io.StringIO(), io.StringIO()
+            with patch.dict(os.environ, {**explicit, **other_prefixes, infra.TRANSPORT: json.dumps(secrets())}, clear=True), \
+                    patch.object(infra, 'deploy') as mutate, \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = infra.main(['--service', 'postgres', '--deploy'])
+            self.assertEqual(code, 1)
+            mutate.assert_not_called()
+            self.assertIn('missing_required_configuration', err.getvalue())
+            self.assertNotIn(SECRET, out.getvalue() + err.getvalue())
+
+    def test_real_check_cli_accepts_explicit_inputs_without_printing_values(self):
+        for service in infra.SCHEMAS:
+            environment = {key: os.environ[key] for key in ('PATH', 'HOME', 'LANG', 'LD_LIBRARY_PATH')
+                           if key in os.environ}
+            environment.update(secrets())
+            environment[infra.TRANSPORT] = 'ignored-invalid-json'
+            result = subprocess.run([sys.executable, str(infra.ROOT / 'scripts/dev/infra_env.py'),
+                                     '--service', service], env=environment,
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn(SECRET, result.stdout + result.stderr)
+
+    def test_explicit_inputs_preserve_literal_values_and_validate_line_breaks(self):
+        literal = '  서울 $VAR $(touch ignored) `echo x` " # = \\  '
+        for value in (literal, literal + '\nINJECTED=yes'):
+            environment = {**secrets(), 'DEV_COM_POSTGRES_PASSWORD': value}
+            payload = infra.consume_explicit_secrets(environment, 'postgres')
+            if '\n' in value:
+                with self.assertRaises(infra.ConfigurationError):
+                    infra.build_settings(payload, 'postgres')
+            else:
+                self.assertEqual(infra.build_settings(payload, 'postgres')['values']['POSTGRES_PASSWORD'], literal)
 
 
 class LiveGuardTests(unittest.TestCase):
@@ -283,15 +336,21 @@ class DeploymentTests(unittest.TestCase):
 
 
 class WorkflowTests(unittest.TestCase):
-    def test_dev_workflows_scope_transport_and_keep_manual_execution(self):
+    def test_dev_workflows_declare_only_service_inputs_and_keep_manual_execution(self):
         files = ('postgres-green-reset.yml', 'mongo-green-reset.yml', 'redis-green-reset.yml',
                  'phoenix-green-reset.yml', 'notion-mcp-green.yml')
-        for name in files:
+        for service, name in zip(infra.SCHEMAS, files):
             source = (infra.ROOT / '.github/workflows' / name).read_text()
-            self.assertEqual(source.count('${{ toJSON(secrets) }}'), 1)
+            self.assertNotIn('toJSON(secrets)', source)
+            self.assertNotIn(infra.TRANSPORT, source)
+            selected = re.findall(r'^          (DEV_COM_[A-Z0-9_]+): \$\{\{ secrets\.([A-Z0-9_]+) \}\}$',
+                                  source, re.MULTILINE)
+            self.assertEqual({name for name, _ in selected}, set(infra.explicit_secret_names(service)))
+            self.assertEqual(len(selected), len(infra.explicit_secret_names(service)))
+            self.assertTrue(all(name == secret for name, secret in selected))
+            self.assertEqual(len(re.findall(r'secrets\.', source)), len(selected))
             self.assertIn('workflow_dispatch:', source)
             self.assertNotIn('  push:', source)
-            self.assertNotIn('${{ secrets.', source)
             self.assertNotIn('down -v', source)
             self.assertNotIn('docker rm', source)
             self.assertIn('set +x', source)

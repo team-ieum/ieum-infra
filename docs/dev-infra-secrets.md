@@ -1,6 +1,5 @@
 # DEV 공용 인프라의 DEV_COM_ Secrets
 
-2026-11-02 로컬 브랜치 기준이다. GitHub 등록·서버 적용·커밋·push를 수행하지 않았다.
 PostgreSQL·Redis·MongoDB·Phoenix·Notion MCP는 한 세트를 공유하며 색상별로 복제하지 않는다.
 
 ## Secrets와 등록 파일
@@ -41,11 +40,14 @@ workflow_dispatch만 허용하며 push로 서비스가 자동 재배포되지 �
 controller의 기존 `/home/kwung/deploy/bluegreen/deploy.lock`을 공유해 앱 배포와 겹치지 않는다.
 설치된 기존 잠금 파일이 없으면 중단하고 임의로 새 잠금 파일을 만들지 않는다.
 
-마지막 배포 단계에서만 `IEUM_INFRA_SECRETS_JSON: ${{ toJSON(secrets) }}`를 전달한다.
-`scripts/dev/infra_env.py`가 DEV_COM_ 중 해당 서비스와 공통 설정만 골라 검증한다.
+마지막 배포 단계의 `env`에 공통 설정과 해당 서비스의 `DEV_COM_` Secrets 이름을 각각 명시한다.
+`scripts/dev/infra_env.py`도 같은 허용 목록으로 입력을 골라 검증한다. Secrets 등록만으로 새 변수가
+추가되지는 않는다. 새 항목은 해당 workflow의 `env`와 수집기의 `COMMON`·`SCHEMAS`·`OPTIONALS`
+중 해당 목록, 필요한 검증을 함께 수정한다.
 접두사 없는 기존 항목·DEV_·DEV_BLUE_·DEV_GREEN_·AWS_·다른 서비스의 자격 증명을
 선택한 Compose 환경에 섞거나 누락값 fallback으로 사용하지 않는다.
-전체 JSON은 읽은 직후 환경에서 제거하고 Docker 프로세스에 상속하지 않는다.
+예전 전체 Secrets JSON은 입력으로 읽지 않는다. 명시 입력은 수집 후 환경에서 제거하며
+Docker 프로세스에는 Secrets 환경변수를 상속하지 않는다.
 runner의 ambient Compose 설정과 DB 값을 받지 않고 선택한 파일을 사용한다.
 
 | GitHub Secret | Compose 환경 이름 |
